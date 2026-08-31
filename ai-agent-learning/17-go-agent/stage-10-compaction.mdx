@@ -1,12 +1,286 @@
 ---
-title: "Go 10：Compaction"
-description: "在 context window 受限时保留前缀和最近消息。"
+title: "Go 10：Context Compaction 与保留尾部"
+description: "用近似 token 预算压缩消息历史，并理解 summary、tool 配对与语义损失。"
 ---
 
-# Go 10：Compaction
+# Go 10：Context Compaction 与保留尾部
 
-`Compact` 用近似字符/token 比例触发，把 system 前缀、摘要和 recent tail 组成新 history。它不是 tokenizer，也不是完整语义摘要；真实 Harness 还要保护 Tool Call/Result 配对、关键事实和 compaction entry。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-改变 `maxTokens`，观察何时触发；加入 tool call/result，检查不会留下孤立 result。把摘要输入模型后，比较压缩前后的可执行事实。
+- 说明 Context Window 与 Session 存储为什么不是同一件事。
+- 读懂 `EstimateTokens` 的近似算法和限制。
+- 读懂 `Compact` 如何保留 system、summary 与 recent tail。
+- 解释 tool call/result 配对、关键事实和摘要可靠性。
+- 用测试验证不需要压缩、需要压缩和非法 budget 三类路径。
+
+## 输入、增加的能力与明确不做什么
+
+输入是 Go 09 的 `[]Message` 和 JSONL Session。本阶段新增估算 token、超过预算时生成摘要并使用 `Session.Replace` 更新内存/文件历史。
+
+本阶段不实现真实 tokenizer，不保证摘要保留所有事实，不实现 Pi 的 branch summary 或 durable compaction entry，也不把摘要当成事务日志。真实生产 Harness 应保存压缩前后的边界和原因。
+
+## 前置 Go 知识
+
+需要知道：
+
+- `len(string)` 得到的是字节数，不是 token 数；
+- slice 可以从尾部遍历；
+- `append` 会影响底层数组，复制能避免意外共享；
+- 一个纯函数适合 table-driven test；
+- compaction 应在 Context projection 之前发生。
+
+## 问题场景：Context 满了不是“多发一次请求”
+
+失败 trace：
+
+```text
+Session 有 100 条消息
+-> 每条 tool result 都带完整文件输出
+-> Request 超过 provider context window
+-> Model 返回 context_length_exceeded
+-> naive retry 原样重发
+-> 永远失败并增加费用
+```
+
+正确策略是改变输入：删减低价值历史、保留关键事实、压缩旧消息，然后再发送。压缩不会删除磁盘上的全部历史，通常只是生成一份更小的 Model context。
+
+## EstimateTokens：控制信号而非账单
+
+源码：
+
+```go
+func EstimateTokens(messages []Message) int {
+    characters := 0
+    for _, message := range messages {
+        characters += len(message.Content)
+        for _, call := range message.ToolCalls {
+            characters += len(call.Name) + len(call.Arguments)
+        }
+    }
+    return (characters + 3) / 4
+}
+```
+
+输入是 Message slice；输出是近似 token 数；状态不变；失败点包括多字节字符、system/tool metadata 未计入以及不同 tokenizer 误差。
+
+`len` 在 Go 中是字节长度。`(characters+3)/4` 只是约四字节一个 token 的教学估计，不能用于精确计费、Provider 上限或中文长文本的安全阈值。
+
+使用它的价值是把“什么时候需要压缩”变成可测试的控制信号。生产实现应使用对应模型 tokenizer，并为 system prompt、工具 schema、图片和 reasoning 保留预算余量。
+
+## Compact 的入口
+
+```go
+func Compact(messages []Message, maxTokens int) ([]Message, error) {
+    if maxTokens <= 0 {
+        return nil, errors.New("maxTokens must be positive")
+    }
+    if EstimateTokens(messages) <= maxTokens {
+        return append([]Message(nil), messages...), nil
+    }
+    // choose prefix, recent tail and summary
+}
+```
+
+输入是历史和预算；输出是新 history 或 error；状态不变，因为函数返回新 slice；失败点是非法 budget、无法生成有效 summary 或调用方错误地覆盖 Session。
+
+不超预算时返回 copy，而不是原 slice。这让调用方可以修改结果而不直接破坏 Session 内部数据。
+
+## 保留 system 前缀
+
+```go
+start := 0
+var prefix []Message
+if len(messages) > 0 && messages[0].Role == RoleSystem {
+    prefix = append(prefix, messages[0])
+    start = 1
+}
+```
+
+当前实现只特殊保留第一条 system message。它没有扫描所有 system messages，也不懂 project instruction。输入是历史首条；输出是 prefix 和开始索引；状态不变；失败点是多个 system message 排序不符合预期。
+
+这是一个教学取舍。真实 Context Builder 可能把 system prompt 作为独立输入重建，而不是依赖某个历史 index。
+
+## 从尾部选择 recent tail
+
+```go
+keep := make([]Message, 0, len(messages))
+for index := len(messages) - 1; index >= start; index-- {
+    candidate := append([]Message(nil), messages[index])
+    candidate = append(candidate, keep...)
+    if EstimateTokens(append(append([]Message(nil), prefix...), candidate...)) > maxTokens/2 && len(keep) > 0 {
+        break
+    }
+    keep = candidate
+}
+```
+
+算法从最新消息向前走，先保留尾部，然后在 prefix + candidate 超过 `maxTokens/2` 且已有 tail 时停止。输入是旧 history；输出是保留的 recent tail；状态不变；失败点是大量单条消息、预算太小和 Tool Call/Result 被切断。
+
+注意 `maxTokens/2` 是示例中的更保守目标，不是 Provider 的硬上限。单条消息本身超过目标时，当前代码仍可能保留它；不要将代码描述为严格预算保证。
+
+## Summary 的内容与限制
+
+```go
+dropped := len(messages) - start - len(keep)
+summary := Message{
+    Role: RoleAssistant,
+    Content: fmt.Sprintf(
+        "[compaction summary: %d earlier messages omitted; retain task decisions and verify files before acting]",
+        dropped,
+    ),
+}
+result := append(prefix, summary)
+result = append(result, keep...)
+return result, nil
+```
+
+输入是被删除的消息数量；输出是一条固定文本 assistant summary、prefix 和 tail；状态不变；失败点是 summary 只记录数量，不记录真实决策、文件修改和未完成 Tool。
+
+这条 summary 的用途是明确提醒模型“前面有历史被省略”，不是把实际历史语义压缩完成。它不能替代模型生成的可靠摘要，也不能提供外部副作用证据。
+
+## Tool Call/Result 的配对风险
+
+可能的坏结果：
+
+```text
+保留 tool result
+-> 对应 assistant tool call 被丢掉
+-> 下一次 Provider 收到孤立 result
+-> 请求被拒绝或模型误解
+```
+
+当前 `Compact` 是按 Message 粗粒度截尾，没有检查 Tool Call 和 Tool Result 配对。教程必须明确这是教学限制。改进算法应把一个 assistant + 其完整 Tool Result batch 视为不可拆分单元，或者在 projection 时补 synthetic result。
+
+同样不能丢掉：
+
+- 用户的原始目标；
+- 已批准/拒绝的权限决策；
+- 已经写入的文件和测试结果；
+- 尚未完成的队列意图；
+- 当前 branch/Session 身份。
+
+## Session 与 Context 的关系
+
+```text
+完整 Session（可审计历史）
+  -> Context Manager
+  -> compaction / branch selection / tool projection
+  -> Request.Messages（本轮模型看到的内容）
+```
+
+Session 负责保存，Context 负责选择。`Compact` 返回的 history 可以进入 `Session.Replace`，也可以只用于下一次 Request；产品必须明确是哪一种策略。
+
+当前 `Harness.Compact` 直接替换 Session 并 Save，适合展示生命周期，但它会丢掉被压缩的平面消息。Pi 的 Session tree 通常保留原始 entries，再生成 compaction entry。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestSessionPersistenceAndCompaction'
+```
+
+预期测试通过。它检查超预算 history 能得到非空 compacted 结果，JSONL 仍存在。
+
+手动实验可运行：
+
+```bash
+go test -v ./... -run TestSessionPersistenceAndCompaction
+```
+
+输出会显示测试通过；要观察具体 history，可以在临时测试中打印，不要把 debug print 留在库代码。
+
+## 测试设计
+
+### 不需要压缩
+
+给短消息和足够大的 `maxTokens`，断言返回内容等价但 slice 不共享。修改返回 slice 后，原输入不应变化。
+
+### 需要压缩
+
+给长 user/assistant messages，断言：
+
+1. 输出包含 system prefix（如果有）；
+2. 输出包含 summary；
+3. 输出保留最新消息；
+4. 输出长度小于原始消息数量；
+5. summary 的 dropped count 正确。
+
+### 非法参数
+
+`maxTokens <= 0` 必须返回 `maxTokens must be positive`，不能静默返回空历史。
+
+### 配对回归
+
+向测试加入 assistant Tool Call 和 RoleTool result。当前实现可能切断配对，因此测试应先记录已知限制，再作为未来改进的回归测试。不要为了让测试绿而声称当前代码已解决。
+
+### 语义回归
+
+对同一输入重复 Compact，当前 summary 会把摘要当普通消息，结果可能再次改变。测试应观察 fixed point 是否稳定；生产设计需要显式 compaction entry，而不是无限摘要摘要。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/harness/compaction/compaction.ts`：压缩决策与保留内容边界。
+- `packages/agent/src/harness/compaction/branch-summarization.ts`：branch summary 的语义。
+- `packages/coding-agent/src/core/agent-session.ts`：context overflow 时的 compaction orchestration。
+- `packages/coding-agent/src/core/session-manager.ts`：compaction entry、branch 和 history 投影。
+
+Pi 的 compaction 不是简单删除数组尾部；它与 Session tree、provider message conversion、usage 和 retry 相连。Go 版本只用于讲 token budget 和纯函数测试。
+
+## Java 对照
+
+Go：
+
+```go
+EstimateTokens(messages)
+Compact(messages, maxTokens)
+```
+
+Java 对应 `Compactor.compact(List<Message>, int)`，同样使用字符近似和 summary。差异在于 Java 的 `record` 让消息对象更容易不可变，Go 需要自己复制 slice。
+
+| 问题 | Go | Java |
+| --- | --- | --- |
+| 估算 | `len` 字节 / 4 | `String.length` 近似 |
+| 返回 | 新 `[]Message` | 新 `List<Message>` |
+| 更新 Session | `Replace` | `Session.replace` |
+| 精确 tokenizer | 未实现 | 未实现 |
+
+## 实验：比较压缩前后可见事实
+
+### 目标
+
+确认 compaction 改变的是 Model context，不应被误读为“历史从世界上消失”。
+
+### 准备
+
+打开 `session.go` 和 `agent_test.go`，准备 system、user、assistant、Tool Call、Tool Result 五类消息。
+
+### 步骤
+
+1. 打印 `EstimateTokens`。
+2. 用足够大 budget，确认返回 copy 与原输入等价。
+3. 用很小 budget，打印 prefix、summary、tail。
+4. 检查 Tool Call 是否有对应 result。
+5. 把 compacted history 写入临时 Session，再 reload。
+6. 记录哪些事实因当前教学算法丢失。
+
+### 观察点
+
+summary 只写“省略了多少条”，不会知道真实代码修改；Session.Replace 会改变教学 Session；生产设计要保存原始 tree 和 compaction 元数据。
+
+### 预期结果
+
+你能回答“上下文满了怎么办”，也能解释“压缩不是 RAG、不是事务日志、不是删除外部副作用”。
+
+### 思考题
+
+如果最后一条是 Tool Result、对应 call 在被删除区域，Context Builder 应拒绝、补空结果还是把 batch 一起保留？压缩摘要由模型生成时，如何防止摘要中的幻觉成为事实？
+
+## 小结与下一阶段
+
+Compaction 是在有限 Context Window 下重建可用输入的过程。Go 示例用字符近似、system prefix、summary 和 recent tail 教授基本控制流，同时明确缺少 tokenizer、Tool 配对保护、branch entry 和 durable 记录。
+
+下一阶段学习 steering、follow-up 与 next-run queue：当 Agent 正在工作时，用户新指令不能随意插入已发出的 Request，而要在定义好的边界处理。

@@ -39,6 +39,101 @@ settings 中 package 字符串会加载全部资源；对象形式可以分别�
 
 **实践实验**：创建一个只含 `extensions/`、`skills/`、`prompts/` 的本地 package，先用 `pi -e` 验证，再用 `pi install -l` 写入项目设置；加入 `!legacy.ts`、`+themes/legacy.json`，对比过滤结果。然后在全局和项目各声明同一 npm name，观察 project precedence，并模拟缺依赖和未信任项目的错误路径。
 
+### 一次安装究竟改变了什么
+
+`pi install` 不只是下载文件。它解析 package source，决定安装范围，把声明写入 global 或 project settings，并在需要时安装依赖。启动时 ResourceLoader 再依据 settings、manifest 和过滤条件发现 extension、skill、prompt template、theme。可以把生命周期画成：
+
+```text
+source spec
+  -> resolve npm/git/local
+  -> materialize package
+  -> install dependencies
+  -> write settings
+  -> trust check
+  -> discover resources
+  -> load selected resources
+```
+
+每一步都可能失败。Git ref 解析成功不代表 `npm install` 成功；package 被写进 settings 也不代表未信任项目会加载它；manifest 声明了 extension 也不代表过滤器允许它进入 registry。
+
+> 译者注：Package 是分发边界，ResourceLoader 是发现边界，Extension runner 是执行边界。把三者写成一个“安装后立刻运行”的动作，会遗漏权限、依赖和恢复问题。Java 生态中可以类比 Maven artifact、ServiceLoader discovery 和实际 bean lifecycle，但 Pi package 的 resource 类型更多。
+
+### npm、git 和 local 的选择
+
+npm 适合有版本发布和依赖树的 package。带版本号的 npm spec 会固定版本，更新命令不会擅自移动它；不带版本的 spec 则允许 update 根据包管理策略取得新版本。git source 适合直接跟踪仓库中的资源，但 ref 应尽量使用 tag 或 commit，而不是漂移的 branch。local path 适合开发和调试，它不复制目录，因此修改原目录会立即影响下一次加载。
+
+一个实际决策表：
+
+| 场景 | 推荐 source | 需要额外检查 |
+| --- | --- | --- |
+| 团队发布稳定扩展 | `npm:@scope/pkg@version` | 版本、依赖、包内容 |
+| 内部仓库固定实现 | `git:host/org/repo@commit` | ref、SSH 凭据、构建脚本 |
+| 本地开发 | `./path/to/package` | 路径解析、是否误提交密钥 |
+| 临时试用 | `pi -e <source>` | 临时目录和任意代码权限 |
+
+裸 URL、SSH shorthand 和 `git:` 前缀的解析规则不同，不能把所有字符串都当作同一种 git URL。CI 中设置 `GIT_TERMINAL_PROMPT=0` 可以避免等待交互式凭据；这不是给 CI 自动提供凭据。
+
+### Manifest、约定目录与 glob
+
+manifest 中的路径相对 package root，而不是相对执行 `pi install` 的 cwd。正模式先发现资源，`!pattern` 做排除；dot-prefixed 路径应直接列出。没有 `pi` manifest 时，Pi 才使用 `extensions/`、`skills/`、`prompts/`、`themes/` 的约定发现。
+
+下面这个例子只允许 review extension 和一个 prompt：
+
+```json
+{
+  "pi": {
+    "extensions": ["extensions/*.ts", "!extensions/legacy.ts"],
+    "skills": [],
+    "prompts": ["prompts/review.md"],
+    "themes": []
+  }
+}
+```
+
+注意 `skills: []` 是全部不加载，而省略 `skills` 是不限制该类型。过滤器只能收窄 manifest 的允许范围，`+path` 不是越过 manifest 的万能授权。路径中出现 symlink 时，还要按源文档规则直接列出 resource root，避免 glob 穿过链接造成意外发现。
+
+> 译者注：glob 过滤是集合运算，不是逐文件的权限审批。若 package manifest 已经允许一个目录，settings filter 可以减少它；如果 manifest 根本没有声明某资源，`+path` 也不应被理解为扩大权限。实现自己的 loader 时，应先得到 allowed set，再应用 filter。
+
+### 依赖与 module root
+
+扩展运行时依赖放在 `dependencies`，Pi core 提供的包放在 `peerDependencies` 并使用 `*`，不要把宿主核心重复打进 tarball。其他 Pi package 如果被 package 代码导入，要放进 `dependencies` 和 `bundledDependencies`，并用 `node_modules/` 下的资源路径引用它们。
+
+这条规则解决的是模块隔离：不同 package 有分离的 module roots，不应依赖“另一个 package 已经安装了某个 npm 模块”。如果本地开发时恰好能解析，发布后的独立安装仍可能失败。因此要用干净临时目录执行 package 安装测试，而不是只在 monorepo 根目录运行。
+
+### Scope、autoload 与 precedence
+
+global settings 为用户所有项目提供资源，project settings 为当前仓库提供资源。相同 package identity 同时出现时，project entry 优先；`autoload: false` 则表示 project entry 作为对 global entry 的增量修改。npm identity 是 package name，git identity 是去掉 ref 的 repository URL，local identity 是解析后的绝对路径。
+
+这会产生一个常见 trace：
+
+```text
+global: npm:review-tools, extensions=[review.ts]
+project: npm:review-tools, autoload=false, skills=[review]
+=> 项目设置不会简单“替换整个 global package”，而是按 scope 规则合并/收窄
+```
+
+不要用“项目里没写 extension”推断 extension 一定不存在；先看 entry 的 scope、autoload 和资源过滤字段。
+
+### 更新、失败和回滚
+
+`pi update --all` 可能同时更新 Pi、packages 和 pinned git refs 的 checkout；`--extensions` 只处理 package 资源，`--models` 刷新模型目录，`--self` 只处理 Pi。实验性 installer-managed 安装会先写 staged、lockfile-backed release，验证成功才激活，因此失败时应保留当前版本。普通 package update 若需要运行 `npm install`，应把它视为任意代码执行步骤，审查脚本和网络访问。
+
+> 译者注：安装的“成功”至少包含 source resolved、package materialized、依赖安装、settings 写入和资源加载五个层次。建议把每层写事件并可重试；不要只依据进程 exit code 判断 extension 已生效。
+
+### 可执行实验：构造一个最小 package
+
+1. 在临时目录创建 `package.json`、`extensions/hello.ts`、`prompts/review.md` 和 `skills/review/SKILL.md`。
+2. 写入 `pi` manifest，并故意加入 `!extensions/legacy.ts` 与 `skills: []`。
+3. 用 `pi -e ./package` 试用，确认不会把设置持久化。
+4. 用 `pi install -l ./package` 安装到项目设置，确认 `.pi/settings.json` 的变化。
+5. 在 global 和 project 分别声明相同 npm identity，观察 precedence 与 `autoload`。
+6. 删除一个依赖或制造坏 manifest，记录失败发生在哪个生命周期阶段。
+7. 用干净临时 npm cache 重复安装，排除 monorepo 中已有依赖造成的假成功。
+
+实验结果应包含 source、settings、discovery、filter、dependency 和 load 的实际证据。不要安装未审查的第三方 package，也不要在实验 package 中执行 shell、读取 home 凭据或发送网络请求。
+
+> 译者注：如果只想学习资源解析，可以先用 local path；如果要学习发布与可复现性，再使用固定 npm/git ref。两者的测试重点不同，不能用 local path 的成功替代发布包测试。
+
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

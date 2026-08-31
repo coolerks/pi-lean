@@ -1,12 +1,313 @@
 ---
-title: "Go 09：Session"
-description: "用 JSONL 保存可恢复的消息前缀。"
+title: "Go 09：JSONL Session 持久化"
+description: "把内存 transcript 写入 JSONL，安全保存、加载并诊断损坏行。"
 ---
 
-# Go 09：Session
+# Go 09：JSONL Session 持久化
 
-`Session.Save` 先写临时文件再 rename；`LoadSession` 逐行解码并报告坏行号。Harness 在 run 后保存成功前缀，因此失败的 Provider 不会让已经确认的历史凭空消失。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-重启进程加载 session，注入 malformed JSON、空 role、超长行，验证错误不会被吞掉；为实际生产版本补 fsync、版本 header、树节点和并发锁。
+- 解释 Session 与 Context、Memory、Provider message 的区别。
+- 使用 `Session.Append`、`Snapshot`、`Replace` 保存消息历史。
+- 读懂 `Save` 的临时文件 + rename 过程。
+- 读懂 `LoadSession` 对缺失文件、坏 JSON、空 role 和超长行的处理。
+- 设计失败恢复和 JSONL 版本升级的下一步。
+
+## 输入、增加的能力与明确不做什么
+
+输入是 Go 06 的 `[]Message` 和 Go 07 的 Agent 运行结果。本阶段新增线程安全的 `Session`，以一行一个 JSON message 的方式持久化 transcript。
+
+本阶段不实现 Pi 的完整 Session tree、parentId、branch、operation ledger 或 SQLite backend。JSONL 保存的是教学示例的消息前缀，不是生产级崩溃恢复协议。尤其要记住：文件存在不等于每次副作用都已安全提交。
+
+## 前置 Go 知识
+
+需要掌握：
+
+- `sync.RWMutex` 的读写锁；
+- `os.Open`、`os.CreateTemp`、`os.Rename`；
+- `bufio.Scanner` 按行读取；
+- `json.Encoder` 和 `json.Unmarshal`；
+- `defer` 清理临时文件。
+
+JSONL 的优势是每行可检查、可追加和可定位；代价是跨行事务、尾行损坏和 schema 版本都需要应用层定义。
+
+## 问题场景：只在 final 后保存
+
+假设一次运行顺序如下：
+
+```text
+user message
+-> assistant tool call
+-> tool 已经改了文件
+-> Provider timeout
+-> 程序退出
+-> final 没有生成，所以没有 Save
+```
+
+如果只有 final 才保存，重启后的 Session 完全看不到用户请求和部分执行。下一次运行可能重复修改文件。
+
+当前 Harness 的策略是调用 `Agent.Run` 后保存 `result.Messages`。Loop 在模型错误和 max steps 时也返回已经形成的 history，因此可以保存成功前缀；但它仍没有 intent/result 记录，无法证明外部副作用是否已经发生。
+
+## Session 的内存边界
+
+```go
+type Session struct {
+    mu       sync.RWMutex
+    Messages []Message
+}
+
+func NewSession() *Session { return &Session{} }
+```
+
+输入是消息对象；输出是 Session 实例；状态变化是内存 slice；失败点是直接访问 exported `Messages` 绕过 mutex。教学代码保留 `Messages` 字段便于阅读，调用方应优先使用方法。
+
+读取：
+
+```go
+func (s *Session) Snapshot() []Message {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    return append([]Message(nil), s.Messages...)
+}
+```
+
+这里返回 copy，而不是内部 slice。输入是当前 Session；输出是调用方可以安全读取的快照；状态不变；失败点是 Message 内部的 `ToolCalls` 仍需注意深复制，生产版本应定义不可变结构。
+
+写入：
+
+```go
+func (s *Session) Append(messages ...Message) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.Messages = append(s.Messages, messages...)
+}
+```
+
+输入是零个或多个消息；输出无；状态变化是 transcript 尾部增长；失败点是没有长度/角色校验。`Replace` 用于 compaction 或 reload，同样在锁内复制。
+
+## Save：为什么写临时文件
+
+`Save` 首先拒绝空 path，并创建父目录：
+
+```go
+if path == "" {
+    return errors.New("session path cannot be empty")
+}
+if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+    return err
+}
+```
+
+输入是目标 path；输出是可继续写的目录或 error；状态变化暂时没有替换正式文件；失败点是路径无效、权限不足或目录创建失败。
+
+然后创建临时文件：
+
+```go
+temporary, err := os.CreateTemp(filepath.Dir(path), ".session-*.tmp")
+```
+
+编码快照：
+
+```go
+encoder := json.NewEncoder(temporary)
+for _, message := range s.Snapshot() {
+    if err := encoder.Encode(message); err != nil {
+        return err
+    }
+}
+```
+
+输入是快照；输出是每条 Message 独占一行的 JSON；状态变化是临时文件增长；失败点是 JSON 无法编码或磁盘写失败。
+
+最后关闭并替换：
+
+```go
+if err := temporary.Close(); err != nil {
+    return err
+}
+return os.Rename(temporaryName, path)
+```
+
+输入是完整临时文件；输出是新 path；状态变化是目标文件指向完整快照；失败点是关闭失败、rename 跨文件系统失败或进程在 rename 前崩溃。defer 会删除留下的临时文件。
+
+注意：示例没有 `fsync`，也没有目录 fsync。它提供的是“避免直接覆盖导致半文件”的教学保护，不是断电级 durability。
+
+## LoadSession：逐行恢复
+
+缺失文件返回空 Session：
+
+```go
+if os.IsNotExist(err) {
+    return NewSession(), nil
+}
+```
+
+这适合第一次运行，但生产系统要区分“首次创建”和“路径拼错”。
+
+读取器设置 4 MiB 行上限：
+
+```go
+scanner := bufio.NewScanner(file)
+scanner.Buffer(make([]byte, 1024), 4<<20)
+```
+
+每行 decode：
+
+```go
+line++
+var message Message
+if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+    return nil, fmt.Errorf("decode session line %d: %w", line, err)
+}
+if message.Role == "" {
+    return nil, fmt.Errorf("session line %d has no role", line)
+}
+session.Append(message)
+```
+
+输入是完整一行；输出是 Message 或带行号的错误；状态变化是成功行加入 Session；失败点是坏 JSON、空 role 或超过 Scanner 上限的超长行。当前代码在第一次坏行就停止，不会静默跳过中间损坏。
+
+这是一项重要的工程选择：静默跳过坏行会让“损坏历史”看起来像“用户从没说过”。如果允许尾行截断，必须记录偏移、版本和修复动作。
+
+## Session、Context、Memory 的区别
+
+| 概念 | 本示例含义 | 作用 |
+| --- | --- | --- |
+| Session | JSONL 中的消息历史 | 跨进程保存和恢复 |
+| Context | 发给本轮 Model 的投影 | 受 token budget 限制 |
+| Memory | 经过选择/总结的长期事实 | 可被多个 Session 使用 |
+| Provider message | adapter 所需的请求形状 | 适配厂商协议 |
+
+Session 不必完整塞进 Context；Compaction 会从 Session 生成更短投影。Memory 也不是自动从每条消息可靠提取的数据库。
+
+## Harness 何时保存
+
+当前 `Harness.Prompt`：
+
+```go
+history := h.Session.Snapshot()
+history = append(history, Message{Role: RoleUser, Content: text})
+result, err := h.Agent.Run(ctx, history)
+h.Session.Replace(result.Messages)
+if h.SessionPath != "" {
+    if saveErr := h.Session.Save(h.SessionPath); saveErr != nil && err == nil {
+        return result, saveErr
+    }
+}
+return result, err
+```
+
+输入是 user text 和当前快照；输出是 RunResult/error；状态变化是用结果 history 替换 Session 并写盘；失败点是 Agent 在极早期返回空结果、Save 失败、并发 Prompt 或外部副作用未记录。
+
+这段代码说明示例边界，也提示一个改进：保存应由单 writer 串行化，并为 accepted prompt 写 operation intent。不能把这个 `Save` 解释成 exactly-once。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestSessionPersistenceAndCompaction|TestHarnessPersistsAndReloads'
+```
+
+预期两个测试通过。它们分别验证 JSONL round trip 和 Harness prompt 后的 reload。
+
+手动运行：
+
+```bash
+go run ./cmd/agent --demo
+cat .agent-session.jsonl
+```
+
+预期文件中至少有一行 user 和一行 assistant/tool 相关 JSON。`cat` 只是观察实验，不是代码逻辑；完成后删除该文件。
+
+## 测试设计
+
+### Round trip
+
+`TestSessionPersistenceAndCompaction` 使用临时目录，Append 两条消息，Save，再 Load，断言消息数量和内容。使用 `t.TempDir()` 避免污染仓库。
+
+### 坏 JSON
+
+建议添加：
+
+```text
+line 1: 合法 user
+line 2: {broken
+```
+
+断言 error 包含 `line 2`，并断言函数没有返回一个看似正常的半 Session。
+
+### 空 role 与超长行
+
+写入 `{"content":"x"}`，断言 `has no role`。写入超过 4 MiB 的单行，断言 Scanner error。测试必须实际使用临时文件，而不是依赖操作系统路径。
+
+### 原子替换失败
+
+在不同文件系统或权限目录注入 rename failure。当前实现会返回 error，但没有持久化旧文件的备份策略；生产版本需要另行设计。
+
+### 并发读写
+
+用多个 goroutine 调用 Snapshot 和 Append，运行 `go test -race ./...`。这里验证 mutex 保护的是 slice；它不验证多进程 writer。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/session-manager.ts`：Session entry、tree、leaf、branch 和 JSONL 管理。
+- `packages/agent/src/harness/session/session.ts`：Session 抽象与 append 约束。
+- `packages/agent/src/harness/session/context.ts`：从 Session 状态投影 Provider context。
+- `packages/coding-agent/docs/session-format.md`：记录格式和兼容边界。
+
+Go 版本把 `[]Message` 简化成平面历史；Pi 的 session 需要保留 entry id、parentId、metadata 和树导航。学习顺序应是先理解 JSONL round trip，再读 tree/recovery。
+
+## Java 对照
+
+Java `Session` 使用 Jackson 写 JSONL，并以临时文件和 atomic move 优先、不可支持时回退。对应关系：
+
+| Go | Java |
+| --- | --- |
+| `sync.RWMutex` | synchronized 方法/锁 |
+| `json.Encoder` | Jackson `ObjectMapper` |
+| `bufio.Scanner` | `BufferedReader` |
+| `os.Rename` | `Files.move` |
+| `error` | checked `IOException` |
+
+两版都应该让坏行报告行号。Java 的 `record` 让消息字段更容易不可变，Go 则需要避免把内部 slice 直接暴露给并发调用方。
+
+## 实验：人为损坏 Session
+
+### 目标
+
+观察“成功前缀可读”和“中间坏行必须显式失败”的差异。
+
+### 准备
+
+先运行 demo，复制 `.agent-session.jsonl` 到临时文件；打开 `session.go`。
+
+### 步骤
+
+1. 在文件尾部追加一行合法 assistant JSON。
+2. LoadSession，确认消息数量增加。
+3. 在中间插入 `{broken`。
+4. 再 LoadSession，记录错误行号。
+5. 把坏行移到最后，比较是否仍然失败。
+6. 设计“截断尾行”和“拒绝中间行”的生产策略。
+
+### 观察点
+
+当前实现对尾行和中间行一视同仁，第一次坏行就返回 error；它没有自动修复，也没有 header 版本。
+
+### 预期结果
+
+你不会把部分恢复误认为完整恢复。坏数据必须进入诊断路径，不能静默丢失。
+
+### 思考题
+
+如果 tool 已经修改文件但 Session 只保存到 assistant call，重启时如何知道是否重放？如果两个进程同时 Save，临时文件 + rename 能否解决顺序问题？需要什么 single writer 或 lock？
+
+## 小结与下一阶段
+
+Session 是跨进程的历史边界，JSONL 让记录可检查，但 atomic rename 不是完整事务。当前 Go 版本能保存和加载消息前缀，能报告坏行，也诚实地缺少 tree、版本、fsync、operation log 和跨进程恢复。
+
+下一阶段实现 `EstimateTokens` 和 `Compact`，学习如何在不把整个 Session 塞进 Context 的情况下保留 system、summary 与最近尾部。

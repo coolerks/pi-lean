@@ -5,8 +5,302 @@ description: "实现 read、write、edit、grep 和 shell，并先经过权限�
 
 # Go 05：基础 Coding Tools
 
-`builtin_tools.go` 将文件和命令能力实现为同一个 `Tool` 接口。`PermissionPolicy` 规范 workspace 内路径并拒绝明显危险 shell；这只是教学门，不是容器沙箱。
+## 本阶段完成什么
 
-## 实验
+把 Go 04 的 calculator 换成本地工作能力：`read`、`write`、`edit`、`grep` 和 `shell`。本页按“参数解码 → workspace policy → I/O → 有界 ToolResult”的顺序解释每个 Tool。
 
-为 `read` 加输出上限，为 `write` 加拒绝 workspace 外路径，为 `edit` 加“旧文本必须唯一”；再测试 shell timeout、命令失败和大输出。比较 sequential 与 parallel：读两个独立文件可以并行，write/read 同一文件必须保序。
+完成后你可以在临时目录里让 Agent 读取、修改和验证文件，也能说明为什么一个 shell Tool 会让 Coding Agent 变成高风险程序。
+
+## 本阶段不完成什么
+
+示例不提供 OS sandbox、网络隔离、进程组清理、symlink race 防护、完整 shell parser 或用户审批 UI。`PermissionPolicy` 是教学级第一道门，不是安全证明；生产系统仍需容器、最小权限账户、资源限制和审计。
+
+## 前置知识
+
+完成 Tool interface 和 Registry gate，理解 `os.ReadFile`、`os.WriteFile`、`filepath`、`filepath.WalkDir`、`os/exec`。所有实验使用 `t.TempDir()` 或明确 workspace。
+
+## 五个 Tool 的共同生命周期
+
+```text
+assistant ToolCall
+ -> Registry.Validate（名称/JSON object/required）
+ -> BeforeTool hook（若有）
+ -> arguments decode
+ -> PermissionPolicy
+ -> file/process I/O
+ -> output limit
+ -> ToolResult
+ -> RoleTool message
+```
+
+Tool Definition 只是模型可见的 metadata；真正执行发生在 `Execute`。每一个 Tool 都必须让错误返回，而不是 panic 或把错误写进看似成功的 Content。
+
+## PermissionPolicy：先规范路径
+
+```go
+type PermissionPolicy struct { Workspace string }
+
+func (p PermissionPolicy) ResolvePath(path string) (string, error) {
+    if p.Workspace == "" {
+        return "", fmt.Errorf("permission policy has no workspace")
+    }
+    candidate := path
+    if !filepath.IsAbs(candidate) {
+        candidate = filepath.Join(p.Workspace, candidate)
+    }
+    resolved, err := filepath.Abs(candidate)
+    if err != nil { return "", err }
+    workspace, err := filepath.Abs(p.Workspace)
+    if err != nil { return "", err }
+    if resolved != workspace && !strings.HasPrefix(
+        filepath.Clean(resolved), filepath.Clean(workspace)+string(os.PathSeparator),
+    ) {
+        return "", fmt.Errorf("path %q is outside workspace", path)
+    }
+    return filepath.Clean(resolved), nil
+}
+```
+
+相对路径从 workspace 解析；绝对路径仍要检查是否在 workspace 下。`Clean` 处理 `a/../b`，但不能解决 symlink 指向 workspace 外的问题；这是生产 sandbox 的工作。
+
+## read：读取并限制输出
+
+`ReadTool` 的核心逻辑：
+
+```go
+path, err := t.Policy.ResolvePath(input.Path)
+if err != nil { return ToolResult{}, err }
+content, err := os.ReadFile(path)
+if err != nil { return ToolResult{}, err }
+maxBytes := t.MaxBytes
+if maxBytes <= 0 { maxBytes = 32 << 10 }
+truncated := len(content) > maxBytes
+if truncated { content = content[:maxBytes] }
+result := string(content)
+if truncated {
+    result += fmt.Sprintf("\n[output truncated at %d bytes]", maxBytes)
+}
+return ToolResult{Content: result, Details: map[string]any{
+    "path": path, "truncated": truncated,
+}}, nil
+```
+
+先 ResolvePath 再 ReadFile，保证越权路径不会被打开。截断标志很重要：模型需要知道看到的是前缀，不应据此断言文件末尾内容。
+
+## write：创建目录并覆盖
+
+```go
+path, err := t.Policy.ResolvePath(input.Path)
+if err != nil { return ToolResult{}, err }
+if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+    return ToolResult{}, err
+}
+if err := os.WriteFile(path, []byte(input.Content), 0o644); err != nil {
+    return ToolResult{}, err
+}
+return ToolResult{
+    Content: fmt.Sprintf("wrote %d bytes to %s", len(input.Content), input.Path),
+    Details: map[string]any{"path": path},
+}, nil
+```
+
+当前实现是覆盖写。它没有 atomic temp+rename，也没有检查旧版本，所以不适合把大文件写入当成可恢复事务。`MkdirAll` 是便于教学的选择；生产权限要按目录类型收紧。
+
+## edit：旧文本必须唯一
+
+```go
+content, err := os.ReadFile(path)
+if err != nil { return ToolResult{}, err }
+count := strings.Count(string(content), input.OldText)
+if count != 1 {
+    return ToolResult{}, fmt.Errorf(
+        "oldText must occur exactly once, found %d", count,
+    )
+}
+updated := strings.Replace(string(content), input.OldText, input.NewText, 1)
+if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+    return ToolResult{}, err
+}
+return ToolResult{Content: "edited " + input.Path}, nil
+```
+
+count=0 表示目标不存在；count>1 表示编辑不确定。两者都应该停止而不是猜一个位置。这个唯一性检查类似 Pi `edit` 的安全意图，但不等于 patch transaction。
+
+## grep：有限命中
+
+`GrepTool` 使用 `filepath.WalkDir`：跳过目录，读取每个文件，遇到 NUL 字节跳过二进制内容，在 `MaxHits` 达到上限后停止。输出形状是：
+
+```text
+/path/to/file.go:42:matching line
+```
+
+Query 为空直接报错，因为空查询会匹配所有行并快速撑爆 context。当前实现没有正则语义；它是简单 substring search，文档不要声称是 ripgrep 的完整替代。
+
+## shell：把 context 接给子进程
+
+```go
+if err := t.Policy.CheckCommand(input.Command); err != nil {
+    return ToolResult{}, err
+}
+command := exec.CommandContext(ctx, "sh", "-c", input.Command)
+command.Dir = t.Policy.Workspace
+var output bytes.Buffer
+command.Stdout, command.Stderr = &output, &output
+err := command.Run()
+content := output.String()
+if len(content) > maxBytes {
+    content = content[:maxBytes] + fmt.Sprintf(
+        "\n[output truncated at %d bytes]", maxBytes,
+    )
+}
+if err != nil {
+    return ToolResult{Content: content, IsError: true,
+        Details: map[string]any{"exit": command.ProcessState.ExitCode()}}, err
+}
+return ToolResult{Content: content, Details: map[string]any{"exit": 0}}, nil
+```
+
+`CommandContext` 能在 context cancel 时请求终止进程；但 `sh -c` 可能派生子进程。`CheckCommand` 只拒绝空命令和明显危险字符串，如 `rm -rf`、`git push`、`curl | sh`，字符串黑名单可以被绕过，不能作为生产防护。
+
+## Tool error 如何回到 Loop
+
+当 `Execute` 返回 error，`executeOne` 把它变成 `ToolResult{IsError:true}`，随后 Loop 追加：
+
+```go
+Message{
+    Role: RoleTool,
+    Content: result.Content,
+    ToolCallID: call.ID,
+    ToolName: call.Name,
+    IsError: result.IsError,
+}
+```
+
+模型下一轮能看到“read 失败”或“命令退出失败”，但错误不会自动授予更高权限。安全拒绝、文件不存在、命令退出码和 context cancel 应在 telemetry 中保持可区分。
+
+## 失败 trace
+
+### 越权读取
+
+```text
+call read("../../secret")
+ -> JSON/schema gate 通过
+ -> ResolvePath 发现不在 workspace
+ -> 不执行 os.ReadFile
+ -> error ToolResult
+```
+
+### edit 不唯一
+
+```text
+oldText 出现 2 次
+ -> count != 1
+ -> 不执行 WriteFile
+ -> 返回明确错误
+```
+
+### 命令超时
+
+```text
+shell sleep 30
+ -> context.WithTimeout 到期
+ -> CommandContext 返回 context deadline exceeded
+ -> ToolResult.IsError=true
+ -> Loop 不继续执行该命令
+```
+
+### 输出过大
+
+```text
+cat large.log
+ -> command 完成
+ -> content 截断到 MaxBytes
+ -> result 带 truncated marker
+```
+
+输出限制不能代替命令资源限制：进程仍可能在内存中生成大输出，生产实现要用 pipe、限流和 OS resource control。
+
+## 测试设计
+
+使用 `t.TempDir` 创建文件；不要通过真实仓库测试。应覆盖：
+
+| Tool | 测试 |
+| --- | --- |
+| read | 读取成功、越权、文件不存在、超过 MaxBytes |
+| write | 创建子目录、覆盖、越权 |
+| edit | 0/1/2 次 oldText |
+| grep | 命中、空 query、MaxHits、二进制跳过 |
+| shell | 成功、非零退出、拒绝危险模式、context cancel、输出上限 |
+
+测试 Tool 的关键不是“返回了字符串”，而是断言失败时副作用没有发生。例如 write 越权后检查目标外目录仍不存在，edit count=2 后重新读取文件确认未改变。
+
+## 运行方式
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'Test.*Tool'
+go test -race ./...
+go vet ./...
+```
+
+当前测试的 `TestKnowledgeToolFiltersTenantAndReturnsCitations` 还展示了 RAG Tool 如何通过同一个 registry 接入；它与本地 coding tools 的权限边界不要混淆。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/tools/read.ts`、`write.ts`、`edit.ts` 是 Pi 具体工具入口。
+- `packages/coding-agent/src/core/tools/index.ts` 负责 `createCodingTools` 和 definitions。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall`/`executePreparedToolCall` 对应本页 gate 和执行边界。
+- `packages/coding-agent/docs/security.md` 以及 project trust/sandbox 代码提醒，allowlist 和 shell policy 都不是完整隔离。
+
+Pi 的工具还包含 diff/render、progress 和更丰富的 content block；Go 版本只保留能看懂安全边界的核心。
+
+## Java 对照
+
+| Go | Java 21 | 说明 |
+| --- | --- | --- |
+| `filepath.Abs/Clean` | `Path.toAbsolutePath().normalize()` | 路径规范化 |
+| `os.ReadFile` | `Files.readString` | 读取 |
+| `os.WriteFile` | `Files.writeString` | 写入 |
+| `exec.CommandContext` | `ProcessBuilder` + token | 启动命令 |
+| goroutine/WaitGroup | `ExecutorService` | 并行 batch |
+
+Java 和 Go 都不能把 `Path.normalize` 或字符串黑名单描述成 sandbox。两种实现都要把 permission check 放在 I/O/process 之前。
+
+## 实验：构建安全的临时 Coding Agent
+
+### 目标
+
+证明五个 Tool 的输入校验、权限和输出限制各自有效。
+
+### 准备
+
+创建临时目录，写入 `a.txt`（两行文本）和一个大于 32 KiB 的文件；准备一个 workspace 外的路径，但不要写入真实敏感文件。
+
+### 步骤
+
+1. 注册 `ReadTool`、`WriteTool`、`EditTool`、`GrepTool`、`ShellTool`。
+2. read `a.txt`，记录正常结果。
+3. read 大文件，检查 truncation marker。
+4. read `../outside`，确认策略先拒绝。
+5. edit 一个出现两次的 oldText，确认文件不变。
+6. write 子目录文件，再 grep 其内容。
+7. shell 执行 `printf ok`，然后执行 `git push`，比较成功和拒绝。
+8. 用 timeout 取消 `sleep`，观察 error result。
+
+### 观察点
+
+模型提供的 name/arguments 只是请求；Registry、Policy 和 Tool Executor 共同产生事实。Shell 成功也不意味着命令安全，只意味着示例 policy 没有拒绝它。
+
+### 预期结果
+
+越权、重复 edit、危险命令和超时都返回 error；合法读写能在 workspace 内完成；大输出被明确标记截断。
+
+### 思考题
+
+symlink 指向 workspace 外时当前 `ResolvePath` 为什么可能失效？为什么 retry 一个 write 和 retry 一个 GET 的风险不同？如果 shell 子进程再派生孙进程，单纯 `CommandContext` 是否足够？
+
+## 小结与下一阶段
+
+Coding Tool 是副作用边界，不是模型能力。Go 05 用 policy、唯一性和输出上限建立最小保护；下一阶段把这些 Tool 放回完整 Loop，并专门讨论 Message/Context 如何增长。

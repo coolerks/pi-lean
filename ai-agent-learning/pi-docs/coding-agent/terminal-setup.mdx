@@ -9,36 +9,103 @@ description: "不同终端的 capability override 和 TUI 设置。"
 
 ## 中文导读
 
-不同终端的 capability override 和 TUI 设置。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+Terminal Setup 解决的不是“哪款终端最好看”，而是终端能否把按键、鼠标、颜色、链接和图片能力准确传给 Pi。Pi 的 TUI 依赖一条完整链路：键盘 → 终端 emulator → tmux/SSH/IDE terminal（如果有）→ Pi。任意一层改写 escape sequence，都可能让 `Shift+Enter` 看起来像普通 Enter，或让滚轮事件丢失。
+
+本译文逐项保留源文档的终端差异。先理解 capability detection 和 override，再按自己使用的终端选择配置。环境变量、settings 和终端配置是三套不同层级；强制开启一项终端实际不支持的能力，通常比关闭它更难排查。
 
 ## 中文译文
 
-### 能力检测与强制覆盖
+### Kitty keyboard protocol 与能力检测
 
-Pi 使用 Kitty keyboard protocol 来可靠区分 modifier key；多数现代终端支持，但部分终端需要配置。Pi 还会自动检测 OSC 8 超链接、inline image protocol 和 truecolor。经过 tmux、远程终端或代理后检测可能不准确，可以用环境变量或 settings 强制覆盖：
+Pi 使用 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) 可靠识别 modifier key。很多现代终端开箱即用，但 IDE 内置终端、老终端、tmux 和远程连接可能只转发部分协议。
+
+Pi 还会自动检测三类能力：OSC 8 hyperlinks、inline image protocols 和 truecolor。检测值不是抽象偏好，而是 Pi 是否应该发送特定 escape sequence 的运行时输入。如果中间有 terminal proxy 或 multiplexer，自动检测结果可能反映中间层而不是最终显示器。
+
+### Capability Overrides
+
+自动检测失败时，可以使用环境变量或 JSON setting：
 
 | 能力 | 环境变量 | JSON setting |
 | --- | --- | --- |
 | OSC 8 hyperlinks | `PI_HYPERLINKS=1\|0\|auto` | `terminal.hyperlinks: true\|false\|"auto"` |
-| inline images | `PI_IMAGE_PROTOCOL=kitty\|iterm2\|none\|auto` | `terminal.images: "kitty"\|"iterm2"\|false\|"auto"` |
-| truecolor | `PI_TRUE_COLOR=1\|0\|auto` | `terminal.trueColor: true\|false\|"auto"` |
+| Inline images | `PI_IMAGE_PROTOCOL=kitty\|iterm2\|none\|auto` | `terminal.images: "kitty"\|"iterm2"\|false\|"auto"` |
+| Truecolor | `PI_TRUE_COLOR=1\|0\|auto` | `terminal.trueColor: true\|false\|"auto"` |
 
-settings 的优先级高于环境变量；未设置或 `auto` 会保留自动检测。只有在完整终端链路确实支持时才强制开启，否则发送的 escape sequence 可能破坏渲染。
+settings 优先于环境变量。未设置或设为 `auto` 时，Pi 继续使用检测结果；`1`/`true`、`0`/`false` 则表示强制启用或禁用。配置 precedence 的实际问题是：你可能在 shell 中设置了变量，却发现项目 settings 覆盖了它。
 
-### 各终端设置
+例如临时排查颜色：
 
-- **Kitty**：开箱即用。
-- **iTerm2**：regular TUI 开箱即用。fullscreen TUI 由 Pi 接管 viewport，鼠标滚轮会变成报告；如果 fast trackpad 只移动一行，进入 iTerm2 Settings → Advanced，将 `Trackpad scrolls fast?` 设为 `No`。这是全局 workaround，也可能改变原生触控板滚动。
-- **Apple Terminal**：可用时开启 enhanced key reporting；若 `Shift+Enter` 仍被当作普通 Return，Pi 在本机 macOS Terminal.app 使用 modifier fallback。通过 SSH 运行时无法读取远端键盘。
-- **Ghostty**：配置文件在 macOS 为 `~/Library/Application Support/com.mitchellh.ghostty/config`，Linux 为 `~/.config/ghostty/config`。推荐保留 `keybind = alt+backspace=text:\x1b\x7f`。不要误留旧的 `keybind = shift+enter=text:\n`：它发送 raw linefeed，在 Pi 中无法和 `Ctrl+J` 区分。fullscreen 中链接仍可点，但 Pi 捕获鼠标后 Ghostty 不显示 hover underline/URL preview；macOS 按 `Shift+Command`、Linux 按 `Shift+Ctrl` 可使用 Ghostty 原生链接处理。
-- **WezTerm**：通常通过 xterm modifyOtherKeys 支持 `Shift+Enter`。若要明确开启 Kitty protocol，在 `~/.wezterm.lua` 设置 `config.enable_kitty_keyboard = true`。macOS 默认把 `Option+Enter` 绑定为 fullscreen；若要将它用于 Pi follow-up queue，发送 `\x1b[13;3u`。WSL 的 CJK IME 候选框若不跟随光标，设置 `PI_HARDWARE_CURSOR=1` 或 settings 中 `showHardwareCursor: true`。
-- **Alacritty**：通常支持 `Shift+Enter`。macOS 若 `Option+Enter` 变成普通 Enter，在 `~/.config/alacritty/alacritty.toml` 将 Alt+Enter 发送为 `\u001b[13;3u`，修改后重启。
-- **VS Code integrated terminal**：VS Code 1.109.5 及以上默认开启 Kitty protocol。旧版本在 `keybindings.json` 添加 `workbench.action.terminal.sendSequence`，令 `Shift+Enter` 发送 `\u001b[13;2u`；文件位置为 macOS `~/Library/Application Support/Code/User/keybindings.json`、Linux `~/.config/Code/User/keybindings.json`、Windows `%APPDATA%\\Code\\User\\keybindings.json`。
-- **Windows Terminal**：原生 Windows 和 WSL 使用 Windows 风格快捷键：`Alt+V` 粘贴、fullscreen `Ctrl+F` 搜索、`Alt+P` 上一个模型、原生 Windows `Ctrl+Z` undo、WSL `Alt+Z` undo、`Ctrl+Q` follow-up、`Alt+Q` 恢复队列。要用 `Shift+Enter` 插入换行，在 Windows Terminal `settings.json` 增加 `sendInput`，发送 `\u001b[13;2u`；如果使用 `Alt+Enter`，把它转发给 Pi 并绑定 `app.message.followUp`。修改后完全关闭并重开 Windows Terminal。
-- **xfce4-terminal / terminator**：escape sequence 支持有限，`Ctrl+Enter`、`Shift+Enter` 无法和 Enter 区分，类似 `submit: ["ctrl+enter"]` 的绑定不能可靠工作。优先使用 Kitty、Ghostty、WezTerm、iTerm2 或支持 Kitty protocol 的 Alacritty。
-- **IntelliJ IDEA integrated terminal**：同样无法可靠区分 Shift+Enter 和 Enter。需要硬件光标时设置 `PI_HARDWARE_CURSOR=1`；更好的体验是使用专用 terminal emulator。
+```bash
+PI_TRUE_COLOR=0 pi
+```
 
-下面是几个最小配置片段。它们只展示终端如何转发按键，Pi action 的最终映射仍由 `keybindings.json` 决定：
+例如项目 settings 中关闭链接：
+
+```json
+{
+  "terminal": {
+    "hyperlinks": false
+  }
+}
+```
+
+上面的配置只展示形状，实际 settings 路径和加载优先级应以 `settings.md` 为准。只有完整终端链路支持某项能力时才强制开启；未支持的 escape sequence 可能破坏渲染、把文字显示成控制字符，甚至让后续键盘输入失步。
+
+> 译者注：`auto` 不是“永远开启”，而是把决定权留给检测器。调试时应记录“环境变量、settings、终端、multiplexer”四项，不能只贴一段 JSON 就断言问题解决。
+
+### Kitty
+
+Kitty 通常开箱即用，因为它原生支持 Pi 所需的键盘协议、颜色和相关终端能力。仍然要留意 tmux 或 SSH 是否位于 Kitty 与 Pi 之间；直接在 Kitty 中正常并不证明远程链路也正常。
+
+### iTerm2
+
+#### Regular TUI mode
+
+Regular TUI mode 下 iTerm2 通常开箱即用。regular 模式不完全接管终端 viewport，因此原生 scrollback 和 Pi 编辑器的滚动行为比较接近普通终端。
+
+#### Fullscreen TUI mode
+
+Fullscreen 模式下 Pi 拥有 viewport，iTerm2 会把鼠标滚轮变成 mouse-wheel reports，而不是滚动自己的 native scrollback。iTerm2 默认的 fast-trackpad 行为可能丢掉加速滚轮的大部分 delta，于是 fullscreen 滚动比 regular 慢很多。
+
+如果快速触控板手势每次只移动约一行：
+
+1. 打开 **iTerm2 → Settings → Advanced**。
+2. 搜索 **Trackpad scrolls fast?**。
+3. 设为 **No**。
+
+这是 iTerm2 全局 workaround，也可能改变其他程序的原生触控板滚动。源文档把底层问题关联到 [iTerm2 issue 9619](https://gitlab.com/gnachman/iterm2/-/work_items/9619)。
+
+### Apple Terminal
+
+Pi 在可用时启用 enhanced key reporting。如果 Terminal.app 仍然把 `Shift+Enter` 发送成普通 Return，Pi 在与 Terminal.app 运行于同一台 Mac 时使用本地 macOS modifier fallback，把它识别为 `Shift+Enter`。
+
+这个 fallback 读取的是本机键盘状态；通过 remote SSH 运行 Pi 时，远端进程不能检测本地 Mac 的键盘。因此“本机有效、SSH 无效”并不矛盾，应该修复远端终端链路或改用可识别的按键。
+
+> 译者注：Terminal.app 的 fallback 是 Pi 对特定终端的兼容逻辑，不是通用的键盘协议。不要把它当成 SSH 透明传输 modifier 的证据。
+
+### Ghostty
+
+在 Ghostty 配置中加入：
+
+```text
+keybind = alt+backspace=text:\x1b\x7f
+```
+
+macOS 配置路径是 `~/Library/Application Support/com.mitchellh.ghostty/config`，Linux 是 `~/.config/ghostty/config`。旧版 Claude Code 可能留下：
+
+```text
+keybind = shift+enter=text:\n
+```
+
+这一映射发送 raw linefeed byte。在 Pi 中它无法和 `Ctrl+J` 区分，因此 tmux 和 Pi 看不到真正的 `shift+enter` event。如果这个配置只是为了 Claude Code 2.x 或更新版本，通常可以删除；但在 tmux 中使用 Claude Code 时仍可能需要它。
+
+Pi 默认把 `Ctrl+J` 作为 newline alias，所以经过该 remap 后，tmux 内的 `Shift+Enter` 仍能插入换行，不需要额外 Pi binding。
+
+Fullscreen 模式下链接仍可点击，但由于 Pi 捕获鼠标输入，Ghostty 不显示 hover underline 或左下角 URL preview。macOS 按住 `Shift+Command`，Linux 按住 `Shift+Ctrl` 可使用 Ghostty 原生 link handling。
+
+### WezTerm
+
+WezTerm 通常通过 xterm modifyOtherKeys 支持 `Shift+Enter`。若要明确启用 Kitty protocol，在 `~/.wezterm.lua` 中写：
 
 ```lua
 local wezterm = require 'wezterm'
@@ -47,53 +114,158 @@ config.enable_kitty_keyboard = true
 return config
 ```
 
+macOS 上 WezTerm 默认把 `Option+Enter` 绑定为 fullscreen。要把它用于 Pi 的 follow-up queue，可发送对应 Kitty event：
+
+```lua
+local wezterm = require 'wezterm'
+local config = wezterm.config_builder()
+config.keys = {
+  {
+    key = 'Enter',
+    mods = 'ALT',
+    action = wezterm.action.SendString('\x1b[13;3u'),
+  },
+}
+return config
+```
+
+如果已有 `config.keys`，把 entry 合并进去，不要覆盖其他快捷键。WSL 中 CJK IME candidate window 可能需要 visible hardware cursor；候选框不跟随文字光标时，设置 `PI_HARDWARE_CURSOR=1` 或 settings 的 `showHardwareCursor: true`。
+
+### Alacritty
+
+Alacritty 通常可以处理 `Shift+Enter`。macOS 上 `Option+Enter` 可能变成普通 Enter；要把它用于 follow-up queue，在 `~/.config/alacritty/alacritty.toml` 添加：
+
 ```toml
 [[keyboard.bindings]]
 key = "Enter"
 mods = "Alt"
-chars = "\\u001b[13;3u"
+chars = "\u001b[13;3u"
 ```
+
+保存后重启 Alacritty。配置发送的是 escape sequence，Pi 的 action 映射仍由 Pi keybindings 决定；终端只负责传输事件。
+
+### VS Code Integrated Terminal
+
+VS Code 1.109.5 及更新版本默认在 integrated terminal 开启 Kitty keyboard protocol，`Shift+Enter` 通常开箱即用。更早版本需要手动设置 `keybindings.json`。
+
+路径如下：
+
+- macOS：`~/Library/Application Support/Code/User/keybindings.json`
+- Linux：`~/.config/Code/User/keybindings.json`
+- Windows：`%APPDATA%\\Code\\User\\keybindings.json`
+
+加入：
 
 ```json
 {
   "key": "shift+enter",
   "command": "workbench.action.terminal.sendSequence",
-  "args": { "text": "\\u001b[13;2u" },
+  "args": { "text": "\u001b[13;2u" },
   "when": "terminalFocus"
 }
 ```
 
-## 章节对照
+`when: terminalFocus` 限制了生效范围，避免编辑器本身也被重映射。修改后重新聚焦 terminal；若无效，先确认 VS Code 版本和是否还有 tmux 层。
 
-| 源文档标题 | 中文阅读标题 |
+### Windows Terminal
+
+原生 Windows 和 WSL 使用 Windows-style keybindings：
+
+| 按键 | Pi 行为 |
 | --- | --- |
-| Terminal Setup | Terminal Setup |
-| Capability Overrides | Capability Overrides |
-| Kitty | Kitty |
-| iTerm2 | iTerm2 |
-| Regular TUI mode | Regular TUI mode |
-| Fullscreen TUI mode | Fullscreen TUI mode |
-| Apple Terminal | Apple Terminal |
-| Ghostty | Ghostty |
-| Fullscreen TUI mode | Fullscreen TUI mode |
-| WezTerm | WezTerm |
-| Alacritty | Alacritty |
-| VS Code (Integrated Terminal) | VS Code (Integrated Terminal) |
-| Windows Terminal | Windows Terminal |
-| xfce4-terminal, terminator | xfce4-terminal, terminator |
-| IntelliJ IDEA (Integrated Terminal) | IntelliJ IDEA (Integrated Terminal) |
+| `Alt+V` | 粘贴图片或 clipboard text |
+| `Ctrl+F` | fullscreen transcript 搜索 |
+| `Ctrl+Up`/`Ctrl+Down` | 在 marked messages 间跳转 |
+| `Alt+P` | 切换到上一个 model |
+| 原生 Windows `Ctrl+Z` | undo editing |
+| WSL `Alt+Z` | undo editing；`Ctrl+Z` 可 suspend Pi |
+| `Ctrl+Q` | queue follow-up |
+| `Alt+Q` | 把 queued message 放回编辑器 |
 
-## 使用建议
+在 Windows Terminal 的 `settings.json`（Ctrl+Shift+, 或 Settings → Open JSON file）中转发 `Shift+Enter`：
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+```json
+{
+  "actions": [
+    {
+      "command": { "action": "sendInput", "input": "\u001b[13;2u" },
+      "keys": "shift+enter"
+    }
+  ]
+}
+```
 
-<Note>
+Windows Terminal 默认把 `Alt+Enter` 绑定为 fullscreen。若希望它代替 Pi 的 `Ctrl+Q` 作为 follow-up，配置 Terminal 发送这个键，并在 Pi 中把 `app.message.followUp` 绑定到 `alt+enter`。已有 `actions` 数组时只添加 object；改完完全退出再重新打开 Windows Terminal。
 
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+> 译者注：终端配置发送“编码后的键”，Pi keybindings 配置绑定“action”。两者不是同一个层级；键已经正确传到 Pi 但 action 未绑定时，仍然不会产生预期行为。
 
-</Note>
+### xfce4-terminal、terminator
+
+这两个终端的 escape sequence 支持有限，`Ctrl+Enter` 和 `Shift+Enter` 无法与普通 Enter 区分。因此像 `submit: ["ctrl+enter"]` 的自定义 binding 不可靠。
+
+更好的选择是支持 Kitty keyboard protocol 的：
+
+- [Kitty](https://sw.kovidgoyal.net/kitty/)
+- [Ghostty](https://ghostty.org/)
+- [WezTerm](https://wezfurlong.org/wezterm/)
+- [iTerm2](https://iterm2.com/)
+- [Alacritty](https://github.com/alacritty/alacritty)（需要编译时支持 Kitty protocol）
+
+### IntelliJ IDEA Integrated Terminal
+
+IntelliJ 内置 terminal 同样可能无法区分 Shift+Enter 和 Enter。若只希望显示 hardware cursor，可在启动前设置 `PI_HARDWARE_CURSOR=1`；默认关闭是为了兼容性。需要稳定的键盘协议和滚动时，考虑使用 dedicated terminal emulator。
+
+## 诊断实验：定位是哪一层改写了按键
+
+### 目标
+
+把“Pi 不识别 Shift+Enter”拆成终端、multiplexer、IDE 和 Pi action 四个可观察边界。
+
+### 准备
+
+准备一个无敏感内容的临时项目，分别在直接 terminal、tmux（若使用）和 Pi 中观察。不需要真实 Provider；也不要在排查时执行写文件命令。
+
+### 步骤
+
+1. 直接运行 `printf` 或终端自带按键诊断工具，确认终端是否能发送 modified Enter。
+2. 在没有 tmux 的 terminal 中启动 Pi，测试 `Shift+Enter`。
+3. 在 tmux 中重复测试，比较两条链路。
+4. 逐项检查 `PI_*` 环境变量和 settings JSON，确认是否被覆盖。
+5. 把 fullscreen 切换为 regular，分别测试滚轮、链接和文本选择。
+6. 若是 WezTerm/Alacritty/VS Code，确认配置已重启且没有覆盖整个 keys/actions 数组。
+7. 用 `PI_HARDWARE_CURSOR=1` 判断问题只是 IME 光标显示还是按键编码。
+
+### 观察点
+
+- 按键在直接终端有效、tmux 无效：优先查 tmux 转发。
+- Pi 收到换行但不是 Shift+Enter：查 Kitty/xterm 编码与 action binding。
+- 颜色异常但按键正常：只检查 truecolor，不要同时修改所有 capability。
+- fullscreen 滚动异常但 regular 正常：查 viewport、mouse report 和终端 trackpad 设置。
+
+### 思考题
+
+1. 为什么 `PI_TRUE_COLOR=1` 不能修复 Shift+Enter？
+2. 为什么在 SSH 远端运行 Pi 时 Apple Terminal fallback 不生效？
+3. 如果 `Shift+Enter` 到达 Pi 但 action 不改变，应该修改终端配置还是 `keybindings.json`？
+4. 为什么不应为了“看起来能用”强行开启 inline image protocol？
+5. 你的工作流应该选择 regular 还是 fullscreen？请按 scrollback、鼠标、IME 和链接需求说明。
+
+> 译者注：终端故障排查最有效的方法是一次只改一层并记录结果。把 terminal config、tmux config、Pi settings 同时改掉，会失去因果关系。
+
+## 与 Go、Java 和 Pi 的对照
+
+| 能力 | Pi/TypeScript | Go 教学实现 | Java 教学实现 |
+| --- | --- | --- | --- |
+| 取消 | `AbortSignal` | `context.Context` | `CancellationToken` + interruption |
+| 事件 | callback/event | callback/channel | Listener/EventSink |
+| 流式文本 | `AsyncIterable`/event stream | SSE scanner + callback | HttpClient body + callback |
+| 终端配置 | TUI 与 terminal capability | CLI 输出，不拥有 TUI | CLI 输出，不拥有 TUI |
+
+> 译者注：Go 和 Java 示例刻意不复刻 Pi 的终端渲染器。它们把 terminal 当作 UI 边界，把协议、取消和事件留在可测试的 Runtime 中。
+
+## 小结
+
+Pi 的终端体验取决于完整输入输出链路。先使用 `auto` 和默认配置，再用最小 override 验证单项能力；明确区分终端发送的 escape sequence、Pi 解析出的 key event 和最终 action。这样你能把“按键失效”变成可复现的分层问题。
 
 ## 完整原文对照
 

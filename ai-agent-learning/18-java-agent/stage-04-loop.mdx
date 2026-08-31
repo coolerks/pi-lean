@@ -1,10 +1,344 @@
 ---
-title: "Java 04：Agent Loop"
-description: "用有限 step 的 model → tool → result 循环实现 Agent。"
+title: "Java 04：AgentLoop.run 的完整闭环"
+description: "逐步追踪 history、assistant、Tool Result、follow-up、retry 与 maxSteps。"
 ---
 
-# Java 04：Agent Loop
+# Java 04：AgentLoop.run 的完整闭环
 
-`AgentLoop.run` 保存 `List<Message>`，每一步调用 `Model.complete`；assistant 有 tool calls 时执行、追加 `TOOL` 消息，再发下一次 request；无 tool call 时结束。`LoopOptions.maxSteps` 是硬上限。
+## 本阶段目标
 
-`ScriptedModel` 第一轮返回调用、第二轮返回文本；测试检查第二次 request 的最后一条消息和最终答案，而不是访问真实 Provider。
+到 Java 03 为止，我们有了 `Tool` 和 `ToolRegistry`，但没有任何组件把它们连续使用。`AgentLoop` 是把一次用户请求变成多轮模型请求的控制流：发送 history，接收 assistant，发现 Tool Call，执行工具，把 Tool Result 追加回 history，再发送下一轮。
+
+本页不把 Loop 说成“模型自己循环”。模型只处理一次 request；循环、状态和副作用都由 Java Runtime 拥有。完成本页后，你应能手写下面的 trace，并指出每一行由谁产生：
+
+```text
+user message
+ -> model request #1
+ -> assistant tool_call(id=c1)
+ -> registry validation
+ -> tool execution
+ -> role=TOOL(id=c1)
+ -> model request #2
+ -> assistant final text
+ -> run_end
+```
+
+本阶段暂不实现 durable operation log、Context compaction、MCP discovery 和 UI。先把内存中的有限 Loop 做对，后面才有资格讨论恢复。
+
+## 前置 Java 知识
+
+需要理解 `List` 的复制、record accessor、for 循环、checked exception 和 lambda。`AgentLoop` 接收三个依赖：
+
+```java
+public final class AgentLoop {
+    private final Model model;
+    private final ToolRegistry registry;
+    private final LoopOptions options;
+
+    public RunResult run(
+            List<Message> initial,
+            CancellationToken cancellation,
+            QueueSource queue) throws Exception;
+}
+```
+
+`model` 是 provider-neutral 的模型接口；`registry` 负责工具定义和校验；`options` 负责上限、执行模式、retry、hook 和事件。`initial` 是本次运行开始时已有的 history，Loop 会复制它，避免调用者的 list 被内部追加污染。
+
+## 为什么需要 history
+
+第一次 request 只有用户消息和工具 definitions：
+
+```json
+{
+  "messages": [{"role":"user", "content":"2 + 3"}],
+  "tools": [{"name":"calculator", "parameters":{}}]
+}
+```
+
+模型返回的 assistant tool call 不能丢掉，因为下一次请求必须让模型知道自己刚才要求了什么。Tool Result 也不能只放在 Java 日志里；它必须成为下一次 request 的 message：
+
+```json
+[
+  {"role":"user", "content":"2 + 3"},
+  {"role":"assistant", "tool_calls":[{"id":"c1","name":"calculator"}]},
+  {"role":"tool", "tool_call_id":"c1", "content":"5"}
+]
+```
+
+少掉 assistant call，provider 可能认为 tool result 没有对应请求；少掉 Tool Result，模型无法观察执行结果，只会再次猜测。`Message.tool` 同时保存 `toolCallId`、工具名、内容和错误标记。
+
+## `run` 的主循环
+
+下面是与当前项目一致的核心结构：
+
+```java
+List<Message> history = new ArrayList<>(
+        initial == null ? List.of() : initial);
+Message finalMessage = null;
+
+for (int step = 1; step <= options.maxSteps(); step++) {
+    history.addAll(source.steering());
+    emit(new Event("step_start", step, ""));
+    Response response = completeWithRetry(
+            new Request(history, registry.definitions()),
+            token, step);
+    Message assistant = response.message();
+    history.add(assistant);
+    finalMessage = assistant;
+
+    if (assistant.toolCalls().isEmpty()) {
+        List<Message> followUps = source.followUps();
+        if (followUps.isEmpty()) {
+            emit(new Event("run_end", step, response.stopReason()));
+            return new RunResult(history, finalMessage, step);
+        }
+        history.addAll(followUps);
+        continue;
+    }
+
+    List<ToolResult> results = executeBatch(
+            assistant, token, step);
+    for (int i = 0; i < results.size(); i++) {
+        history.add(Message.tool(
+                assistant.toolCalls().get(i), results.get(i)));
+    }
+}
+throw new IllegalStateException(
+        "max steps exceeded: " + options.maxSteps());
+```
+
+输入是初始 message，输出是 `RunResult(messages, finalMessage, steps)`；每个 step 至少产生一次模型请求，可能产生一批 Tool Result。没有 Tool Call 才可能结束；如果 follow-up 队列非空，Loop 继续而不是立即返回。
+
+## 第一步：消费 steering
+
+`QueueSource.steering()` 在每个 model request 前被调用。它让运行中的 Agent 在边界处加入用户修正：
+
+```text
+工具正在执行前：history = [user, assistant tool_call]
+用户发送 steering：不要碰数据库
+下一次 request：history + user steering
+```
+
+当前教学实现只把消息追加到 history，并发出 `steering` 事件。它不会把消息插入已经发出的 HTTP request，因为 request 发送后，模型看不到中途修改。
+
+## 第二步：发送模型请求与 retry
+
+```java
+private Response completeWithRetry(
+        Request request,
+        CancellationToken cancellation,
+        int step) throws Exception {
+    Exception last = null;
+    for (int attempt = 1;
+            attempt <= options.maxAttempts(); attempt++) {
+        cancellation.throwIfCancelled();
+        emit(new Event("model_attempt", step,
+                Integer.toString(attempt)));
+        try {
+            return model.complete(request, cancellation);
+        } catch (CancellationException exception) {
+            throw exception;
+        } catch (Exception exception) {
+            last = exception;
+            if (attempt == options.maxAttempts()) break;
+            sleepCancellable(
+                    options.baseDelayMillis()
+                            * (1L << (attempt - 1)),
+                    cancellation);
+        }
+    }
+    throw last == null
+            ? new IllegalStateException("model failed") : last;
+}
+```
+
+输入是同一份 request，输出是成功 `Response` 或最后一个异常。retry 不会重新构造带有额外 Tool Result 的 history；它只是重新发送这一次失败的模型请求。`CancellationException` 单独传播，不能被 catch 后当作 provider failure 重试。
+
+> 译者注：`Future.cancel(true)`、`CancellationToken.cancel()` 和 HTTP 远端取消都不是一回事。Java 只能要求本地代码停止；远端已经产生的计费或副作用未必能撤回，因此 telemetry 应记录 abort。
+
+## 第三步：assistant 是文本还是 Tool Call
+
+```java
+Message assistant = response.message();
+history.add(assistant);
+finalMessage = assistant;
+emit(new Event("assistant", step, assistant.content()));
+
+if (assistant.toolCalls().isEmpty()) {
+    // 没有工具调用：可能结束，也可能消费 follow-up
+}
+```
+
+先追加 assistant，再判断是否有 Tool Call。这样即使后续工具失败，history 也保留模型当时的决定。`stopReason` 是控制信号，`content` 是展示文本，不能只用“content 为空”判断工具调用。
+
+## 第四步：执行 batch 并建立配对消息
+
+```java
+List<ToolResult> results = executeBatch(assistant, token, step);
+for (int index = 0; index < results.size(); index++) {
+    ToolCall call = assistant.toolCalls().get(index);
+    ToolResult result = results.get(index);
+    history.add(Message.tool(call, result));
+}
+```
+
+`executeBatch` 内部先 `registry.validate(call)`，再运行 before hook 和 Tool。结果数组的下标与 assistant call 的下标一致；这就是为什么并行完成顺序不能直接当作历史顺序。错误 Tool Result 也要追加，下一轮模型可以根据错误调整。
+
+## follow-up 与结束边界
+
+没有 Tool Call 时，Loop 先读取 `followUps()`：
+
+```text
+assistant final
+ -> follow-up queue empty -> run_end
+assistant final
+ -> follow-up queue has message -> append user follow-up
+ -> next step model request
+```
+
+如果 Tool Result 的 `terminate` 全为 true，当前实现也会检查 follow-up。`follow-up` 和 steering 不同：steering 是下一次请求前修正当前工作，follow-up 是模型本来要结束时追加下一项工作；两者都必须在明确的 turn boundary 注入。
+
+## maxSteps 是最后的保险丝
+
+假设 ScriptedModel 每一轮都返回未知 Tool：
+
+```text
+step 1: assistant tool_call -> error result
+step 2: assistant tool_call -> error result
+step 3: assistant tool_call -> error result
+maxSteps=3 -> throw max steps exceeded
+```
+
+上限错误不是成功 final。调用者应保存已有 history，记录失败原因，并把该运行标成 failed；不能静默返回“已完成”。`maxAttempts` 和 `maxSteps` 解决不同问题：前者限制一次 request 的网络重试，后者限制整个决策循环。
+
+## ScriptedModel 如何让测试可重复
+
+```java
+ScriptedModel model = new ScriptedModel()
+        .add(new Response(
+                Message.assistant(List.of(new ToolCall(
+                        "c1", "calculator",
+                        mapper.readTree(
+                            "{\"operation\":\"add\","
+                          + "\"left\":2,\"right\":3}")))),
+                "tool_use", Usage.empty()))
+        .add(new Response(
+                Message.assistant("5"), "stop", Usage.empty()));
+```
+
+第一轮固定返回调用，第二轮固定返回文本。测试不需要真实 LLM，也不会因模型采样变化而不稳定。`ScriptedModel.requests()` 记录每一次 request，可以断言第二次 request 的最后一条 message 是 `TOOL`，而不是只断言最终字符串。
+
+## 失败 trace
+
+### Tool 失败但 Loop 继续
+
+```text
+assistant calculator(left=2,right=0)
+ -> schema gate 通过
+ -> execute 抛 division by zero
+ -> ToolResult(isError=true)
+ -> append role=TOOL
+ -> 下一次 model request
+```
+
+### 模型耗尽 retry
+
+```text
+request #1 -> IOException
+ -> backoff
+request #2 -> IOException
+ -> maxAttempts reached
+ -> throw last exception
+ -> 不执行任何 Tool
+```
+
+### 用户 abort
+
+```text
+model request / tool execution in flight
+ -> Agent.abort -> token.cancel
+ -> next cancellation check throws CancellationException
+ -> finally 清除 running 状态
+```
+
+### 无限工具调用
+
+```text
+每轮都有 tool_calls
+ -> 没有 final text
+ -> step 达到 maxSteps
+ -> failed，不是 completed
+```
+
+## JUnit 测试与运行
+
+当前项目的核心测试包括：
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest#executesToolAndSendsToolResultBack test
+mvn -q -Dtest=AgentTest#retryAndMaxStepsAreBounded test
+mvn -q -Dtest=AgentTest#abortCancelsAnInFlightModel test
+mvn test
+```
+
+应断言：`model.requests().size()` 从 1 变成 2；第二个 request 的最后一条消息 role 是 `TOOL`；最终内容为 `5`；retry 只在第一次 model failure 后发生；maxSteps 抛 `IllegalStateException`；abort 的 future cause 是 `CancellationException`。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent-loop.ts` 的 `runAgentLoop`、`runAgentLoopContinue`、`executeToolCalls` 对应本页的 request/assistant/tool-result 控制流。
+- `packages/agent/src/agent.ts` 的 `Agent` 和 `PendingMessageQueue` 保存 running、steering、follow-up、next-run 与 abort 状态。
+- `packages/ai/src/types.ts` 定义 provider-neutral `Context`、`AssistantMessage`、`ToolCall`、`Usage` 和 event 类型。
+- `packages/coding-agent/src/core/agent-session.ts` 把 loop event 连接到 session、UI 和工具 hook。
+
+Pi 的 Agent Loop 还处理 streaming、thinking、usage、tool render 和 provider-specific message conversion；本示例只把最小控制流暴露给 Java 学习者。
+
+## Go 对照
+
+| Java | Go | 责任 |
+| --- | --- | --- |
+| `List<Message>` | `[]Message` | 可传递 history |
+| `Model.complete` | `Model.Complete` | 一次模型请求 |
+| `CancellationToken` | `context.Context` | 取消与 deadline |
+| `CancellationException` | `context.Canceled` | 中止传播 |
+| `ExecutorService/Future` | goroutine/WaitGroup | batch 调度 |
+| `ScriptedModel` | `ScriptedModel` | 确定性测试 |
+
+Java 的 checked exception 显式出现在方法签名；Go 用返回值传播 error。两者都不应在 Loop 内吞掉模型错误。
+
+## 动手实验
+
+### 目标
+
+用日志还原一次 calculator 调用的完整生命周期，并人为触发 retry、follow-up 和 maxSteps。
+
+### 准备
+
+阅读 `AgentLoop.java`、`Message.java`、`ScriptedModel.java` 和 `AgentTest.java`。准备 JDK 21，不需要 API key。
+
+### 步骤
+
+1. 在 EventSink 中打印 step、event type 和 detail。
+2. 用两轮 ScriptedModel，确认第二次 request 包含 assistant call 与 Tool Result。
+3. 把 calculator 的 right 改成 0，观察 error Tool Result 是否回传。
+4. 让 ScriptedModel 第一次 `fail`、第二次返回文本，设置 `maxAttempts=2`。
+5. 让它只返回 Tool Call，设置 `maxSteps=2`，确认抛上限错误。
+6. 实现一个 QueueSource，在第一次 final 前返回 follow-up，观察 Loop 多一次 model request。
+
+### 观察点
+
+每次模型请求都携带完整 history；工具结果按 call id 配对；retry 不增加 step；follow-up 增加后续 step；abort 不产生成功 run_end。
+
+### 预期结果
+
+你能画出一条包含 `Request → Response → ToolResult → Request` 的时序，并指出 `Tool.execute` 只被 Runtime 调用一次。
+
+### 思考题
+
+如果 assistant 同时返回两个调用，一个成功一个失败，Loop 应继续吗？如果第二次 request 的 Tool Result 顺序错了，provider 可能如何解释？如果重试模型请求前 history 被另一个线程修改，会出现什么问题？
+
+## 小结与下一阶段
+
+`AgentLoop.run` 的核心不是一个无条件 `while(true)`，而是受 `maxSteps`、stop reason、Tool Call、follow-up、retry 和 cancellation 约束的状态机。下一阶段把 `AgentLoop` 接到 `Agent`、队列、Session 和 Harness，观察 Loop 外的生命周期责任。

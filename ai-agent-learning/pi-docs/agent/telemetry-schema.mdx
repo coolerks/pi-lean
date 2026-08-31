@@ -9,67 +9,568 @@ description: "Pi Agent 与 Harness 的遥测事件字段参考。"
 
 ## 中文导读
 
-Pi Agent 与 Harness 的遥测事件字段参考。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+这是一份字段级参考，不是把遥测概括成“记录几条日志”。源文件定义了 schema version、span 名称、父子关系、默认状态、错误条件、start/end attributes 和 Events。本文按源文件顺序逐项翻译；字段名、类型名、枚举值和 schema key 原样保留，解释放在中文列中。
+
+读者可以把一次 Agent 运行想成一棵 trace：外层 `pi.harness.run` 下面有 checkpoint、turn、step 和 tool；一次 provider 调用是 `pi.ai.request`；Session 写入则是独立的 `pi.session.write`。这些 span 描述“发生了什么”，不替代 session 的 durable records。
+
+> 译者注：`span` 是有开始和结束的操作范围，适合记录时长、父子关系和最终状态；`event` 是范围内某个时刻发生的一件事。这里 schema 的每个 span 都声明 `No declared span events`，并不表示系统没有事件，而是 Harness event contract 另有自己的事件流。
 
 ## 中文译文
 
-### 遥测文档怎么读
+## 基础术语
 
-这份 schema 描述的是 span，而不是把整段 prompt 写进日志。每个 span 有父子关系、默认状态、开始属性和结束属性。开始属性回答“这次操作是什么”，结束属性回答“它怎样结束”。`Required` 表示创建 span 时必须提供的字段；结束属性都是可选的补充信息，不能因为没有某个 usage 字段就把整次请求判为失败。
+| 原名 | 中文理解 | 阅读方法 |
+| --- | --- | --- |
+| Schema version | schema 契约版本 | 不是 Pi、Provider 或 model 版本；消费者应按版本兼容字段 |
+| Span name | 聚合维度 | 例如 `pi.ai.request`；名称应稳定、低基数 |
+| Parent | 父 span | 决定 trace 树；`root` 表示没有上游 span |
+| Start attributes | 开始属性 | 建立操作时就可确定，用来描述请求身份和计划 |
+| End attributes | 结束属性 | 操作结束后补充结果、usage、错误和 outcome |
+| Default status | 默认状态 | 没有错误时的状态，源 schema 为 `ok` |
+| Error when | 错误条件 | 何时 span 应以错误结束，而不是伪装成成功 |
+| High cardinality | 高基数 | 值的种类很多，例如每个 request 一个 id；适合精确定位，不适合作为 dashboard 分组 |
+| Low cardinality | 低基数 | 值的种类有限，例如 `stream` 或 `failed`；适合指标聚合 |
 
-### `pi.ai.request`：一次 Provider 请求
+> 译者注：高基数不是“禁止记录”。`pi.operation.id`、`pi.session.id` 和 response id 对排查单次故障有价值，但把它们作为指标 label 会造成时间序列爆炸。生产 exporter 应考虑采样、索引和访问控制。
 
-`pi.ai.request` 覆盖 `stream`、`fetch_deferred`、`cancel_deferred` 和 `generate_images` 等逻辑操作。创建时应记录 Provider id、model id、API id、是否 streaming，以及是否 deferred。请求完成后可以补充实际响应 model/id、规范化的 `stop_reason`、HTTP 状态、输入/输出/cache/reasoning token、总成本、chunk 数、首个 chunk 的延迟和低基数错误类型。
+> 译者注：start/end 不是“请求/响应两份日志”的同义词。start 属性必须在 span 开始时可用；end 属性只有在操作得到结果后才有意义。比如 `pi.session.seq` 代表已经提交的序号，不能在写入前提前上报。
 
-这里的 `response.id` 被标为 high cardinality：它适合排查单次请求，不适合作为聚合维度。`time_to_first_chunk_ms` 衡量首个增量事件，不等于整次 LLM latency；两者都应保留。Provider 抛出异常或返回错误结果时，span 状态才应变为 error。
+## AI request schema
 
-### `pi.harness.*`：可靠性边界
+Schema version：`1`。
 
-`pi.harness.run`、`compaction` 和 `navigation` 都对应一次已接纳的 Harness 操作，并要求 session、lane、operation id、是否 recovery 以及 operation kind。结束时写 `completed`、`aborted`、`failed` 或 `suspended` 等 outcome；稳定的 `error.code` 适合告警和统计，具体异常类名放在 `error.type`。
+### `pi.ai.request`
 
-`pi.harness.checkpoint` 是 run 内的提交边界，可区分 `normal`、`failure_drain` 和 `abort_reconcile`。`pi.harness.turn` 表示一次 assistant response 加其 Tool batch；`pi.harness.step` 表示一个可重试的 assistant、compaction 或 branch-summary attempt，因此 `attempt` 必须是一开始就确定的、从 1 开始的编号。overflow 不是普通失败，`step.outcome` 可以明确记录 `overflow` 或 `retry`。
+语义：向 AI Provider 发起的一次逻辑请求。它可以对应 stream、deferred fetch、deferred cancel 或 image generation；不要把它理解成某一个 HTTP packet。
 
-### Tool、Hook 与被动事件
+- **Parents：** `root` 或任意 caller span。
+- **Default status：** `ok`。
+- **Error when：** operation 抛出异常，或返回 error result。
 
-`pi.harness.tool` 只表示原始 phase-2 Tool 执行。开始时记录 tool name、call id、声明的 replay policy（`never` 或 `safe`）和是否 recovery；结束时记录 `is_error`。这不等于模型生成了一个 Tool Call：模型输出应由普通 message/event 记录，真正的副作用执行才创建 Tool span。
+> 译者注：这里的“逻辑请求”允许一次 adapter 操作跨越多个底层网络细节。Agent Loop 关心的是统一的 provider operation；具体 HTTP 重试次数应通过 step/attempt 或 attributes 另外观察。
 
-`pi.harness.hook` 记录 handler 的 name 和 registration id，结束 outcome 可以是 `completed`、`skipped`、`blocked` 或 `failed`。`pi.harness.event_handler` 是被动 listener 的调用 span；listener 出错仍应留下 `handler_error`，不能静默吞掉。`pi.harness.sleep` 专门记录 retry delay，并区分正常 elapsed 与 aborted。
+#### Start attributes（开始属性）
 
-### Session 写入与隐私
+以下六个字段全部来自源 schema。`yes` 翻译为必填，`no` 翻译为可选。
 
-`pi.session.write` 表示一次已提交的 session mutation：entry、record、lane 或 fact。只有 commit 成功后才应报告 committed sequence。schema 中多个 id 被标为 high cardinality，并不意味着可以发送原始文件、完整 Tool 参数、认证 header 或 prompt；采集端需要脱敏、采样和访问控制。跨 provider、run、turn、Tool 的关联使用 id，聚合使用低基数字段。
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.ai.operation` | `string` | yes | `stream`, `fetch_deferred`, `cancel_deferred`, `generate_images` | — | 逻辑上的 Provider 操作类型。 |
+| `pi.ai.provider` | `string` | yes | — | — | 被选择的 Provider id。 |
+| `pi.ai.model` | `string` | yes | — | — | 请求使用的 model id。 |
+| `pi.ai.api` | `string` | yes | — | — | Provider API id，例如某个消息或流适配器。 |
+| `pi.ai.streaming` | `boolean` | yes | — | — | 该 operation 是否返回 stream。它是协议形态，不等于是否会产生多个 Agent step。 |
+| `pi.ai.deferred` | `boolean` | no | — | — | 该 operation 是否请求或参与 deferred execution。 |
 
-**实验**：先用一次 ScriptedModel run 产生一个成功的 `pi.ai.request` 和 `pi.harness.run`，再注入 429、Tool exception、abort 和 compaction overflow。检查每个失败 span 有 outcome/error，usage 没有被误写进 message，日志中没有 API key 和文件正文。
+字段使用方式：start 时写入 provider/model/api，结束时才能把响应、usage 和错误挂回同一个 span。输入是模型调用选项和 provider 选择；输出是统一 response、stream 或 deferred handle，以及最终 span 状态。
+
+#### End attributes（结束属性）
+
+源文档说明所有 end attributes 都是可选的 completion enrichment。下面的 `Required` 因而统一写为 `no`，并保留源文件的字段类型、Values、Notes 和语义。
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.ai.response.model` | `string` | no | — | — | Provider 实际返回的 concrete model；可能与请求的 model 不同。 |
+| `pi.ai.response.id` | `string` | no | — | high cardinality | Provider response id；可用于定位单次响应，不宜作为聚合维度。 |
+| `pi.ai.response.stop_reason` | `string` | no | `stop`, `length`, `tool_use`, `error`, `aborted`, `deferred` | — | 归一化后的终止原因；它不是原始厂商字符串的盲转发。 |
+| `pi.ai.http.status_code` | `number` | no | — | — | 最终 HTTP status。重试时应明确它代表哪个最终/相关请求。 |
+| `pi.ai.usage.input_tokens` | `number` | no | — | — | Provider 报告的输入 token 数。 |
+| `pi.ai.usage.output_tokens` | `number` | no | — | — | Provider 报告的输出 token 数。 |
+| `pi.ai.usage.cache_read_tokens` | `number` | no | — | — | 从 cache 读取的 token 数。 |
+| `pi.ai.usage.cache_write_tokens` | `number` | no | — | — | 写入 cache 的 token 数。 |
+| `pi.ai.usage.reasoning_tokens` | `number` | no | — | — | Provider 报告的 reasoning token 数。 |
+| `pi.ai.usage.total_tokens` | `number` | no | — | — | Provider 报告的总 token 数。 |
+| `pi.ai.usage.cost` | `number` | no | — | — | Provider 报告或 adapter 计算的总成本。 |
+| `pi.ai.stream.chunk_count` | `number` | no | — | — | stream update chunk 的数量，不等于 token 数。 |
+| `pi.ai.stream.time_to_first_chunk_ms` | `number` | no | — | — | 从请求开始到第一个 update chunk 的毫秒数。 |
+| `pi.ai.error.type` | `string` | no | — | low cardinality | Provider 或 transport 的错误类别。 |
+
+> 译者注：usage 字段和 `pi.ai.stream.chunk_count` 必须分开。一个 chunk 可能包含多个 token，也可能只包含状态变化；用 chunk 数推算成本会得到错误账单。
+
+#### Events
+
+源文档为：**No declared span events**。也就是说，`pi.ai.request` 本身没有在这个 schema 中声明专用 span event。Provider stream 的增量应由 stream/event contract 表达，不能擅自把每个 delta 当成新的 span。
+
+#### 一个完整例子
+
+```text
+start: pi.ai.request
+  pi.ai.operation=stream
+  pi.ai.provider=openai
+  pi.ai.model=<requested-model>
+  pi.ai.api=<provider-api>
+  pi.ai.streaming=true
+  pi.ai.deferred=false
+receive updates
+end:
+  pi.ai.stream.chunk_count=12
+  pi.ai.stream.time_to_first_chunk_ms=320
+  pi.ai.usage.input_tokens=1200
+  pi.ai.usage.output_tokens=80
+  pi.ai.response.stop_reason=tool_use
+status=ok
+```
+
+输入是一次 provider-neutral request，输出是 settled response 或 tool call；状态变化包括 start、若干 stream update 和 end。若 HTTP 429、坏 JSON、断流或 abort，`pi.ai.error.type` 与错误 status 必须如实表达，不能写成正常 `stop`。
+
+## Harness schema
+
+Schema version：`1`。
+
+Harness span 的共同原则是：它们观察 admitted operation、checkpoint、turn、step、tool、hook、sleep、event handler 和 session mutation。父子关系让读者可以从一个用户 prompt 追到具体 tool；持久化记录仍然由 Session/operation log 负责。
+
+> 译者注：`Default status: ok` 只是默认值，不是成功承诺。`pi.harness.run` 可能最终是 `failed` 或 `suspended`；监控必须分别统计 accepted invocation、completed outcome 和 error。
+
+### `pi.harness.run`
+
+语义：一次已经 admitted 的 in-process run invocation。
+
+- **Parents：** `root` 或 caller-owned external span。
+- **Default status：** `ok`。
+- **Error when：** run fails 或 throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.session.id` | `string` | yes | — | high cardinality | Session id；把这次 run 关联到持久会话。 |
+| `pi.lane.name` | `string` | yes | — | high cardinality | lane name；区分同一 session 中的并发工作线。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | durable operation id；一次 admitted operation 的身份。 |
+| `pi.operation.recovery` | `boolean` | yes | — | — | 本次 invocation 是否在恢复 durable work。 |
+| `pi.operation.kind` | `string` | yes | `run` | — | operation kind；此 span 固定为 run。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.operation.outcome` | `string` | no | `completed`, `aborted`, `failed`, `suspended` | — | run invocation 的最终结果。 |
+| `pi.error.code` | `string` | no | — | low cardinality | 稳定的 operation error code。 |
+| `pi.error.type` | `string` | no | — | low cardinality | 低基数的 operation error class。 |
+
+#### Events
+
+No declared span events。run 的 live event（例如 `run_start`、`run_end`）属于 Harness event stream，不是本 span schema 的 declared events。
+
+#### 输入、输出和排障
+
+输入是 session/lane/operation identity 和 recovery flag；输出是 outcome。若调用方只拿到 “accepted” 就把它计为完成，会漏掉 suspended/failed。排障时先看 operation outcome，再沿 parent 关系查看 step 和 tool。
+
+### `pi.harness.compaction`
+
+语义：一次已经 admitted 的 in-process manual compaction invocation。
+
+- **Parents：** `root` 或 caller-owned external span。
+- **Default status：** `ok`。
+- **Error when：** compaction fails 或 throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.session.id` | `string` | yes | — | high cardinality | 被压缩的 Session id。 |
+| `pi.lane.name` | `string` | yes | — | high cardinality | 执行 compaction 的 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | compaction operation 的 durable identity。 |
+| `pi.operation.recovery` | `boolean` | yes | — | — | 本次 compaction 是否在恢复操作。 |
+| `pi.operation.kind` | `string` | yes | `compaction` | — | operation kind；此 span 固定为 compaction。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.operation.outcome` | `string` | no | `completed`, `declined`, `aborted`, `failed` | — | compaction invocation 的最终结果；`declined` 通常代表策略或 hook 拒绝。 |
+| `pi.error.code` | `string` | no | — | low cardinality | 稳定错误 code。 |
+| `pi.error.type` | `string` | no | — | low cardinality | 低基数错误类别。 |
+
+#### Events 与实验
+
+No declared span events。手工触发 compaction，观察 start/end 与 `declined` 的区别；如果没有生成 operation record，不能用 span 代替恢复依据。
+
+> 译者注：compaction span 记录“压缩操作”，不记录 summary 的全部内容。summary 可能包含源代码和用户指令，默认 telemetry 不应把它自动写入 span attributes。
+
+### `pi.harness.navigation`
+
+语义：一次已经 admitted 的 navigation invocation。
+
+- **Parents：** `root` 或 caller-owned external span。
+- **Default status：** `ok`。
+- **Error when：** navigation fails 或 throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.session.id` | `string` | yes | — | high cardinality | 被导航的 Session id。 |
+| `pi.lane.name` | `string` | yes | — | high cardinality | 发生 leaf navigation 的 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | navigation operation 的 identity。 |
+| `pi.operation.recovery` | `boolean` | yes | — | — | 是否在恢复 navigation work。 |
+| `pi.operation.kind` | `string` | yes | `navigation` | — | operation kind；固定为 navigation。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.operation.outcome` | `string` | no | `completed`, `declined`, `aborted`, `failed` | — | navigation 的最终结果。 |
+| `pi.error.code` | `string` | no | — | low cardinality | 稳定错误 code。 |
+| `pi.error.type` | `string` | no | — | low cardinality | 低基数错误类别。 |
+
+#### Events 与实验
+
+No declared span events。可在临时 session 中切换 tree leaf，验证 `pi.harness.navigation` 的父级和 outcome；不要把 UI 选择器的每次按键当成 navigation span。
+
+### `pi.harness.checkpoint`
+
+语义：一次 run checkpoint。
+
+- **Parents：** `pi.harness.run`。
+- **Default status：** `ok`。
+- **Error when：** checkpoint work throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | checkpoint 所属 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | checkpoint 所属 operation。 |
+| `pi.checkpoint.kind` | `string` | yes | `normal`, `failure_drain`, `abort_reconcile` | — | checkpoint 的目的：普通边界、失败排空或 abort reconciliation。 |
+
+#### End attributes
+
+源文档显式给出 `_none_`；没有声明结束属性。不要自行添加“成功消息”等字段。
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `_none_` | — | — | — | — | 源 schema 没有 end attribute。 |
+
+#### Events 与实验
+
+No declared span events。让一次 run 经过正常 checkpoint，再构造 failure drain 或 abort reconcile，检查 `pi.checkpoint.kind` 是否属于规定枚举。
+
+> 译者注：checkpoint 是观察边界，不是新的 operation。它的 parent 是 run，说明它属于一次运行；`pi.operation.id` 仍然指向同一个 durable operation。
+
+### `pi.harness.turn`
+
+语义：一次 assistant response 及其完整 tool batch。
+
+- **Parents：** `pi.harness.run`。
+- **Default status：** `ok`。
+- **Error when：** turn work throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | turn 所属 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | turn 所属 durable operation。 |
+| `pi.turn.id` | `string` | yes | — | high cardinality | invocation-local turn id，用于关联同一批响应和工具。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `_none_` | — | — | — | — | 源 schema 没有 end attribute。 |
+
+#### Events 与实验
+
+No declared span events。一次 assistant 不调用工具和一次调用多个工具都各自形成 turn；用 `pi.turn.id` 关联 batch，不要把它当成 session id。
+
+### `pi.harness.step`
+
+语义：一次 durable retry attempt。
+
+- **Parents：** `pi.harness.turn`、`pi.harness.checkpoint`、`pi.harness.compaction` 或 `pi.harness.navigation`。
+- **Default status：** `ok`。
+- **Error when：** attempt retry、失败或抛异常。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | step 所属 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | step 所属 operation。 |
+| `pi.step.kind` | `string` | yes | `assistant`, `compaction`, `branch_summary` | — | 可重试的工作类型。 |
+| `pi.step.attempt` | `number` | yes | — | — | 从 1 开始的 durable attempt number；重启后不能归零。 |
+| `pi.compaction.reason` | `string` | no | `manual`, `threshold`, `overflow` | — | compaction 触发原因；非 compaction step 时不应伪造。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.step.outcome` | `string` | no | `succeeded`, `retry`, `failed`, `aborted`, `deferred`, `overflow` | — | attempt 的结果。 |
+
+#### Events 与实验
+
+No declared span events。让 fake model 第一次失败、第二次成功，验证两次 attempt 的关系；检查 retry 不会把失败 attempt 伪装为成功。
+
+> 译者注：`pi.step.attempt` 是持久化重试次数，不等同于 HTTP client 内部重试计数。两层都存在时，必须在实现文档中说明各自 owner。
+
+### `pi.harness.tool`
+
+语义：一次 raw phase-2 tool execution。
+
+- **Parents：** `pi.harness.turn` 或 `pi.harness.run`。
+- **Default status：** `ok`。
+- **Error when：** raw phase-2 execution 返回 error。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | tool 执行所在 lane。 |
+| `pi.operation.id` | `string` | yes | — | high cardinality | tool 所属 operation。 |
+| `pi.turn.id` | `string` | no | — | high cardinality | invocation-local live turn id。 |
+| `pi.tool.name` | `string` | yes | — | — | 被执行的 tool name。 |
+| `pi.tool.call_id` | `string` | yes | — | high cardinality | 模型返回的 tool call id。 |
+| `pi.tool.replay` | `string` | yes | `never`, `safe` | — | 声明该 tool 是否允许安全 replay。 |
+| `pi.tool.recovery` | `boolean` | yes | — | — | 这次执行是否属于 recovery。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.tool.is_error` | `boolean` | no | — | — | raw phase-2 execution 是否返回 error。 |
+
+#### Events、输入输出与实验
+
+No declared span events。执行链是 assistant ToolCall → validation/before_tool → tool span → phase-2 effect → tool span end → session tool-result commit。输入是工具名、call id 和 replay policy；输出是执行结果或 error。`safe` 是声明，不是幂等性的证明。
+
+> 译者注：模型生成 ToolCall 不等于 tool span 已开始，更不等于工具执行成功。只有通过校验、权限和 before hook 后，Runtime 才能进入 phase-2 effect。
+
+### `pi.harness.hook`
+
+语义：一次已注册 hook handler invocation。
+
+- **Parents：** `root` 或任意 caller span。
+- **Default status：** `ok`。
+- **Error when：** handler throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | hook 运行所在 lane。 |
+| `pi.operation.id` | `string` | no | — | high cardinality | operation 已被接受时的 durable id。 |
+| `pi.hook.name` | `string` | yes | `before_run`, `before_resume`, `before_run_end`, `transform_context`, `before_request`, `before_payload`, `after_response`, `before_tool`, `after_tool`, `before_compaction`, `before_navigation` | — | 被调用的 hook 名称。 |
+| `pi.hook.registration_id` | `string` | no | — | — | 稳定的 hook 注册 id，用于恢复和重放关联。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.hook.outcome` | `string` | no | `completed`, `skipped`, `blocked`, `failed` | — | handler 的结果。`blocked` 不应与存储故障混为一谈。 |
+
+#### Events 与实验
+
+No declared span events。分别让 `before_tool` 阻止调用、让普通 handler 抛错，比较 `blocked` 与 `failed`；再验证 handler_error 事件不会递归产生无限 span。
+
+> 译者注：hook span 记录 handler 调用，但不能告诉你 hook 是否采用 fail-closed。这个安全策略要看宿主实现和测试，不能从一个 status 字段反推。
+
+### `pi.harness.sleep`
+
+语义：一次 retry delay。
+
+- **Parents：** `pi.harness.step` 或 `pi.harness.run`。
+- **Default status：** `ok`。
+- **Error when：** sleep work throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.operation.id` | `string` | yes | — | high cardinality | delay 所属 operation。 |
+| `pi.sleep.delay_ms` | `number` | yes | — | — | 请求等待的毫秒数。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.sleep.outcome` | `string` | no | `elapsed`, `aborted` | — | delay 是正常耗尽还是被取消。 |
+
+#### Events 与实验
+
+No declared span events。让 retry policy 产生 delay，再 abort；检查 `elapsed` 和 `aborted` 不被合并为普通成功。
+
+### `pi.harness.event_handler`
+
+语义：一次被动 event listener invocation。
+
+- **Parents：** `root` 或任意 caller span。
+- **Default status：** `ok`。
+- **Error when：** listener throws。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.event.type` | `string` | yes | `run_start`, `run_resume`, `run_suspend`, `run_abort`, `run_end`, `fault`, `handler_error`, `turn_start`, `turn_end`, `retry_scheduled`, `retry_start`, `retry_end`, `message_start`, `message_update`, `message_end`, `tool_start`, `tool_update`, `tool_end`, `entry_added`, `write_pending`, `queue_update`, `fact_update`, `config_update`, `compaction_start`, `compaction_end`, `navigation_start`, `navigation_end`, `lane_created`, `usage` | low cardinality | 已投递的 Harness event type；枚举应保持原样。 |
+| `pi.lane.name` | `string` | no | — | high cardinality | lane-scoped event 所属 lane。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `_none_` | — | — | — | — | 源 schema 没有 end attribute。 |
+
+#### Events 与实验
+
+No declared span events。这里最容易混淆：`pi.event.type` 是一个 span attribute，它描述被 listener 处理的 Harness event；它不等于 schema 的 declared span events。让 listener 抛错，检查 `handler_error` 是否被记录且不会改变已提交事实。
+
+> 译者注：event handler span 的 parent 可以是 root，因为它是被动 listener invocation；这不代表被监听的 run 消失了。真正的因果关联还需要 event 中的 operation/lane identity 或其他 context。
+
+### `pi.session.write`
+
+语义：一次已经提交的 Session mutation。
+
+- **Parents：** `root` 或任意 caller span。
+- **Default status：** `ok`。
+- **Error when：** storage rejects the mutation。
+
+#### Start attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.lane.name` | `string` | yes | — | high cardinality | mutation 所属 lane。 |
+| `pi.operation.id` | `string` | no | — | high cardinality | 已接受 operation 时的 operation id。 |
+| `pi.session.mutation` | `string` | yes | `entry`, `record`, `lane`, `fact` | — | Session mutation 的种类。 |
+| `pi.session.item_type` | `string` | no | — | — | entry、record、lane 或 fact 的具体子类型。 |
+
+#### End attributes
+
+| Name | Type | Required | Values | Notes | Description（中文） |
+| --- | --- | --- | --- | --- | --- |
+| `pi.session.seq` | `number` | no | — | — | storage commit 成功后暴露的 Session sequence。 |
+
+#### Events、提交语义与实验
+
+No declared span events。先执行一次成功 append，再注入 storage rejection；成功时才允许 `pi.session.seq` 出现在 end attributes。不能在写入开始前把 span 命名成 committed，也不能用它推断 operation intent 已经执行。
+
+> 译者注：`pi.session.write` 和 operation intent 是两个方向：前者说明 mutation 已提交，后者说明“准备执行什么”。如果把二者合并，崩溃恢复时就无法区分已计划、已执行和已落盘。
+
+## 隐私、成本与实现对照
+
+源 schema 没有要求把 prompt、completion、tool args、tool output、文件内容、payload、headers 或 credentials 写入 attributes。默认 exporter 应采用 data minimization：只记录诊断必要的身份、耗时、状态、usage 和低基数错误。
+
+| 数据 | 默认处理 | 原因 |
+| --- | --- | --- |
+| provider、model、api | 可记录 | 低基数运营维度，便于比较延迟和错误 |
+| response.id、session.id、operation.id | 谨慎记录 | 高基数；需要采样、访问控制和 retention 策略 |
+| token、latency、stop reason、outcome | 可记录 | 成本、性能和可靠性指标 |
+| prompt、completion、tool args/output | 默认不记录 | 可能包含用户秘密、源代码和个人数据 |
+| Authorization、cookie、API key | 不进入普通 telemetry | 凭据泄漏风险 |
+
+> 译者注：redaction 不是把所有文本替换成 `***` 就结束。要在属性进入 exporter 前阻止敏感字段，限制日志异常 body，控制谁能查询高基数 id，并为调试采集设置明确的 opt-in 和 retention。
+
+一次 retry 可能产生多次 AI request 和多笔成本；成本应按清晰的 usage ledger 汇总，而不是把 listener 看到的 span 随意相加。`pi.ai.usage.cost` 是 reported/adapter-derived value，不能在没有来源标记时用字符数冒充。
+
+### Java 与 Go 对照
+
+| Pi/TypeScript | Java | Go | 中文说明 |
+| --- | --- | --- | --- |
+| span callback/context | OpenTelemetry `Context`、try-with-resources scope、Listener | `context.Context`、显式 recorder | parent 关系应显式传递，不使用隐式全局 current span |
+| `AbortSignal` | `CancellationToken`/thread interruption | `ctx.Done()` | 取消只表达意图；远端计费未必撤销 |
+| high-cardinality attribute | immutable map + redaction | struct/map，默认禁止 payload | 记录 id 前要考虑采样、权限和查询成本 |
+| parent span | `Span.makeCurrent()` 或显式 parent | context 中携带 trace state | span 生命周期必须成对结束 |
+| no-op telemetry | no-op interface | no-op function/recorder | 遥测失败不应改变 Agent 主流程 |
+
+Java 侧可用 OpenTelemetry SDK 建立 span，用 `try`/`finally` 或 `try-with-resources` 结束 scope；Listener 适合测试事件，不等于 OpenTelemetry span。Go 侧可用 struct 保存稳定 attributes，以 `context.Context` 传递取消和 trace metadata；不要把 context 当作可变业务状态仓库。
+
+> 译者注：Java `Listener`/Go callback 通常是进程内观察者；OpenTelemetry exporter 还涉及 batching、采样和网络失败。两层都要测试，但不要让 exporter 的异常回滚已提交的 Session。
+
+## 可执行实验
+
+### 实验 1：无工具请求
+
+**目标：** 区分 `pi.ai.request`、`pi.harness.run` 与 session write。
+
+**准备：** 使用 Go/Java `ScriptedModel`，启用内存 recorder，不配置真实 Provider。
+
+**步骤：**
+
+1. 发起一个只返回文本的 prompt。
+2. 记录三个 span 的 name、parent、start/end attributes。
+3. 对照 required 字段检查缺失项。
+4. 确认 prompt 和 completion 没有被写入 telemetry。
+
+**预期：** request 是 AI provider 操作，run 是 admitted invocation，session.write 才表示 mutation commit；三者不是同一条日志。
+
+### 实验 2：重试与 usage
+
+**目标：** 证明重试不能覆盖成本和 attempt。
+
+**步骤：**
+
+1. 让 fake model 第一次返回 429，第二次返回文本。
+2. 为每次逻辑请求记录 operation、model、status 和 usage。
+3. 记录 `pi.harness.step` 的 `pi.step.attempt`。
+4. 观察最终 outcome 与失败尝试的关系。
+
+**预期：** retry 是可观察的，失败 attempt 不会被误报为成功；总成本取决于明确的 ledger 规则。
+
+### 实验 3：工具失败与恢复
+
+**目标：** 区分 ToolCall、tool effect、tool span 和 session result。
+
+**步骤：**
+
+1. 让 ScriptedModel 返回一个 tool call。
+2. 让 before hook 阻止一次，再让工具执行抛错一次。
+3. 分别检查 hook outcome、tool `is_error`、run outcome 和 session write。
+4. 模拟 crash 后恢复，确认 telemetry 不会单独决定是否 replay。
+
+**预期：** 模型输出不是执行事实；`safe` replay 也不能替代幂等策略。
+
+### 实验 4：隐私检查
+
+**目标：** 防止敏感内容进入遥测。
+
+**步骤：**
+
+1. 在 prompt、tool args、文件正文中放入假 token。
+2. 运行 exporter 前扫描所有 attributes。
+3. 断言只出现允许的 ids、状态、usage 和 duration。
+4. 检查异常 body 和 headers 是否经过 redaction。
+
+**思考题：**
+
+- 为什么 `response.id` 可以用于排障，却不应成为主要 metrics label？
+- `pi.session.seq` 如果在 storage 失败前已经上报，会破坏什么事实？
+- `pi.harness.tool` 的 `replay=safe` 由谁证明，而不是由谁声明？
+- 一个 listener 抛错时，为什么不能回滚已经提交的 Session？
+
+## 小结
+
+这份 schema 的核心不是字段数量，而是字段之间的边界：AI request 描述 Provider 操作；run/compaction/navigation 描述 admitted operation；checkpoint、turn、step 描述运行结构；tool、hook、sleep 和 event_handler 描述执行与观察；session.write 描述已提交 mutation。
+
+阅读任何一条 telemetry 时，按以下顺序检查：span name → parent → start identity → end outcome → usage/error → privacy。Telemetry 是 passive diagnostics，不是 Agent Loop、Session reducer 或 durable recovery 的替代品。
 
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |
 | --- | --- |
-| Pi Agent Telemetry Schemas | Pi Agent Telemetry Schemas |
+| Pi Agent Telemetry Schemas | Pi Agent 遥测 Schema |
 | AI request schema | AI request schema |
-| `pi.ai.request` | pi.ai.request |
+| `pi.ai.request` | `pi.ai.request` |
 | Harness schema | Harness schema |
-| `pi.harness.run` | pi.harness.run |
-| `pi.harness.compaction` | pi.harness.Compaction |
-| `pi.harness.navigation` | pi.harness.navigation |
-| `pi.harness.checkpoint` | pi.harness.checkpoint |
-| `pi.harness.turn` | pi.harness.turn |
-| `pi.harness.step` | pi.harness.step |
-| `pi.harness.tool` | pi.harness.tool |
-| `pi.harness.hook` | pi.harness.hook |
-| `pi.harness.sleep` | pi.harness.sleep |
-| `pi.harness.event_handler` | pi.harness.event_handler |
-| `pi.session.write` | pi.session.write |
+| `pi.harness.run` | `pi.harness.run` |
+| `pi.harness.compaction` | `pi.harness.compaction` |
+| `pi.harness.navigation` | `pi.harness.navigation` |
+| `pi.harness.checkpoint` | `pi.harness.checkpoint` |
+| `pi.harness.turn` | `pi.harness.turn` |
+| `pi.harness.step` | `pi.harness.step` |
+| `pi.harness.tool` | `pi.harness.tool` |
+| `pi.harness.hook` | `pi.harness.hook` |
+| `pi.harness.sleep` | `pi.harness.sleep` |
+| `pi.harness.event_handler` | `pi.harness.event_handler` |
+| `pi.session.write` | `pi.session.write` |
 
 ## 使用建议
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+1. 先按 span 顺序阅读字段表，不要跳过 start/end 的区别。
+2. 再运行 Go/Java 实验，打印 span name、parent 和 outcome，但不要打印 prompt、凭据或工具输出。
 3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
 
 <Note>
 
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏字段、枚举值、示例和边界条件。
 
 </Note>
 

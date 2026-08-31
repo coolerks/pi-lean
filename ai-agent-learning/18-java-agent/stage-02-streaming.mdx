@@ -1,14 +1,273 @@
 ---
-title: "Java 02：Streaming"
-description: "使用 HttpResponse.BodyHandlers.ofLines 理解 SSE 行流。"
+title: "Java 02：Streaming 与 SSE"
+description: "用 HttpResponse.BodyHandlers.ofLines 读取增量事件，并正确处理断流和取消。"
 ---
 
-# Java 02：Streaming
+# Java 02：Streaming 与 SSE
 
-`HttpModel.stream` 通过 `HttpClient` 的 line body handler 读取 `data:`，解析 JSON delta，并在 `[DONE]` 时完成。SSE 的事件边界、网络读取边界和完整 JSON 边界需要分别处理。
+## 本阶段目标与边界
 
-## 实验
+本阶段把 Java 01 的一次性响应改成流式响应：请求中设置 `stream:true`，服务端连续发送 SSE `data:` 事件，客户端逐行读取 delta，最后返回一个 settled `Response`。
 
-用本地 `HttpServer` 拆分写入，测试空 delta、坏 JSON、429/500、连接断开和取消；比较同步 `send` 与放入 `ExecutorService` 的异步封装。
+完成后你要能区分：
 
-对应源码：`HttpModel.stream`、`StreamingModel`。
+- HTTP/TCP 的读取片段：可能在任意字节处分割。
+- SSE event：通常由空行分隔，内容以 `data:` 开头。
+- Provider delta：模型语义上的新增文本或 Tool Call 参数。
+- settled response：只有完整事件序列结束后，Loop 才能安全使用的结果。
+
+本阶段不在 delta 到达时执行 Tool。一个 JSON 参数可能跨多个 delta；必须等到完整 response 后，交给 Java 03 的 Registry 校验。
+
+## 前置 Java 知识
+
+你需要知道：
+
+1. `HttpResponse.BodyHandlers.ofLines()` 返回 `HttpResponse<Stream<String>>`。
+2. `Stream<String>` 是惰性数据流；使用完应在 try-with-resources 中关闭。
+3. method reference `(Iterable<String>) lines::iterator` 可以让 `for` 循环逐行消费 Stream。
+4. `StringBuilder` 适合把多个文本片段拼成一个字符串。
+5. `Consumer<String>` 是一个接受 delta、没有返回值的 callback。
+
+`Stream<String>` 不是 `java.util.concurrent.Flow` 的 backpressure pipeline。它只帮助我们迭代 response body；本示例没有实现异步订阅。
+
+## 上一阶段输入与新增接口
+
+Java 01 已经有 `Model.complete(Request, CancellationToken)` 和 `HttpModel`。本阶段增加一个可选能力：
+
+```java
+public interface StreamingModel {
+    Response stream(
+            Request request,
+            CancellationToken cancellation,
+            Consumer<String> onDelta) throws Exception;
+}
+```
+
+`AgentLoop` 仍然只依赖 `Model`，这是故意的：Loop 先保持简单，UI 或上层可以在明确支持流式时把 `HttpModel` 转成 `StreamingModel`。不要为了一个 callback 就让所有 Model 都必须提供 stream。
+
+真实实现位置：`examples/java-agent/src/main/java/learning/agent/HttpModel.java` 的 `stream` 方法。
+
+## SSE 输入长什么样
+
+OpenAI-compatible endpoint 可能发送：
+
+```text
+data: {"choices":[{"delta":{"content":"hel"}}]}
+
+
+data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}
+
+
+data: [DONE]
+
+```
+
+空行是事件边界。`data:` 后面的内容才是 payload；`[DONE]` 是协议哨兵，不是 JSON，不应交给 `ObjectMapper.readTree`。
+
+网络读取边界与上述文本无关。server 可能一次写完一行，也可能将它拆成多个 packet；`BodyHandlers.ofLines()` 只在得到一整行后才交给迭代器。因此测试不应依赖 server 的 write 次数。
+
+## `HttpModel.stream` 的真实代码
+
+```java
+@Override
+public Response stream(
+        Request request,
+        CancellationToken cancellation,
+        Consumer<String> onDelta) throws Exception {
+    cancellation.throwIfCancelled();
+    String body = mapper.writeValueAsString(payload(request, true));
+    HttpRequest httpRequest = HttpRequest.newBuilder(endpoint)
+            .timeout(Duration.ofMinutes(2))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("Authorization", "Bearer " + apiKey)
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build();
+    HttpResponse<java.util.stream.Stream<String>> response = client.send(
+            httpRequest, HttpResponse.BodyHandlers.ofLines());
+    if (response.statusCode() < 200 || response.statusCode() >= 300) {
+        throw new IllegalStateException(
+                "stream request failed (" + response.statusCode() + ")");
+    }
+    StringBuilder content = new StringBuilder();
+    String finish = "stop";
+    try (java.util.stream.Stream<String> lines = response.body()) {
+        for (String line : (Iterable<String>) lines::iterator) {
+            cancellation.throwIfCancelled();
+            if (!line.startsWith("data:")) continue;
+            String data = line.substring("data:".length()).trim();
+            if (data.equals("[DONE]")) break;
+            JsonNode chunk = mapper.readTree(data);
+            JsonNode choice = chunk.path("choices").path(0);
+            String delta = choice.path("delta").path("content").asText("");
+            if (!delta.isEmpty()) {
+                content.append(delta);
+                if (onDelta != null) onDelta.accept(delta);
+            }
+            if (!choice.path("finish_reason").isMissingNode()
+                    && !choice.path("finish_reason").isNull()) {
+                finish = choice.path("finish_reason").asText(finish);
+            }
+        }
+    }
+    return new Response(Message.assistant(content.toString()), finish, Usage.empty());
+}
+```
+
+这段代码的状态变化是：
+
+1. 先把 `stream` flag 写入请求，而不是由 server 猜测。
+2. `client.send` 完成 header/status 握手后，body 才以行流消费。
+3. `content` 保存最终文本；`onDelta` 只是实时观察，不是持久化来源。
+4. 每一行先过滤非 `data:`，再处理 `[DONE]`，最后才解析 JSON。
+5. cancellation 在每行之间检查，避免长流已取消却继续拼接。
+6. stream 结束后创建一个新的 `Response`，把内部状态交给调用者。
+
+## 为什么 callback 不能代表最终结果
+
+```text
+delta "hel" -> UI 显示 hel
+连接断开 -> 没有 [DONE]
+```
+
+如果此时程序把 `hel` 当成 final，就会把不完整答案保存到 Session。callback 的职责是展示进度；`Response` 才是 Loop 可以判断 stop reason 的结果。生产版本应额外记录 `sawDone`，区分“收到了正常结束哨兵”和“EOF 结束”。
+
+## Tool Call delta 的坑
+
+文本 delta 不是唯一的流内容。模型可能把工具参数拆开：
+
+```text
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\\"pa"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\"a.md\\"}"}}]}}]}
+```
+
+最终参数才是 `{"path":"a.md"}`。Java 02 的教学实现主要演示文本 delta；要支持流式 Tool Call，应按 `index` 保存 `StringBuilder`，把 name、id 和 arguments 分开累计，收到完整结束事件后再创建 `ToolCall`。
+
+绝对不能在第一块参数到达时调用 `ObjectMapper.readTree` 并执行 Tool。JSON 可能尚未闭合，且即使 JSON 完整，也仍要经过 schema 和 PermissionPolicy。
+
+## 失败 trace
+
+### 坏 JSON
+
+```text
+data: {"choices":[
+ -> mapper.readTree
+ -> JsonProcessingException
+ -> 不产生 settled Response
+```
+
+### HTTP 错误
+
+```text
+status 500
+ -> 先检查 statusCode
+ -> 不把 error body 当 delta
+ -> 抛出 stream request failed
+```
+
+### 取消
+
+```text
+read delta 1
+ -> cancellation.cancel()
+ -> 下一次 throwIfCancelled
+ -> CancellationException
+ -> 上层不应把它转成成功 final
+```
+
+### 断流
+
+```text
+data: content="hel"
+ -> EOF，没有 [DONE]
+ -> 当前简化代码可能得到 prefix
+ -> 生产实现应标记 incomplete 并让上层决定重试
+```
+
+这里特意指出当前示例的限制，而不是把 EOF 描述成正常停止。
+
+## JUnit 测试设计
+
+`HttpModelTest` 使用本地 `HttpServer` 返回两段 delta 和 `[DONE]`，断言 callback 得到 `hello`、Response content 也是 `hello`、finish reason 是 `stop`。建议把测试扩展为：
+
+| 场景 | 断言 |
+| --- | --- |
+| 空行/注释/非 data 行 | 忽略，不改变文本 |
+| 多个 delta | 顺序保持，`hel` + `lo` = `hello` |
+| 空 choices | 不抛 NullPointer；记录 provider anomaly |
+| 坏 JSON | 抛出 Jackson 异常 |
+| 429/500 | 在解析 body 前抛状态错误 |
+| 没有 `[DONE]` | 生产 adapter 标记 incomplete |
+| cancellation | 不再消费后续行 |
+| callback 记录 | callback 仅观察，不改变 Response |
+
+测试 server 不要绑定固定端口；使用 `new InetSocketAddress("localhost", 0)` 可以避免并行测试冲突。
+
+## Maven 运行与预期输出
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=HttpModelTest test
+mvn test
+```
+
+JUnit 成功时命令返回 0；默认没有逐条打印测试日志。你也可以暂时在 `onDelta` 中使用 `System.out.print`，观察 `hello` 是分两次到达，而 final Response 只在 stream 结束后返回。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/ai/src/utils/event-stream.ts` 的 `EventStream` 把异步事件、结束和错误放在统一 stream 中。
+- `packages/ai/src/types.ts` 的 `AssistantMessageEvent` 能表达 text delta、thinking、tool-call delta、usage、done 和 error，信息比本示例的 `Consumer<String>` 丰富。
+- `packages/ai/src/api/openai-completions.ts`、`anthropic-messages.ts`、`google-generative-ai.ts` 分别处理 provider 的流格式。
+- `packages/agent/src/agent-loop.ts` 消费 settled assistant message，不能把任意展示 delta 当作已完成 Tool Call。
+
+Pi 的 stream 抽象可中止并携带更多元数据；Java 例子只保留学习 SSE 所需的最小状态。
+
+## Go 对照
+
+| Java | Go | 关键差异 |
+| --- | --- | --- |
+| `BodyHandlers.ofLines()` | `bufio.Scanner` | 都按行，不自动验证 JSON |
+| `StringBuilder` | `strings.Builder` | 累加文本 |
+| `Consumer<String>` | `func(string)` | callback 观察 delta |
+| `CancellationToken` | `context.Context` | 取消仍需主动检查 |
+| `Stream<String>` | `io.Reader` | Java Stream 需要 close |
+
+Java 没有因为使用 `Stream<String>` 就自动拥有 reactive backpressure；如果要把流暴露为 `Flow.Publisher`，那是下一层异步 API 设计。
+
+## 动手实验
+
+### 目标
+
+证明“网络响应、SSE 行、delta、最终 Response”是四个不同边界。
+
+### 准备
+
+阅读 `HttpModel.stream` 和 `HttpModelTest`。准备 JDK 21，使用本地 `HttpServer`，不要访问付费 endpoint。
+
+### 步骤
+
+1. 让 server 发送 `hel`、`lo` 两个 data event。
+2. 在 callback 中记录每次到达的字符串和时间。
+3. 在 server 中加入空行、非 data 行和 metadata-only chunk。
+4. 把 `[DONE]` 删除，观察当前实现和生产实现应如何区分。
+5. 在消费到第一行后取消 token，确认后续 delta 不再被交给 callback。
+6. 设计一个 Tool Call 参数分片测试，但只累计，不执行。
+
+### 观察点
+
+callback 可能多次执行；最终 Response 只有一个 content。JSON 解析发生在每个 event，而 Tool 执行必须延迟到完整 assistant message 和 schema gate 之后。
+
+### 预期结果
+
+你能解释为什么 server 写入两次不代表一定收到两行，也能指出没有 `[DONE]` 时不能把 EOF 直接当作 provider 的 stop。
+
+### 思考题
+
+如果 callback 抛异常，应该由 adapter 吞掉还是让请求失败？如果模型在最后一个 delta 中返回 `finish_reason:length`，是 stream 成功还是需要 Compaction？如果要用 `CompletableFuture` 包装 `stream`，取消 future 时如何传回 `CancellationToken`？
+
+## 小结与下一阶段
+
+Streaming 是传输和事件边界，不是 Agent Loop。先读取并拼成 settled response，再进行 Tool Call schema gate；UI 可以实时看 delta，但 Session 和 Runtime 只能保存可信的完成状态。下一阶段定义 Tool interface 和 Registry。

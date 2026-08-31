@@ -1,12 +1,320 @@
 ---
-title: "Go 07：Retry 与 Abort"
-description: "使用 context.Context 和有限 backoff 处理可恢复失败。"
+title: "Go 07：Retry、Backoff 与 Abort"
+description: "用 context.Context 贯穿模型、工具和退避，区分可重试错误与用户取消。"
 ---
 
-# Go 07：Retry 与 Abort
+# Go 07：Retry、Backoff 与 Abort
 
-`RetryPolicy` 只在允许重试的 Model 错误上进行有限次数尝试；backoff 期间用 `select` 监听 `ctx.Done()`。`Abort` 调用当前 run 的 cancel，不杀进程；工具和 HTTP 请求必须继续传递同一个 context。
+## 学习目标
 
-## 实验
+本阶段完成后，你应该能够：
 
-让 `ScriptedModel` 先返回 503 再成功，断言 attempt 数；让它延迟并在中途取消，断言没有下一轮请求。区分 timeout、429、永久 4xx 和用户 abort。
+- 解释 retry 解决的是暂时性失败，而不是所有错误。
+- 读懂 `AgentLoop.completeWithRetry` 的尝试次数、退避和取消路径。
+- 使用 `context.WithTimeout` 和 `context.WithCancel` 控制一次运行。
+- 解释 `Agent.Abort` 为什么不等于杀死 goroutine 或撤销远端副作用。
+- 为 timeout、429、5xx、坏参数和用户 abort 设计不同测试。
+
+## 输入、增加的能力与明确不做什么
+
+输入是 Go 06 的 `Model`、`Tool`、`AgentLoop` 和 `Request`。本阶段新增 `RetryPolicy`、指数退避、`Agent` 的运行生命周期和取消入口。
+
+本阶段不实现通用的 HTTP 状态码分类器，不重试 Tool 的不可逆副作用，也不承诺取消远端请求后费用会消失。当前示例把 Model 返回的 error 视为可尝试重试，真正生产系统应先分类错误。
+
+## 前置 Go 知识
+
+需要理解：
+
+- `context.Context` 是只读信号，子 context 可以被 cancel；
+- `select` 能在 timer 和 `ctx.Done()` 之间选择；
+- goroutine 不是自动可取消的，函数必须检查 context；
+- `defer` 适合释放 cancel 函数和恢复 running 状态；
+- error 是值，可以用 `errors.Is` 判断包装后的原因。
+
+## 问题场景：无限 retry 和取消失效
+
+坏实现通常是：
+
+```text
+for {
+    response = model.complete(request)
+    if error { sleep(1s); continue }
+}
+```
+
+失败 trace：
+
+```text
+provider 返回 429
+-> loop 无限 retry
+-> 用户点击停止
+-> sleep 没有监听 ctx.Done()
+-> UI 一直 busy
+-> 下一轮请求仍可能发送
+```
+
+另一个危险是把所有错误都重试：参数非法、权限拒绝和模型已经执行过的写操作都可能被重复提交。
+
+正确顺序是：有界 attempt、可中断 backoff、只在 Model 边界 retry，并把取消向下传递。
+
+## RetryPolicy 的数据模型
+
+```go
+type RetryPolicy struct {
+    MaxAttempts int
+    BaseDelay   time.Duration
+}
+
+type LoopOptions struct {
+    MaxSteps int
+    Retry    RetryPolicy
+    // ... ToolMode, hooks, events and queues
+}
+```
+
+输入是配置；输出是每个 step 的最大尝试次数和初始等待时间；状态变化是 attempt 计数增加；失败点是 `MaxAttempts <= 0` 或 duration 溢出。当前代码把非正 `MaxAttempts` 规范化为 1，把非正 `BaseDelay` 规范化为 50ms。
+
+## 逐步实现：模型请求重试
+
+`AgentLoop.Run` 每个 step 调用：
+
+```go
+response, err := l.completeWithRetry(
+    ctx,
+    Request{Messages: history, Tools: l.Tools.Definitions()},
+    options.Retry,
+    step,
+)
+```
+
+`completeWithRetry` 的核心逻辑是：
+
+```go
+for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+    l.emit(Event{Type: "model_attempt", Step: step})
+    response, err := l.Model.Complete(ctx, request)
+    if err == nil {
+        return response, nil
+    }
+    lastErr = err
+    if ctx.Err() != nil || attempt == policy.MaxAttempts {
+        break
+    }
+    delay := policy.BaseDelay
+    if delay <= 0 { delay = 50 * time.Millisecond }
+    delay *= time.Duration(1 << (attempt - 1))
+    timer := time.NewTimer(delay)
+    select {
+    case <-timer.C:
+    case <-ctx.Done():
+        timer.Stop()
+        return Response{}, ctx.Err()
+    }
+}
+return Response{}, lastErr
+```
+
+输入是相同 Request、context、policy 和 step；输出是成功 Response 或最后一个 error；状态变化是 `model_attempt` 事件增加；失败点是模型每次都失败、context 已取消或退避等待被打断。
+
+这个实现是 step 级 retry：它不会把已经追加的 assistant message 重新追加，因为只有成功 Response 才进入 history。生产 durable Harness 还要把 attempt 写入 operation log，避免重启时次数归零。
+
+## 退避为什么可取消
+
+`time.Sleep` 只能等待，无法在等待中收到 context。示例使用 timer + select：
+
+```go
+timer := time.NewTimer(delay)
+defer timer.Stop()
+select {
+case <-timer.C:
+    // 允许下一次 attempt
+case <-ctx.Done():
+    return Response{}, ctx.Err()
+}
+```
+
+输入是 delay 和 context；输出是“到时间了”或“取消了”；状态变化是 retry scheduler 从 waiting 转为 ready/cancelled；失败点是忘记 `Stop` timer、在取消后继续发请求。
+
+注意指数式 delay 不是幂等保证。相同请求是否安全，必须由 Provider/API 或 Harness operation id 决定。
+
+## Abort 的生命周期
+
+`Agent.Prompt` 不直接把模型暴露给 UI，而是建立可取消的子 context：
+
+```go
+runContext, cancel := a.beginRunLocked(ctx)
+return a.execute(runContext, cancel, initial)
+```
+
+`beginRunLocked` 设置 `running = true` 和 `cancel`。`Abort` 获得 mutex 后：
+
+```go
+if !a.running || a.cancel == nil {
+    return errors.New("no active run")
+}
+a.steering = nil
+a.followUp = nil
+a.cancel()
+return nil
+```
+
+输入是外部 abort 请求；输出是 nil 或“没有 active run”错误；状态变化是 context 被标记 cancelled、当前队列清空；失败点是工具不检查 context、远端副作用已经发生、abort 发生在 run 结束之后。
+
+`execute` 用 `defer` 把 `running` 恢复为 false。这保证模型因 cancel 返回后，下一次 Prompt 不会永久收到“already running”。
+
+## context 必须贯穿哪些边界
+
+模型：
+
+```go
+func (m *HTTPModel) Complete(ctx context.Context, request Request) (Response, error)
+```
+
+HTTP：
+
+```go
+http.NewRequestWithContext(ctx, http.MethodPost, m.URL, body)
+```
+
+工具：
+
+```go
+func (t ShellTool) Execute(ctx context.Context, raw json.RawMessage) (ToolResult, error)
+```
+
+进程：
+
+```go
+exec.CommandContext(ctx, "sh", "-c", input.Command)
+```
+
+退避：用 `select` 监听 `ctx.Done()`。如果任一层丢弃 context，用户按停止就只能停止外层等待，不能真正结束内部工作。
+
+## 错误分类表
+
+| 错误 | 例子 | 是否自动 retry | 理由 |
+| --- | --- | --- | --- |
+| 暂时 Provider 错误 | 429、503、连接重置 | 通常可以 | 等待或换 endpoint 可能成功 |
+| timeout | 请求超时 | 视预算 | 必须限制总时长和次数 |
+| 坏 JSON | Provider 返回无效 payload | 通常不应盲试 | 同一响应不会因等待变合法 |
+| Tool 参数错误 | 缺少 `path` | 否 | 交给模型修正参数 |
+| Policy deny | 路径越界 | 否 | retry 不改变权限 |
+| Tool exit 1 | 测试命令失败 | 不由 Model retry | 应把结果交给模型诊断 |
+| 用户 abort | 点击停止 | 否 | 这是明确控制意图 |
+
+当前示例没有 HTTP error classifier，因此教材中的 `ScriptedModel.Errors` 只用于演示次数和取消；不要把这段代码复制成生产 retry policy。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestRetryAndMaxSteps|TestAbortStopsInFlightModel'
+```
+
+预期：两个测试通过；retry 测试第一次 error、第二次成功，abort 测试在 delay 中返回 `context.Canceled`。
+
+运行 race 检查：
+
+```bash
+go test -race ./...
+```
+
+输入是测试替身和 context；输出是测试报告；状态变化是没有共享 running 状态的数据竞争。完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+它不访问网络，输出 calculator 结果。demo 生成的 `.agent-session.jsonl` 是临时验证产物。
+
+## 测试设计
+
+### Retry 测试
+
+`TestRetryAndMaxSteps` 的 ScriptedModel 先从 `Errors` 取一个 temporary error，再返回 assistant text。`MaxAttempts=2`，因此模型被调用两次，最后结果是 `ok`。
+
+测试应断言：
+
+- `len(model.Requests) == 2`；
+- final text 正确；
+- retry 不追加一个假的 assistant message；
+- `model_attempt` 事件数量等于尝试数。
+
+### Abort 测试
+
+`TestAbortStopsInFlightModel` 设置 `ScriptedModel.Delay = time.Second`，goroutine 运行 Prompt，主测试调用 `Abort`。ScriptedModel 在 timer 和 context 之间 select，因此返回 `context.Canceled`。
+
+测试的关键不是“20ms 必须准确”，而是最终在一秒内 settle，且 error 能用 `errors.Is` 判断。真实系统应使用 latch，而不是仅靠 sleep。
+
+### 补充边界
+
+你可以添加以下测试：
+
+1. `MaxAttempts=1` 时不会多发请求；
+2. backoff 期间 cancel 不会发送下一次请求；
+3. 已结束 run 调用 Abort 返回 `no active run`；
+4. ShellTool context cancel 会结束子进程等待；
+5. 429 可以重试，永久 400 不应重试；
+6. retry 超过总预算时返回稳定错误。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent-loop.ts`：模型 step、错误返回和 tool batch 的控制流。
+- `packages/ai/src/utils/provider-retry.ts`：`retryProviderRequest` 的 Provider retry 边界。
+- `packages/agent/src/agent.ts`：`Agent`、`AbortController`、running lifecycle 和队列。
+- `packages/ai/src/utils/event-stream.ts`：可 abort 的流式事件。
+
+源码事实是 Pi 把 Provider retry 和 Agent run 生命周期分在不同层；Go 示例把 retry 简化为 `LoopOptions.Retry`，便于先学习控制流。
+
+## Java 对照
+
+Go `context.Context` 对应 Java 的 `CancellationToken` + `Future` interruption：
+
+| Go | Java |
+| --- | --- |
+| `context.WithCancel` | 创建 token 并调用 `cancel()` |
+| `ctx.Done()` | token 检查或线程 interruption |
+| `exec.CommandContext` | `Process`/executor 任务配合 interrupt |
+| `time.Timer + select` | 可取消 sleep 或 `ScheduledExecutorService` |
+| `errors.Is(err, context.Canceled)` | 检查 `CancellationException` |
+
+两者都不是“撤销已经到达远端的请求”。Java 的 `Future.cancel(true)` 也只有在任务合作响应 interruption 时才有及时效果。
+
+## 实验：让退避可观察
+
+### 目标
+
+证明取消可以发生在第一次失败和第二次请求之间，而不是只在 HTTP body 读取时发生。
+
+### 准备
+
+打开 `loop.go` 的 `completeWithRetry`，使用 ScriptedModel，并把 `BaseDelay` 设置为 500ms。
+
+### 步骤
+
+1. 配置 `Errors` 让第一次完成失败。
+2. 在 goroutine 中开始 `loop.Run`。
+3. 等到收到 `model_attempt` 事件后调用 cancel。
+4. 收集事件，确认只有一个 attempt。
+5. 断言 error 是 `context.Canceled`。
+6. 把 cancel 改为等待 timer，再观察第二个 attempt。
+
+### 观察点
+
+backoff 是 Agent Runtime 的等待状态，不是模型推理；取消必须能打断它。事件和返回 error 都是诊断证据，不能依赖最终文字猜测。
+
+### 预期结果
+
+取消在 backoff 期间发生时不会发送第二次 Model request；等待 timer 完成时才会进入第二次 attempt。
+
+### 思考题
+
+如果第一次 Provider 请求可能已经在远端执行，retry 需要什么 idempotency key？如果 Tool 已写文件但返回 error，Agent 能否安全重试？总预算应由谁拥有？
+
+## 小结与下一阶段
+
+Retry 是有界的控制流，Abort 是沿 context 传播的取消意图，二者都必须留下可观察结果。`Agent` 负责运行状态和 cancel；`AgentLoop` 负责 step retry；Model、Tool、HTTP 和 shell 负责合作响应。
+
+下一阶段把 `Event` 和 `EventSink` 独立出来。你会用事件观察每次 attempt、assistant、Tool 和 run end，而不是把诊断日志散落在业务分支里。

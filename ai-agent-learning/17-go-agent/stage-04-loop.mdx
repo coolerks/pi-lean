@@ -5,14 +5,321 @@ description: "把 Model、Tool Registry 和消息历史连接成有限循环。"
 
 # Go 04：Agent Loop
 
-`AgentLoop.Run` 的一次 step 是：构造 `Request` → 完成 Model → 追加 assistant → 判断 `ToolCalls` → 执行 batch → 追加 `RoleTool`。没有 tool call 时返回 final；达到 `MaxSteps`、取消或 Provider 错误时退出。
+## 本阶段完成什么
 
-```text
-for step < MaxSteps:
-    assistant = model.Complete(ctx, request)
-    append assistant
-    if no calls: return final
-    append executeTools(ctx, calls)
+本页单独精读 `AgentLoop.Run`。前页已经定义了 Tool，本页要理解 Runtime 如何把一次 assistant 响应变成下一轮 request：复制初始 history、请求模型、追加 assistant、dispatch Tool、追加带 call id 的 `RoleTool`，再判断继续还是结束。
+
+完成后，你应该可以不看代码画出两轮 calculator 的消息数组，并解释每一个返回路径。
+
+## 本阶段不完成什么
+
+这里不负责 Session 持久化、provider 原生 stream、用户界面或 durable operation ledger。`AgentLoop` 是控制流，不是完整 Harness。它也不保证 Tool 副作用可重放；重试只针对当前示例的 Model 请求。
+
+## 前置知识和输入
+
+需要完成 Go 03 的 `Tool`、`Registry.Validate`。Loop 接收：
+
+```go
+type AgentLoop struct {
+    Model   Model
+    Tools   *Registry
+    Options LoopOptions
+}
+
+type LoopOptions struct {
+    MaxSteps   int
+    ToolMode   ExecutionMode
+    Retry      RetryPolicy
+    BeforeTool BeforeToolHook
+    AfterTool  AfterToolHook
+    OnEvent    EventSink
+    Steering   func() []Message
+    FollowUps  func() []Message
+}
 ```
 
-对应测试：`agent_test.go` 的 `TestToolCallIsExecutedAndReturnedToModel`、`TestRetryAndMaxSteps`。
+`Model` 只有 `Complete(context.Context, Request)`；Loop 不知道 endpoint、header 或 JSON provider 细节。
+
+## 先写伪代码
+
+```text
+history = copy(initial)
+for step in 1..MaxSteps:
+    history += steering at turn boundary
+    response = model.Complete(ctx, {history, tool definitions})
+    if error: return prefix + error
+    assistant = normalize(response.message)
+    history += assistant
+    if assistant has no tool calls:
+        followUps = consume follow-up
+        if empty: return final
+        history += followUps
+        continue
+    results = executeBatch(assistant.toolCalls)
+    for i, result in results:
+        history += tool message paired with assistant.calls[i]
+    if all results terminate:
+        followUps = consume follow-up
+        if empty: return final
+return max steps error
+```
+
+伪代码先固定消息和状态边界，再看 Go 代码。没有 `MaxSteps` 的 while loop 不能交给真实模型。
+
+## 为什么复制 history
+
+当前代码：
+
+```go
+history := append([]Message(nil), initial...)
+```
+
+这会创建一个新的 slice，并复制 Message 结构。Loop 之后会不断 append；如果直接使用调用方的 `initial`，append 可能复用它的 backing array，使 Harness 或测试中的 history 被偷偷改变。这里没有深拷贝所有 nested bytes，但当前 Loop 不修改既有 `ToolCalls`，所以足够保护本阶段边界。
+
+每次模型请求都用当前 history：
+
+```go
+response, err := l.completeWithRetry(
+    ctx,
+    Request{Messages: history, Tools: l.Tools.Definitions()},
+    options.Retry,
+    step,
+)
+```
+
+第二轮的 Request 自然包含第一轮 assistant 和 Tool Result；不需要另造一个“memory”变量。
+
+## 一个 step 的真实顺序
+
+```go
+for step := 1; step <= options.MaxSteps; step++ {
+    for _, message := range drainMessages(options.Steering) {
+        history = append(history, message)
+    }
+    l.emit(Event{Type: "step_start", Step: step})
+
+    response, err := l.completeWithRetry(
+        ctx,
+        Request{Messages: history, Tools: l.Tools.Definitions()},
+        options.Retry,
+        step,
+    )
+    if err != nil {
+        l.emit(Event{Type: "model_error", Step: step, Error: err})
+        return RunResult{Messages: history, Steps: step}, err
+    }
+
+    message := response.Message
+    if message.Role == "" {
+        message.Role = RoleAssistant
+    }
+    history = append(history, message)
+    final = message
+    l.emit(Event{Type: "assistant", Step: step, Message: &message})
+```
+
+`Role` 为空时补成 assistant，是对简单 fake model 的容错；真实 adapter 应该更早规范化。模型错误返回当前 prefix，而不是伪造 final。事件先后反映状态：请求错误有 `model_error`，不能发正常 `run_end`。
+
+## 无 Tool Call：真正的停止点
+
+```go
+if len(message.ToolCalls) == 0 {
+    followUps := drainMessages(options.FollowUps)
+    if len(followUps) == 0 {
+        l.emit(Event{Type: "run_end", Step: step, Message: &message})
+        return RunResult{Messages: history, Final: final, Steps: step}, nil
+    }
+    history = append(history, followUps...)
+    continue
+}
+```
+
+“模型没有 Tool Call”只说明它完成了这一个 assistant step。若有 follow-up，Runtime 仍要继续请求模型；如果没有 follow-up，才是正常 final。这个边界对应成熟 Agent 中“finish boundary 输入竞争”的问题。
+
+## Tool Call：先执行，再回传结果
+
+```go
+results := l.executeBatch(ctx, message, options, step)
+for index, result := range results {
+    call := message.ToolCalls[index]
+    toolMessage := Message{
+        Role:       RoleTool,
+        Content:    result.Content,
+        ToolCallID: call.ID,
+        ToolName:   call.Name,
+        IsError:    result.IsError,
+        Timestamp:  time.Now(),
+    }
+    history = append(history, toolMessage)
+    l.emit(Event{Type: "tool_result", Step: step,
+        ToolCall: callPtr(call), ToolResult: resultPtr(result),
+        Message: &toolMessage})
+}
+```
+
+`ToolCallID` 是配对键；不可以只用 tool name，因为同一轮可能有两个相同名称的 call。Tool error 仍然是 Tool Result，让模型有机会修正；它不是 Go panic，也不是默认终止。
+
+`executeOne` 内部顺序是：`Validate` → `BeforeTool` → `Execute` → `AfterTool` → `tool_end`。任何 validation/hook error 都转成 `IsError` result，且不会调用真实 Tool。
+
+## terminate 与 follow-up
+
+每个 `ToolResult` 有 `Terminate`。Loop 对 batch 聚合：
+
+```go
+terminate := true
+for _, result := range results {
+    if !result.Terminate {
+        terminate = false
+    }
+}
+if terminate {
+    followUps := drainMessages(options.FollowUps)
+    if len(followUps) == 0 {
+        return RunResult{Messages: history, Final: final, Steps: step}, nil
+    }
+    history = append(history, followUps...)
+}
+```
+
+当前 built-in tools 默认不请求 terminate，所以通常会进入下一轮。聚合规则要考虑所有 call；不能因为第一个 result terminate 就忽略第二个尚未完成的 result。
+
+## sequential 与 parallel 的精确语义
+
+Sequential：
+
+```text
+for call index 0..n-1:
+    executeOne(call)
+    results[index] = result
+```
+
+Parallel：
+
+```text
+allocate results[n]
+for each (index, call): start goroutine writing results[index]
+wait all goroutines
+append Tool messages in index order
+```
+
+并行只改变副作用完成时间，不改变模型看到的 source order。`go test -race` 能检查 result slice 的并发写入是否各自独占 index；它不能判断两个文件写操作在业务上是否冲突。
+
+## 终止条件矩阵
+
+| 条件 | RunResult/error | 是否再请求 Model |
+| --- | --- | --- |
+| 无 Tool Call、无 follow-up | final、nil | 否 |
+| 无 Tool Call、有 follow-up | prefix | 是 |
+| Tool error | error Tool Result | 通常是 |
+| Model error | prefix、error | retry 耗尽后否 |
+| `MaxSteps` 到达 | prefix、max steps error | 否 |
+| context cancel | prefix 或取消 error | 否 |
+| 全部 Tool `Terminate` | final/prefix | 无 follow-up 时否 |
+
+这张表应成为测试计划，而不是只写在注释里。
+
+## 失败 trace：无限工具调用
+
+```text
+step 1: assistant -> missing tool
+       -> error Tool Result
+step 2: assistant -> missing tool
+       -> error Tool Result
+...
+step 12: assistant -> missing tool
+       -> max steps exceeded (12)
+```
+
+`TestRetryAndMaxSteps` 使用只返回 Tool Call 的 `ScriptedModel`，设置 `MaxSteps: 1`，断言 Loop 返回错误。它证明终止由 Runtime 强制，不依赖模型配合。
+
+## 失败 trace：Model error
+
+```text
+attempt 1 -> temporary 503
+ -> backoff
+attempt 2 -> assistant "ok"
+```
+
+如果所有 attempts 都失败：
+
+```text
+completeWithRetry -> lastErr
+ -> emit model_error
+ -> return history prefix + error
+```
+
+当前返回的 `RunResult.Messages` 包含已追加到失败前的 history；没有 assistant error message。成熟 durable Harness 可能选择持久化 terminal failure entry，但那是另一个层。
+
+## 测试如何证明 Loop 正确
+
+`TestToolCallIsExecutedAndReturnedToModel` 不是只检查 final 等于 `5`，还检查：
+
+1. `len(model.Requests) == 2`。
+2. 第二个 Request 最后一个 message 的 Role 是 `RoleTool`。
+3. Tool Result content 是 `5`。
+
+`TestMultipleToolCallsPreserveSourceOrder` 使用两个 calls 和 Parallel，断言结果消息仍是 `3`、`12`。这证明并行完成与消息顺序分离。
+
+`TestUnknownToolDoesNotExecuteAnything` 和 `TestInvalidArgumentsDoNotInvokeTool` 证明 Loop 不绕过 Registry gate。
+
+## 运行方式
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestToolCallIsExecutedAndReturnedToModel|TestMultipleToolCallsPreserveSourceOrder|TestRetryAndMaxSteps'
+go test -race ./...
+```
+
+如果你修改 Loop 的消息顺序，先跑单元测试，再跑 race。race 通过不等于 Agent 逻辑正确；两种检查关注不同性质。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent-loop.ts` 的 `runAgentLoop`/`runAgentLoopContinue` 对应一次或连续的 Loop 控制流。
+- `prepareToolCall`、`executePreparedToolCall`、`executeToolCalls` 对应本页的准备、执行和 batch。
+- `packages/agent/src/types.ts` 的 `AgentEvent` 比 Go `Event` 更细，能承载流式 delta、tool execution 和 lifecycle。
+- `packages/agent/src/agent.ts` 在 Loop 外处理 lifecycle、queue 和 abort；Go 11 才实现类似外层。
+
+Pi 还会把 provider stream 转成统一 assistant message，并提供工具执行模式；本页只保留能看懂循环的最小结构。
+
+## Java 对照
+
+Java 的 `AgentLoop.run` 使用 `List<Message> history = new ArrayList<>(initial)` 完成同样的历史复制。`Future<ToolResult>` 对应 Go result index；Java `ExecutionException` 需要拆出 cause，Go 直接返回 `error`。
+
+两者都应把 cancellation 传播到 Model 和 Tool，而不是把取消伪装成普通 Tool Result。Go 的 `context.Context` 更适合层层传递 deadline；Java 需要 token 加线程中断协作。
+
+## 实验：手写第二轮 Request
+
+### 目标
+
+从测试中的 `ScriptedModel.Requests` 还原一次两轮 Loop。
+
+### 准备
+
+打开 `agent_test.go` 的 `TestToolCallIsExecutedAndReturnedToModel`，运行指定测试。
+
+### 步骤
+
+1. 写下第一轮 messages、tools 和 response。
+2. 标出 assistant Tool Call 的 id、name、arguments。
+3. 找到 calculator `Execute` 的结果。
+4. 对比 `model.Requests[1].Messages`。
+5. 把 Tool Result 的 `ToolCallID` 改错，观察真实 provider 可能无法配对。
+6. 把 `MaxSteps` 改为 1，确认不会发第二轮。
+
+### 观察点
+
+Loop 的状态主要就是不断增长的 history 加上 step counter；工具执行本身由 Registry/Tool 完成。
+
+### 预期结果
+
+第二个 request 包含 user、assistant call 和 tool result；没有 call 的 assistant 才能在无 follow-up 时结束。
+
+### 思考题
+
+为什么 Tool Result 必须追加而不是替换 assistant Tool Call？如果两个 call 其中一个失败，是否应该跳过其它结果？如果模型在每次 error result 后继续调用，哪个组件最终阻止无限循环？
+
+## 小结与下一阶段
+
+Go 04 的关键不是 while 语法，而是消息、Tool 结果、终止条件和错误语义的顺序。下一页回到 runtime 的组合细节：Message 如何经过 Retry、事件和队列，为什么 AgentLoop 仍然不是 Harness。

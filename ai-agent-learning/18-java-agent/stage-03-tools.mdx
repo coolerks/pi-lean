@@ -1,12 +1,288 @@
 ---
-title: "Java 05–08：Coding Tools、并行与取消"
-description: "用 JDK 文件/进程 API 实现本地工具和可观察事件。"
+title: "Java 05–08：工具执行、并行、重试与事件"
+description: "用 JDK 文件/进程 API 实现受限 Coding Tools，并观察执行顺序和取消传播。"
 ---
 
-# Java 05–08：Coding Tools、并行与取消
+# Java 05–08：工具执行、并行、重试与事件
 
-`BuiltInTools` 提供 `read`、`write`、`edit`、`grep`、`shell` 和 `calculator`。`PermissionPolicy` 先规范化 workspace path，shell 拒绝明显危险模式；结果限制在教学上限。
+## 本阶段目标
 
-`ExecutionMode.PARALLEL` 使用 `ExecutorService` 提交每个 call，再按 source order 收集 Future；这与“完成事件可能乱序、回传消息保持配对顺序”一致。共享文件的写操作应走 `SEQUENTIAL` 或显式锁。
+上一阶段只证明 Registry 能挡住未知工具和缺少参数。本阶段把真实的 `read`、`write`、`edit`、`grep`、`shell` 接进 `AgentLoop`，再处理一个实际运行时必然遇到的问题：模型可能一次返回多个 Tool Call，用户也可能在模型请求期间点击取消。
 
-事件通过 `EventSink` Listener 观察 `model_attempt`、`tool_start/end`、`tool_error` 和 `run_end`。retry 的 delay 循环检查 token；abort 只取消当前运行，并清空 steering/follow-up，`nextRun` 留给下一次。
+读完并运行本页，你应该能回答：
+
+- 文件路径在哪里被限制到 workspace？
+- 一个 shell 进程何时启动，超时或取消时谁负责销毁？
+- 并行执行为什么可以快，但结果仍要按 source order 回传？
+- 429/5xx 重试和 Tool 失败为什么不能混成同一种错误？
+- Event 是状态事实还是可以驱动第二个状态机？
+
+本阶段不实现操作系统级 sandbox、完整 JSON Schema validator、跨进程 durable ledger 或真正的 `Flow.Publisher`。示例代码用于学习边界，不是生产安全承诺。
+
+## 前置知识与新增 API
+
+需要熟悉 `Path.normalize`、`Files`、`ProcessBuilder`、`TimeUnit`、lambda、`ExecutorService` 和 `Future.get`。Java 示例把每个工具表示为 `Tool`，把执行模式放在不可变的 `LoopOptions`：
+
+```java
+public record LoopOptions(
+        int maxSteps,
+        ExecutionMode executionMode,
+        int maxAttempts,
+        long baseDelayMillis,
+        BeforeToolHook beforeTool,
+        AfterToolHook afterTool,
+        EventSink events) {
+    public LoopOptions {
+        maxSteps = maxSteps <= 0 ? 16 : maxSteps;
+        executionMode = executionMode == null
+                ? ExecutionMode.PARALLEL : executionMode;
+        maxAttempts = maxAttempts <= 0 ? 1 : maxAttempts;
+        events = events == null ? event -> { } : events;
+    }
+}
+```
+
+构造器把零值归一化为安全默认值。`maxSteps` 限制整个 Loop 的 assistant step 数；`maxAttempts` 只限制一次模型请求的重试；`executionMode` 只决定当前 assistant batch 的工具调度，不会改变模型消息顺序。
+
+## PermissionPolicy：路径不是字符串拼接
+
+```java
+public record PermissionPolicy(Path workspace) {
+    public PermissionPolicy {
+        if (workspace == null) {
+            throw new IllegalArgumentException("workspace is required");
+        }
+        workspace = workspace.toAbsolutePath().normalize();
+    }
+
+    public Path resolvePath(String requested) throws IOException {
+        Path candidate = workspace
+                .resolve(requested == null ? "" : requested)
+                .normalize().toAbsolutePath();
+        if (!candidate.startsWith(workspace)) {
+            throw new SecurityException(
+                    "path is outside workspace: " + requested);
+        }
+        return candidate;
+    }
+}
+```
+
+输入是模型提供的相对路径，输出是规范化绝对路径。`normalize` 处理 `..`，`startsWith` 防止访问 workspace 外部。这个检查只保护路径范围；它不处理符号链接逃逸、文件权限、敏感文件分类或并发修改。
+
+> 译者注：`Path.startsWith` 是路径组件比较，不是简单字符串前缀比较。即使如此，生产沙箱仍需要处理 symlink、mount 和 OS 权限，不能把这个 record 当成隔离机制。
+
+## read、write、edit、grep 的实际副作用
+
+```java
+public static Tool read(PermissionPolicy policy) {
+    return new SimpleTool("read",
+            "Read a UTF-8 text file in the workspace.",
+            schema("path", "string"), (cancel, args) -> {
+        Path path = policy.resolvePath(args.path("path").asText());
+        cancel.throwIfCancelled();
+        String text = Files.readString(path);
+        if (text.length() > 32_000) {
+            text = text.substring(0, 32_000)
+                    + "\n[output truncated]";
+        }
+        return new ToolResult(text, false, false);
+    });
+}
+```
+
+输入是已经通过 required gate 的 `path`，输出是文本结果。执行前再次检查取消；读取结果限制 32,000 字符，避免一个文件吞掉整个 context。截断是成功结果，但要在内容中显式标记，否则模型会把不完整文件当成完整文件。
+
+`write` 先 `resolvePath`，再创建父目录并覆盖文件；`edit` 读取旧内容，只允许 `oldText` 恰好出现一次；`grep` 遍历 workspace，跳过包含零字节的二进制文件，并最多返回 50 个命中。三者都应该把路径、参数和输出长度当作不可信输入。
+
+## shell：进程生命周期必须可解释
+
+```java
+public static Tool shell(PermissionPolicy policy) {
+    return new SimpleTool("shell",
+            "Run a command in the workspace after policy checks.",
+            schema("command", "string"), (cancel, args) -> {
+        String command = args.path("command").asText();
+        policy.checkCommand(command);
+        Process process = new ProcessBuilder("sh", "-c", command)
+                .directory(policy.workspace().toFile()).start();
+        while (!process.waitFor(10, TimeUnit.MILLISECONDS)) {
+            if (cancel.isCancelled()) {
+                process.destroyForcibly();
+                cancel.throwIfCancelled();
+            }
+        }
+        String output = new String(
+                process.getInputStream().readAllBytes(),
+                StandardCharsets.UTF_8);
+        if (output.length() > 32_000) {
+            output = output.substring(0, 32_000)
+                    + "\n[output truncated]";
+        }
+        return new ToolResult(output,
+                process.exitValue() != 0, false);
+    });
+}
+```
+
+`ProcessBuilder` 的工作目录固定到 workspace；循环每 10ms 检查进程和取消。当前示例用黑名单拒绝明显危险片段，并不等于安全 shell parser。stdout/stderr 读取、退出码、超时和强制销毁都应该进入事件或审计记录。
+
+## sequential 与 parallel
+
+一个 assistant 可能返回：
+
+```json
+[
+  {"id":"a", "name":"read", "arguments":{"path":"A.md"}},
+  {"id":"b", "name":"read", "arguments":{"path":"B.md"}}
+]
+```
+
+两个 read 通常互不依赖，可以并行；但 `write(A)` 后紧接 `read(A)` 需要顺序。`ExecutionMode` 是调用者的声明，不是模型自动证明出的依赖图。
+
+```java
+ExecutorService executor = Executors.newFixedThreadPool(
+        assistant.toolCalls().size());
+try {
+    List<Future<ToolResult>> futures = new ArrayList<>();
+    for (ToolCall call : assistant.toolCalls()) {
+        futures.add(executor.submit(
+                () -> executeOne(call, cancellation, step)));
+    }
+    List<ToolResult> results = new ArrayList<>();
+    for (Future<ToolResult> future : futures) {
+        results.add(future.get());
+    }
+    return results;
+} finally {
+    executor.shutdownNow();
+}
+```
+
+提交顺序和收集顺序都来自 `assistant.toolCalls()`，因此 `results.get(0)` 始终属于 id `a`，即使 id `b` 先执行完。事件的到达顺序可能不同；持久化的消息配对顺序不能不同。
+
+## retry、backoff 与 cancellation
+
+`AgentLoop.completeWithRetry` 在每次尝试前调用 `cancellation.throwIfCancelled()`；模型异常才进入 retry，`CancellationException` 直接重新抛出。退避时间为 `baseDelayMillis * 2^(attempt-1)`，且 `sleepCancellable` 每 10ms 检查取消。
+
+```text
+attempt 1 -> IOException/429 -> wait 25ms
+attempt 2 -> IOException/5xx -> wait 50ms
+attempt 3 -> success 或抛出最后错误
+```
+
+不要重试参数非法、权限拒绝和用户取消。模型请求的重试也不应自动重放已经产生外部副作用的 Tool；Tool 是否安全重试需要单独的幂等策略。
+
+## Event 与 Hook
+
+```java
+@FunctionalInterface
+public interface EventSink {
+    void accept(Event event);
+}
+
+@FunctionalInterface
+public interface BeforeToolHook {
+    void check(CancellationToken cancellation,
+               ToolCall call,
+               ToolDefinition definition) throws Exception;
+}
+```
+
+`EventSink` 是观察者；`BeforeToolHook` 是可以拒绝执行的拦截点。当前 Loop 发出 `step_start`、`model_attempt`、`assistant`、`tool_start`、`tool_end`、`tool_error` 和 `run_end`。事件不应悄悄修改 history；hook 的修改必须有清晰的返回值和测试。
+
+## 失败 trace
+
+```text
+assistant tool_call(read, path=../../secret)
+ -> ToolRegistry.validate 通过 required
+ -> PermissionPolicy.resolvePath 拒绝
+ -> 不读取文件
+ -> tool_error / error ToolResult
+```
+
+```text
+parallel read A, read B
+ -> Future B 先完成
+ -> Future A 后完成
+ -> 按 futures 列表收集 A、B
+ -> history 仍按 source order 追加
+```
+
+```text
+model attempt 1 -> temporary 503
+ -> sleepCancellable
+ -> attempt 2 -> CancellationException
+ -> 不继续 attempt 3
+ -> Agent 以取消结束
+```
+
+## JUnit 测试清单
+
+| 场景 | 关键断言 |
+| --- | --- |
+| workspace 外路径 | `SecurityException`，文件不存在副作用 |
+| edit 多次命中 | 抛唯一匹配错误，原文件不变 |
+| shell 非零退出 | `ToolResult.isError()` 为 true |
+| shell 取消 | 进程被 destroy，抛 `CancellationException` |
+| 长 read/grep | 结果包含 truncation marker 或最多 50 命中 |
+| 多 Tool Call | result 按 source order，而非完成顺序 |
+| retry | ScriptedModel 第一次失败、第二次成功 |
+| maxSteps | endless tool call 最终抛上限错误 |
+| event | 至少有 model_attempt、tool_start、run_end |
+
+运行当前测试：
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest test
+mvn -q -Dtest=HttpModelTest test
+mvn test
+```
+
+测试使用 `ScriptedModel` 和本地 fake `HttpServer`，不会调用真实模型。`AgentTest.abortCancelsAnInFlightModel` 用 `ExecutorService` 提交运行，再调用 `agent.abort()`，断言 future 的 cause 是 `CancellationException`。
+
+## 与 Pi、Go 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+Pi 的 `packages/agent/src/agent-loop.ts` 同样把 tool call 准备、执行和 result message 分开；`packages/coding-agent/src/core/tools/` 提供具体 read/edit/write/bash 实现。Java `ToolRegistry` 是缩小版，Pi 还包含 render、streaming 和更细的工具事件。
+
+| Java 21 | Go | Pi/TypeScript |
+| --- | --- | --- |
+| `Path` + `Files` | `os` + `filepath` | coding-agent tool executor |
+| `ExecutorService`/`Future` | goroutine + `WaitGroup` | sequential/parallel tool path |
+| `CancellationToken` | `context.Context` | `AbortSignal` |
+| `EventSink` | callback/channel | event stream/callback |
+| checked exception | `error` | rejected Promise/error event |
+
+## 动手实验
+
+### 目标
+
+让两个只读 Tool 并行，让一个写后读任务串行，并观察事件与历史消息的两个顺序。
+
+### 准备
+
+在临时 workspace 创建 `A.md`、`B.md`，阅读 `BuiltInTools`、`AgentLoop.executeBatch` 和 `AgentTest`。不要使用真实 home 目录。
+
+### 步骤
+
+1. 创建两个带延迟的测试 Tool，给 A 延迟 100ms、给 B 延迟 10ms。
+2. 使用 `ExecutionMode.PARALLEL`，在事件中打印 start/end 时间。
+3. 断言 B 的 end 先出现，但第二次 model request 的 Tool Result 仍按 A、B 排列。
+4. 改用 `SEQUENTIAL`，比较总耗时和事件顺序。
+5. 把 `write` 与同文件 `read` 放入并行 batch，观察为什么结果不可预测。
+6. 在 retry backoff 中调用 `cancel()`，确认没有额外模型请求。
+
+### 预期结果
+
+并行只改变执行完成时间，不改变 tool call id 与 result 的配对；取消会在下一次检查点传播；安全策略拒绝发生在 `ProcessBuilder.start` 或 `Files.readString` 之前。
+
+### 思考题
+
+如果一个 batch 同时有 `write(A)` 和 `read(A)`，Runtime 能否仅凭 tool name 判断依赖？如果 shell 已经执行但进程在读取输出前取消，重试会不会重复副作用？事件 listener 抛异常时应该阻断 Tool，还是变成独立 `handler_error`？
+
+## 小结与下一阶段
+
+本阶段把“模型请求”连接到真实工具，但仍保持清晰边界：Registry gate 先发生，PermissionPolicy 再发生，Tool 执行最后发生；并行结果按 source order 回传，retry 只包住模型请求，取消必须传播到网络、sleep 和进程。下一阶段回到 `AgentLoop.run`，完整追踪 assistant step、Tool Result、follow-up 和 maxSteps。

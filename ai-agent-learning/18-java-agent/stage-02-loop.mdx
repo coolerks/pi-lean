@@ -1,21 +1,305 @@
 ---
-title: "Java 03–04：Tool 与 Agent Loop"
-description: "用 interface、JsonNode 和 maxSteps 实现结构化 Tool Calling。"
+title: "Java 03–04：从 Tool 到 Agent Loop"
+description: "用 JsonNode、ToolRegistry 和有限循环把模型候选动作变成可验证结果。"
 ---
 
-# Java 03–04：Tool 与 Agent Loop
+# Java 03–04：从 Tool 到 Agent Loop
+
+## 本阶段目标与边界
+
+前两页只处理一次文本请求和一条 SSE 流。本阶段第一次让模型“提出动作”：模型返回一个结构化 `ToolCall`，Java Runtime 查找工具、校验参数、执行工具，再把 `ToolResult` 作为下一轮消息发回模型。
+
+完成后你要能画出两轮 history：
+
+```text
+USER -> ASSISTANT(tool call) -> TOOL(result) -> ASSISTANT(final)
+```
+
+本阶段不实现文件、shell、Session 或插件。先用 calculator 和计数器证明：Tool definition 是给模型看的描述，`Tool.execute` 才是副作用边界。
+
+## 前置 Java 知识
+
+需要理解：
+
+- `interface` 描述能力；实现类必须提供声明的方法。
+- `record` 用于不可变数据载体；访问器是 `name()` 而不是 `getName()`。
+- Jackson `JsonNode` 是 JSON 树；`ObjectNode` 可构造 object，`ArrayNode` 可遍历数组。
+- `List.copyOf` 创建不可变视图/副本，适合保护 request history。
+- `throws Exception` 让 Tool 失败回到 Loop，而不是隐藏在日志里。
+
+不要把 Java 的 `interface Tool` 当成模型能直接调用的 Java 方法。模型只生成协议数据；Registry 和 Loop 才在本地调用接口。
+
+## 上一阶段输入与新增接口
+
+上一阶段的输入是 `Response.message()`。现在 `Message` 增加 `toolCalls`，每个 call 有 id、name 和 JSON arguments：
 
 ```java
+public record ToolCall(String id, String name, JsonNode arguments) {
+    public ToolCall {
+        if (id == null || id.isBlank()) {
+            throw new IllegalArgumentException("tool call id is required");
+        }
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("tool call name is required");
+        }
+        if (arguments == null || !arguments.isObject()) {
+            throw new IllegalArgumentException("tool arguments must be a JSON object");
+        }
+    }
+}
+
 public interface Tool {
     ToolDefinition definition();
-    ToolResult execute(CancellationToken cancellation, JsonNode arguments) throws Exception;
+    ToolResult execute(CancellationToken cancellation, JsonNode arguments)
+            throws Exception;
 }
 ```
 
-`ToolDefinition` 只给模型；`Tool` 的 `execute` 才产生副作用。`ToolRegistry.validate` 检查名称和 schema 的 required 字段后才允许执行。`AgentLoop` 把 assistant `toolCalls` 逐个或并行分派，把结果转换成 role `TOOL` 消息。
+`ToolDefinition` 是 `name + description + schema`；`ToolResult` 是 content、isError 和 terminate。它们放在 `Tool.java`、`ToolCall.java`、`ToolDefinition.java`、`ToolResult.java`。
 
-`ScriptedModel` 第一轮返回 `calculator`，第二轮返回文本；测试能断言第二个 `Request` 最后一条是 Tool Result。`LoopOptions.maxSteps` 保证异常模型不会无限调用。
+## 失败 trace：把 Tool Call 当成已执行
 
-## 错误路径
+错误实现会看到：
 
-unknown tool、缺参数和 execute exception 变成 error Tool Result；Provider 异常由有限 retry 处理；`CancellationToken` 在模型、Tool 和 backoff 之间传播。
+```text
+assistant.toolCalls = [calculator]
+ -> UI 打印“calculator 已执行”
+ -> 没有查 Registry
+ -> 没有校验参数
+ -> 没有 Tool Result
+```
+
+正确实现是：
+
+```text
+assistant.toolCalls
+ -> ToolRegistry.validate
+ -> BeforeTool hook（若有）
+ -> Tool.execute
+ -> ToolResult
+ -> Message.Role.TOOL + toolCallId
+```
+
+即使模型输出了合法 JSON，也不代表用户允许执行；schema 和权限是不同闸门。
+
+## ToolRegistry：先查找再执行
+
+```java
+public final class ToolRegistry {
+    private final Map<String, Tool> tools = new LinkedHashMap<>();
+
+    public synchronized void register(Tool tool) {
+        String name = tool.definition().name();
+        if (tools.containsKey(name)) {
+            throw new IllegalArgumentException(
+                    "tool already registered: " + name);
+        }
+        tools.put(name, tool);
+    }
+
+    public synchronized Tool find(String name) {
+        return tools.get(name);
+    }
+
+    public synchronized List<ToolDefinition> definitions() {
+        return tools.values().stream().map(Tool::definition).toList();
+    }
+}
+```
+
+`LinkedHashMap` 保留注册顺序，让发送给 provider 的 definitions 稳定。`synchronized` 保护 map；它不保证 Tool 本身线程安全。重复注册直接失败，避免模型看到一个定义却随机执行另一个对象。
+
+实际项目的 `ToolRegistry.validate` 还会检查 schema 的 `required` 数组：
+
+```java
+public Tool validate(ToolCall call) {
+    Tool tool = find(call.name());
+    if (tool == null) {
+        throw new IllegalArgumentException("unknown tool: " + call.name());
+    }
+    JsonNode required = tool.definition().schema().get("required");
+    if (required instanceof ArrayNode requiredNames) {
+        for (JsonNode name : requiredNames) {
+            if (!call.arguments().has(name.asText())) {
+                throw new IllegalArgumentException(
+                        "missing required argument: " + name.asText());
+            }
+        }
+    }
+    return tool;
+}
+```
+
+这个教学 gate 只覆盖 object、工具名和 required 字段；它不是完整 JSON Schema validator。具体 Tool 还必须检查类型、范围、路径和业务约束。
+
+## Message.tool：保持 call/result 配对
+
+```java
+public static Message tool(ToolCall call, ToolResult result) {
+    return new Message(
+            Role.TOOL,
+            result.content(),
+            List.of(),
+            call.id(),
+            call.name(),
+            result.isError(),
+            0);
+}
+```
+
+输入是一个具体 `ToolCall` 和执行结果；输出是 role 为 `TOOL` 的消息。`toolCallId` 是配对键，不能只用工具名，因为同一轮可能有两个 calculator call。`isError` 让模型区分“工具返回了错误”与“没有返回”。
+
+## AgentLoop.run 的第一轮
+
+```java
+List<Message> history = new ArrayList<>(initial == null ? List.of() : initial);
+for (int step = 1; step <= options.maxSteps(); step++) {
+    List<Message> steering = source.steering();
+    history.addAll(steering);
+    emit(new Event("step_start", step, ""));
+    Response response = completeWithRetry(
+            new Request(history, registry.definitions()), token, step);
+    Message assistant = response.message();
+    history.add(assistant);
+    emit(new Event("assistant", step, assistant.content()));
+```
+
+`history` 是本次 run 的工作副本；每次 request 都带当前消息和 definitions。先追加 assistant，再执行 Tool，下一轮 provider 才能看到完整的 call/result 配对。
+
+## AgentLoop.run 的停止与继续
+
+```java
+if (assistant.toolCalls().isEmpty()) {
+    List<Message> followUps = source.followUps();
+    if (followUps.isEmpty()) {
+        emit(new Event("run_end", step, response.stopReason()));
+        return new RunResult(history, assistant, step);
+    }
+    history.addAll(followUps);
+    continue;
+}
+```
+
+“没有 Tool Call”通常是 final，但当前实现还会在 finish boundary 消费 follow-up。`maxSteps` 是 `for` 的上限，不允许模型通过不断返回 unknown tool 让进程无限运行。
+
+## Tool batch 与结果回传
+
+```java
+List<ToolResult> results = executeBatch(assistant, token, step);
+for (int index = 0; index < results.size(); index++) {
+    ToolCall call = assistant.toolCalls().get(index);
+    history.add(Message.tool(call, results.get(index)));
+}
+```
+
+`executeBatch` 的返回列表与 assistant call 的 source order 一致。完成顺序可以不同，但 history 顺序必须稳定；否则同一个模型 response 在不同运行中会看到不同语义。
+
+## 失败 trace：两轮 calculator
+
+```text
+step 1 request: [user("2+3"), definitions(calculator)]
+step 1 response: assistant(tool_call id=1, args={...})
+step 1 execute: calculator -> "5"
+step 1 append: tool(id=1, content="5")
+step 2 request: 上述四条消息
+step 2 response: assistant("5")
+step 2 stop: no tool call + no follow-up
+```
+
+第二次 request 不是只发送 `tool result`；它必须包括产生 result 的 assistant call。缺少中间消息时，Provider 可能拒绝请求，Runtime 也无法解释结果属于哪个 call。
+
+## 异常与 cancellation 语义
+
+- unknown tool、缺 required 参数：`validate` 抛异常；Loop 将其转成 error `ToolResult`，不调用 execute。
+- Tool 自己抛异常：`executeOne` 转成 error result，让下一轮模型决定修正。
+- Model 失败：`completeWithRetry` 根据有限 attempts 重试，耗尽后抛出最后异常。
+- `CancellationException`：不能当成普通 Tool Result；它代表 run 被取消，应传播给调用者。
+- `maxSteps`：抛出明确错误，并且此前的 history 仍是诊断证据。
+
+## JUnit/ScriptedModel 测试设计
+
+`AgentTest.executesToolAndSendsToolResultBack` 的准备步骤：
+
+1. `ScriptedModel` 第一轮返回 calculator Tool Call。
+2. 第二轮返回 assistant text `5`。
+3. Registry 只注册 calculator。
+4. 运行 Loop，断言最终 text、request 数量和第二个 request 的最后一条 role。
+
+还要覆盖：
+
+| 场景 | 断言 |
+| --- | --- |
+| unknown tool | Tool execute 次数为 0，下一轮看到 error result |
+| 缺 required | 不执行副作用，result.isError 为 true |
+| Tool exception | error result 包含脱敏错误 |
+| 只有 Tool Call | `maxSteps` 后结束并报错 |
+| 两个 call | 每个 result 的 call id 正确，列表按 source order |
+| cancellation | 抛 `CancellationException`，不伪造 final |
+
+## Maven 运行与预期输出
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest#executesToolAndSendsToolResultBack test
+mvn test
+```
+
+测试成功返回 0。demo 的最终输出是 `final> 2 + 3 = 5`，但本页最重要的结果是第二个 scripted request 的 history，而不是屏幕文字。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/types.ts` 的 `AgentTool` 比这里包含更丰富的 label、execute、prepareArguments 和 executionMode。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall`、`executePreparedToolCall`、`executeToolCalls` 分开准备、执行和批次编排。
+- `packages/ai/src/types.ts` 的 `ToolCall`/assistant message 是 provider-neutral 载体。
+- `packages/coding-agent/src/core/tools/index.ts` 把工具 definitions 注入 Coding Agent。
+
+Java 版本保留同一责任顺序，但把 `JsonNode`、exception 和 `ToolRegistry` 做成容易调试的最小实现。
+
+## Go 对照
+
+| Java | Go | 解释 |
+| --- | --- | --- |
+| `Tool` interface | `Tool` interface | 都是执行边界 |
+| `JsonNode` | `json.RawMessage` | 参数延迟解析 |
+| `ToolRegistry.validate` | `Registry.Validate` | lookup/schema gate |
+| `CancellationException` | `context.Canceled` | 取消不是成功结果 |
+| `List<Message>` | `[]Message` | 本次 run 的 history |
+
+Java 的 `record` 让值对象声明更紧凑；Go 用 struct 和 JSON tag。两者都不能把 Tool Call 当成已执行。
+
+## 动手实验
+
+### 目标
+
+用一个计数 Tool 证明三件事：定义能发给模型、非法调用不会产生副作用、合法调用结果会在下一轮可见。
+
+### 准备
+
+阅读 `ToolRegistry.java`、`AgentLoop.java` 和 `AgentTest.java`。使用 `ScriptedModel`，不使用网络。
+
+### 步骤
+
+1. 注册一个 `count` Tool，`schema.required` 包含 `value`。
+2. 让第一轮返回 unknown name，断言计数仍为 0。
+3. 让第一轮返回 `count` 但缺 `value`，断言仍不执行。
+4. 让第一轮返回合法 call，第二轮返回 `done`。
+5. 打印两个 request 的 message role 和 call id。
+6. 把 `maxSteps` 改成 1，观察有 Tool Call 但没有 final 时的失败。
+
+### 观察点
+
+`definition()` 在 request 的 tools 列表；`execute()` 只在 validate 之后调用；`Message.tool` 保存 call id。第二轮的模型输入是完整 history，而不是一条孤立结果。
+
+### 预期结果
+
+unknown/invalid call 都不增加计数；合法 call 产生一条 `TOOL` 消息；模型最终 response 才是 final。
+
+### 思考题
+
+为什么 required gate 不能代替类型检查？如果两个 Future 先后完成，为什么仍按 source order 写 history？如果 Tool 已经写文件但 JVM 在追加 Tool Result 前崩溃，当前示例能否安全恢复？
+
+## 小结与下一阶段
+
+Tool interface 解决“如何插入能力”，Agent Loop 解决“如何让结果回到模型并继续”。两者都不等于权限系统和 durable Harness。下一页把 calculator 替换为受限的本地 Coding Tools。

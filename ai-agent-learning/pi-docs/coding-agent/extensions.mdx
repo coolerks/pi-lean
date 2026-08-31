@@ -9,221 +9,719 @@ description: "Extension 的加载、事件、工具、UI、命令和状态管理
 
 ## 中文导读
 
-Extension 的加载、事件、工具、UI、命令和状态管理 API。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+本页完整说明 Pi Extension 的模型、发现、加载、生命周期、事件、命令、工具、状态、UI 和错误处理。
 
-## 源码级中文译文
+Extension 是宿主进程加载的 TypeScript 模块。它可以订阅事件、注册 LLM 可以调用的 Tool、增加 slash command、修改系统提示词、参与 Session 生命周期，并把自定义 UI 接到 TUI 上。
 
-本节把源文档的说明、参数和行为翻译成中文；代码块在下方完整保留。当前实现的三个关键文件是 `packages/coding-agent/src/core/extensions/loader.ts` 的 `loadExtensions`、`loadExtensionsCached`、`discoverAndLoadExtensions`，`packages/coding-agent/src/core/extensions/runner.ts` 的 `ExtensionRunner`、`emitToolCall`、`emitToolResult`，以及 `packages/coding-agent/src/core/extensions/types.ts` 的 `ExtensionAPI`、`ExtensionContext` 和事件类型。`ResourceLoader` 与 `AgentSession` 负责把资源和 Agent 生命周期接到 runner；`AgentSession._installAgentToolHooks` 将低层 `tool_call`/`tool_result` 连接到扩展事件。
+Extension 不是一个独立的 Agent，也不是 MCP Server。它运行在 Pi 进程内，使用宿主授予的 API 和进程权限；因此它既强大，也必须被当作受信任代码。
 
-### Extension 是什么，以及如何加载
+本页的阅读顺序是：先跑一个最小 Extension，再理解文件发现和 factory；随后沿着生命周期事件观察一次 prompt，最后再学习工具、UI、状态和模式差异。
 
-Extension 是宿主进程内执行的 TypeScript module。默认导出一个接收 `ExtensionAPI` 的 factory；factory 可以同步返回，也可以返回 Promise。Pi 通过 `jiti` 在不单独编译的情况下加载 TypeScript。factory 完成后才会继续启动，因此异步初始化得到的 provider、model 和资源可在 `session_start`、`resources_discover` 之前就绪。`pi -e path/to/file.ts` 适合快速试验；自动发现位置是全局 `~/.pi/agent/extensions/` 和项目 `.pi/extensions/`，包括目录形式的 `index.ts`。`/reload` 会重新加载这些资源。
+## 中文译文
 
-全局 extension 对所有项目生效；项目 extension 只有在 project trust 通过后才加载。Extension 拥有宿主的完整系统权限，可以读环境变量、读写任意文件、开网络连接和启动进程；它不是 sandbox。只有信任来源才应安装。通过 npm/git package 分发时，运行时依赖必须放 `dependencies`，因为 package 安装默认使用 production install；`devDependencies` 不会自动存在。扩展目录中的 `package.json` 和 `pi.extensions` 字段决定依赖与入口。
-
-可用导入分成四层：`@earendil-works/pi-coding-agent` 提供 Extension 类型、Context 和事件；`typebox` 构造 Tool schema；`@earendil-works/pi-ai` 提供 `StringEnum` 等 Provider 辅助；`@earendil-works/pi-tui` 提供 TUI component。Node 内建模块也能直接使用。不要把 SDK 或某个 Provider 的私有对象泄露到 Extension 的公共状态中；需要更新模型时应使用 `pi.registerProvider()`，而不是绕过模型注册表自己发请求。
-
-### Factory、资源和关闭生命周期
-
-小扩展可以是单文件；多文件扩展从目录 `index.ts` 导出 factory；有依赖的扩展在旁边放 `package.json`、lockfile 和 `node_modules`。Factory 适合一次性拉取配置或发现模型，但不应在 factory 内启动长期进程、socket、watcher 或 timer，因为有些 invocation 根本不会启动 session。长期资源应在 `session_start` 或第一次 command/tool/event 时创建，并在 `session_shutdown` 里幂等关闭。`shutdown`、`reload`、`new`、`resume`、`fork` 都会触发这一清理边界。
-
-### 事件总览与启动/资源事件
-
-事件是 runner 按注册顺序调用的生命周期接口；有些事件只通知，有些能返回修改或阻止结果。启动顺序通常是 `project_trust` → `session_start` → `resources_discover`。`project_trust` 只由 user/global 或 CLI `-e` extension 参与，返回 `trusted: "yes" | "no" | "undecided"`；第一个 yes/no 决定是否记住，undecided 交给后续 handler 或内建 trust flow。调用 UI 前检查 `ctx.hasUI`。`resources_discover` 在 startup/reload 发生，可以返回额外的 `skillPaths`、`promptPaths`、`themePaths`。
-
-### Session 事件
-
-`session_start` 在 startup、reload、new、resume、fork 后触发，`event.reason` 区分来源，并可能提供 `previousSessionFile`。`session_info_changed` 在 `/name`、RPC 或 `pi.setSessionName()` 改名时通知。`session_before_switch` 在 `/new` 或 `/resume` 之前运行，可返回 `{ cancel: true }`；`session_before_fork` 在 `/fork`/`/clone` 前运行，可取消或返回 `skipConversationRestore`。切换成功后旧 runtime 先收到 `session_shutdown`，再重绑新的 extension 并收到 `session_start`，所以内存状态必须在新 start 重建。
-
-`session_before_compact` 在手动、阈值或 overflow compaction 前运行，可取消或返回 `compaction`，其中包含 `summary`、`firstKeptEntryId`、`tokensBefore` 和可选 `usage`。`willRetry` 表示 overflow 后是否会重试中断的 turn。成功时 `session_compact` 给出保存后的 compaction entry 和 `fromExtension`；失败时 `session_compact_failed` 给出 `errorMessage`、`aborted`、reason 和是否采用扩展摘要。`session_before_tree` 可以取消 navigation 或提供 branch summary，完成后 `session_tree` 给出新旧 leaf 和 summary。`session_shutdown` 是关闭 session-scoped 资源、保存本地状态的地方。
-
-### Agent、消息和 Provider 事件
-
-`before_agent_start` 在用户 prompt 进入 Agent Loop 前运行。它能看到 prompt、图片、当前链式 `systemPrompt`、`systemPromptOptions`、cwd、context files、skills 和 active tools，并返回持久 custom message 或本轮替换后的 system prompt。后注册的 handler 仍可以继续修改链。`agent_start` 只表示低层 run 开始；`agent_end` 表示该低层 run 结束，但自动 retry、compaction retry 或 follow-up 可能还没结束；需要确认整个运行 settled 时监听 `agent_settled`。
-
-`ui_prompt_start`/`ui_prompt_end` 是等待扩展 UI 的通知事件，覆盖 `select`、`confirm`、`input`、`editor` 和 `custom`；嵌套 prompt 会合并成一个外层等待 span。`turn_start`/`turn_end` 对应一个 LLM 响应及其 Tool Batch。`message_start`/`message_end` 覆盖 user、assistant、toolResult；`message_update` 只表示 assistant 流式更新。`message_end` 可以返回 replacement，但必须保持相同 role。
-
-`context` 在每次 LLM request 前运行，收到可安全修改的 messages 副本；它不直接改 Session。`before_provider_headers` 在 headers 组装后运行，可原地设置字符串或用 null 删除字段；同一次 request 的 retry 复用 headers，不会重复触发。`before_provider_request` 在 Provider payload 完成后运行，可返回新 payload；payload 层的改写不会反映到 `ctx.getSystemPrompt()`。`after_provider_response` 在收到 HTTP response、消费 stream 之前运行，可读取 status 和规范化 headers，但某些抽象 transport 不提供原始 headers。
-
-### Tool、Shell 和输入事件
-
-`tool_execution_start` 在准备阶段按 assistant source order 发出；`tool_execution_update` 可能在并行 Tool 之间交错；`tool_execution_end` 按完成顺序发出；最终 tool-result message 仍按 source order。`tool_call` 发生在 start 之后、execute 之前，可以阻止调用。它的 `event.input` 是可变参数，前一个 handler 的修改会给后一个 handler 和真实 execute 看到，但修改后不会重新 schema validation，因此 handler 自己必须保持类型与权限不变量。返回 `{ block: true, reason?, terminate? }` 可阻止调用；只有 batch 中所有 finalized result 都 terminate，agent 才会提前结束。
-
-`tool_result` 在 execute 完成后、最终 Tool message 发送前运行，可按 middleware 顺序返回 `content`、`details`、`isError`、`usage` 的 partial patch。抛出异常的 tool 必须由 `execute` throw 来标记失败；单纯返回带某个字段的对象不会自动设置 `isError`。嵌套 LLM 调用的 token 要合并到 `usage`，Pi 会把它计入 Session、footer 和 RPC totals。`prepareArguments` 在 schema validation 之前运行，用于兼容旧 Session 的参数形状；它不能把废弃字段加入公开 schema。
-
-`user_bash` 在用户输入 `!`/`!!` 时运行，可以返回自定义 `operations`，包装 `createLocalBashOperations()`，或直接返回带 `output`、`exitCode`、`cancelled`、`truncated` 的 result。`!!` 的结果不进入 Context。`input` 发生在 extension command 检查后、Skill/template 展开前，看到 raw text；它可以 `continue`、`transform` 文本/图片，或 `handled` 而不启动 LLM。extension command 优先级最高，之后才是 input、skill、prompt template、`before_agent_start`。streaming 时必须根据 `streamingBehavior` 区分 steer 与 follow-up。
-
-### ExtensionContext
-
-所有 handler 都收到 `ExtensionContext`。`ctx.mode` 是 `"tui"`、`"rpc"`、`"json"` 或 `"print"`；`ctx.hasUI` 只在 TUI/RPC 为 true。`ctx.cwd` 是当前工作目录，构造项目配置路径时使用 `CONFIG_DIR_NAME`，不要硬编码 `.pi`。`ctx.isProjectTrusted()` 包括临时 trust 和 CLI override，不只看全局保存的 trust。
-
-`ctx.ui` 提供 `select`、`confirm`、`input`、`editor`、`notify`、status/widget/footer、工作指示器、editor text、主题、autocomplete 和 `custom` component。对话方法可以用 timeout 自动取消，也可以用 AbortSignal 区分超时与 Escape。TUI 专属的 component factory、terminal input 和 direct rendering 先检查 `ctx.mode === "tui"`；notification 等跨 TUI/RPC 方法先检查 `hasUI`。
-
-`ctx.sessionManager` 是只读 session 访问面，包含 `getEntries()`、`getBranch()`、`buildContextEntries()` 和 `getLeafId()`；在 parallel Tool 中不保证同一 assistant message 的 sibling result 已进入 state。`ctx.modelRegistry` 可解析 provider 和 auth；`ctx.model` 是当前 model，`ctx.thinkingLevel` 是有效 level，`ctx.scopedModels` 是依据 `--models`/`enabledModels` 解析出的只读列表。`ctx.signal` 在活跃 Agent turn 存在，嵌套 fetch、model 和文件/进程操作必须传入；idle event、command 和 shortcut 中可能是 undefined。
-
-`ctx.isIdle()` 会等 Agent、retry、auto-compaction retry 和 queued continuation 全部结束；`ctx.abort()` 请求取消；`ctx.hasPendingMessages()` 检查队列。`ctx.shutdown()` 是优雅关闭：TUI/RPC 延迟到 idle，print mode 是 no-op。`ctx.getContextUsage()` 优先读取最近 assistant usage，否则估算尾部 token。`ctx.compact()` 是不等待结果的 fire-and-forget，应使用 `onComplete`/`onError`；`ctx.getSystemPrompt()` 只返回当前链式 system prompt，不含后续 context message 变换或 Provider payload 改写。
-
-### ExtensionCommandContext 与 Session 替换
-
-Command handler 额外获得 `getSystemPromptOptions()`、`waitForIdle()`、`newSession()`、`fork()`、`navigateTree()`、`switchSession()` 和 `reload()`。`getSystemPromptOptions()` 是构建 base system prompt 的结构化输入，可能包含完整 context file 内容，不应写进 command list 或日志。`waitForIdle()` 用于在修改 Session 前等待所有自动流程结束。
-
-`newSession` 的 `parentSession` 记录来源，`setup` 在切换前修改新的 `SessionManager`，`withSession` 在新 runtime 绑定后执行。`fork` 的 `position: "before"` 恢复选中的 user prompt，`"at"` 复制到选中 entry；`navigateTree` 可以 summarize、提供 customInstructions、替换默认摘要指令并设置 label。`switchSession` 切换到指定 JSONL；静态 `SessionManager.list()`/`listAll()` 可用于选择目标。
-
-`withSession` 收到的是新的 `ReplacedSessionContext`，旧 `pi`、旧 command `ctx`、旧 `sessionManager` 都已过期；不要在 callback 中使用它们。旧 session 先 shutdown，新的 extension instance 先收到 start，callback 仍然在旧 closure 执行。只捕获字符串、id 和可序列化配置；清理后的内存连接、writer lease 和 raw object 不得复用。`ctx.reload()` 会 shutdown、重载资源、再发 reload 的 start/discover；原 command 的 call frame 仍会继续，所以推荐 `await ctx.reload(); return`。Tool 不能直接 reload，应注册 command，再由 Tool 用 follow-up user message 排队该 command。
-
-### ExtensionAPI 方法
-
-`pi.on(event, handler)` 注册事件；`pi.registerTool(definition)` 注册或动态刷新 Tool，即使在 startup 后调用也会立即出现在 `getAllTools()`。`promptSnippet` 可把 Tool 放进 Available tools 单行列表；`promptGuidelines` 会平铺追加到 Guidelines，必须明确写出 Tool 名称。`pi.sendMessage()` 发送会进入 LLM Context 的 custom message；`pi.sendUserMessage()` 发送真正的 user message，总会触发 turn。运行中前者/后者的 `deliverAs` 可为 `steer`、`followUp` 或 `nextTurn`，idle 时 `triggerTurn` 可启动模型；模板/Skill/command 展开需要显式 `expandPromptTemplates`。
-
-`pi.appendEntry(customType, data)` 保存只供 UI/恢复的 custom entry，不进入 LLM Context；与 `registerEntryRenderer` 配合可显示在 transcript。`setSessionName`/`getSessionName` 管理显示名称；`setLabel`/`getLabel` 管理 `/tree` 的书签。`registerCommand` 注册 slash command；重名命令保留全部并按加载顺序添加 `:1` 后缀，可用 `getArgumentCompletions`。`getCommands()` 只列 extension、prompt、skill command，不包含 interactive-only built-ins，`sourceInfo` 是唯一可靠 provenance。
-
-`registerMessageRenderer` 渲染会进入 LLM Context 的 custom message；`registerEntryRenderer` 渲染只进 TUI 的 custom entry。`registerMarkdownTransformer` 按 extension 顺序变换显示 Markdown，不改变 Session 或 model 原文，必须同步且轻量；抛错时保留已经生成的文本并继续。`registerShortcut` 注册快捷键，`registerFlag` 注册 CLI flag；`exec(command,args,options)` 执行受 signal/timeout 控制的 shell。
-
-`getActiveTools`/`getAllTools`/`setActiveTools` 管理内建和扩展 Tool；`sourceInfo.source` 可区分 `builtin`、`sdk` 与 extension。`setModel` 没有可用 API key 时返回 false；`getThinkingLevel`/`setThinkingLevel` 会按 model capability clamp，并发出 `thinking_level_select`。`pi.events` 是扩展之间的共享 event bus，应使用命名事件避免冲突。
-
-`registerProvider` 可以注册/覆盖 provider。factory 阶段的调用先排队，初始化后 flush；startup 后调用立即生效。配置可以给 `baseUrl`、`apiKey`（literal、`$ENV_VAR` 或 `!command`）、API 类型、models、headers、OAuth、`refreshModels` 和 `streamSimple`；动态 catalog 通过 generation-checked `context.publish({ persist })` 决定是否持久化。Provider callback 必须使用具体 `context.signal`。`unregisterProvider` 删除扩展 provider 并恢复被覆盖的 built-in models。
-
-### State、Custom Tool 与并发
-
-扩展状态不要只放在 module-level variable。可以把状态快照放进 Tool Result `details`，在 `session_start` 沿当前 branch 回放 toolResult 来重建；这样分支切换和重启都有确定来源。需要长期状态时使用 `appendEntry`，并区分会进入 model 的 `sendMessage` 与仅显示的 entry。
-
-Custom Tool 的 definition 必须提供 name、label、description 和 TypeBox `parameters`；`execute(toolCallId, params, signal, onUpdate, ctx)` 返回 `content`、可选 `details`、`usage` 和 `terminate`。`onUpdate` 是进度事件，不是最终结果。Tool 抛异常才会成为 `isError`；schema validation、permission 和 `beforeToolCall` 仍由 Runtime 负责。
-
-默认 Tool 可能是并行的。自定义 Tool 对同一文件的 read-modify-write 必须用 `withFileMutationQueue(absolutePath, callback)` 包住整个窗口，不能只排队最后一次 write；该 helper 用 realpath 让 symlink alias 共用队列。并行事件的执行顺序和最终 source order 不同，不能靠 UI 顺序推断副作用顺序。使用 `StringEnum` 以兼容 Google，避免用 `Type.Union`/`Type.Literal` 代替。
-
-### 覆盖、远程执行与输出限制
-
-用同名 `registerTool` 可以覆盖 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find`、`ls`；`--no-builtin-tools` 则完全关闭内建 Tool。执行 override 与 render override 按 slot 独立继承：缺少 `renderCall`/`renderResult` 会沿用内建 renderer；但 `promptSnippet`、`promptGuidelines` 不继承，结果 `details` 必须匹配内建类型，否则 UI/session 解析会坏。
-
-`ReadOperations`、`WriteOperations`、`EditOperations`、`BashOperations`、`PowerShellOperations`、`LsOperations`、`GrepOperations`、`FindOperations` 允许把 Tool 路由到 SSH、container 等远端系统；`spawnHook` 可以在 bash/powershell 执行前调整 command、cwd、env。session 环境变量 `PI_SESSION_ID`、`PI_SESSION_FILE`、`PI_PROVIDER`、`PI_MODEL`、`PI_REASONING_LEVEL` 在 spawnHook 前注入，可用 `exposeSessionEnvironment: false` 关闭。远程操作不等于信任远程输入，仍要做参数和权限检查。
-
-Tool 输出必须截断；内建上限是 50KB 或 2000 行，先到者为准。`truncateHead` 适合文件/搜索开头，`truncateTail` 适合日志尾部，`truncateLine` 限制单行，`formatSize` 显示人类可读大小。截断后应保存完整输出到临时文件、在结果中说明保留/总行数和路径，不能静默丢失上下文。
-
-### 多 Tool、动态加载与 Provider deferred loading
-
-一个 Extension 可以注册多个共享连接的 Tool，并在 `session_shutdown` 关闭连接。动态 Tool Loading 的步骤是：先用 `registerTool` 注册全部 Tool，只启用 `search_tools`；loader 执行时用 `setActiveTools` 做纯 additive 增量；Pi 将新名字记到 Tool Result，并在下一 request 使用 native deferred tool reference，或在不支持的 Provider 上发送新的完整 active list。未知名字被忽略，非 additive 的替换会回退到普通列表并可能破坏 prompt cache。
-
-原生 deferred 支持取决于当前 Provider/model：Anthropic 新版模型使用 `defer_loading`/`tool_reference`，OpenAI 新版模型使用 `tool_search_call`/`tool_search_output`；自定义 Provider 必须明确开启对应 compat flag，不能仅凭 model 名称启用。即便使用 deferred，激活带 `promptSnippet` 或 `promptGuidelines` 的 Tool 仍会重建 system prompt；因此 loader 通常只提供 description。
-
-### Custom UI、渲染和自动补全
-
-`ctx.ui.select` 返回选择或 undefined，`confirm` 返回 boolean，`input`/`editor` 返回文本或 undefined；timeout 会显示倒计时并自动 dismiss。`setStatus` 是 footer 中的持久状态，`setWorkingMessage`/`setWorkingVisible`/`setWorkingIndicator` 控制 streaming 指示器；`setWidget` 可放 editor 上方或下方；`setFooter` 替换完整 footer；`setTitle`、`setEditorText`、`pasteToEditor` 控制终端标题和 editor。`getToolsExpanded`、`getAllThemes`、`getTheme`、`setTheme` 提供显示偏好。
-
-`addAutocompleteProvider` 应先检查 cursor 前的扩展语法；不匹配时委托 `current.getSuggestions`、`applyCompletion` 和 `shouldTriggerFileCompletion`。这样不会覆盖内建 slash/path completion。`ui_prompt_start/end` 能让状态栏区分“正在运行”和“等待用户”。
-
-`ctx.ui.custom()` 临时替换 editor，callback 收到 `tui`、`theme`、`keybindings` 和 `done(value)`；`overlay: true` 可在既有内容上显示浮层，`OverlayHandle` 控制 focus、hidden 和永久移除。自定义 editor 应继承 `CustomEditor` 而不是底层 `Editor`，未处理的 key 必须调用 `super.handleInput`；安装前保存旧 factory 才能与其他 extension 包装组合。renderer 的 `renderCall`/`renderResult` 必须返回 `Component`，可以复用 `lastComponent`、用共享 `context.state`，并处理 `isPartial`、`expanded` 和 error。颜色通过 `theme.fg`、`bold`、`italic` 等 API；key hint 必须使用命名空间 keybinding id，不要硬编码按键。
-
-### 错误、运行模式和实现对照
-
-Extension factory/load 错误会被记录，通常不使 Agent 停止；`tool_call` handler 错误采用 fail-closed 阻止 Tool；Tool `execute` 的异常被捕获并以 `isError` Tool Result 报给 LLM。UI/renderer handler 失败应提供 fallback；不能用 catch 把副作用成功伪装成失败，也不能把完整 prompt、凭据、Tool 参数或文件内容写到 telemetry。
-
-TUI 模式是 `ctx.mode === "tui"`、`hasUI=true`；RPC 也是 `hasUI=true`，对话通过 JSON 协议，TUI 专属 custom 可能返回 undefined；JSON 和 print 模式没有 UI，扩展仍可运行但不能弹对话。所有命令、Tool、事件和 Provider 行为都应显式处理 signal、timeout、权限和未配置的 UI。
-
-Java 的自然实现是 `interface` + `ServiceLoader`/SPI + typed registry + Listener；Go 则用 `interface` + explicit registry/factory + callback/channel。两者都不应为了模拟 Node 而强行使用动态 `plugin` package。Pi Extension 是宿主内代码、拥有生命周期和 UI/API；Skill 是渐进加载的文件资源；MCP 是跨进程协议。可以由 Extension 实现 MCP client，但三者的 trust、错误隔离和关闭语义不同。
+> 译者注：初学者最容易把 `pi.on()` 看成普通事件监听器，把 Extension 看成“配置文件”。实际情况更接近 Java 的 `ServiceLoader` 加一组 Listener/Interceptor，再加上宿主提供的能力对象。Extension 的代码真的会执行网络、文件和进程操作，不能从不可信来源随便安装。
 
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |
 | --- | --- |
-| Extensions | Extensions |
-| Table of Contents | 目录 |
 | Quick Start | 快速开始 |
-| Extension Locations | Extension 位置 |
+| Extension Locations | Extension 位置与发现 |
 | Available Imports | 可用导入 |
 | Writing an Extension | 编写 Extension |
-| Async factory functions | Async factory functions |
-| Long-lived resources and shutdown | Long-lived resources and shutdown |
-| Extension Styles | Extension Styles |
+| Extension Styles | Extension 组织方式 |
 | Events | 事件 |
-| Lifecycle Overview | Lifecycle 概览 |
-| Startup Events | Startup 事件 |
-| Resource Events | Resource 事件 |
+| Lifecycle Overview | 生命周期总览 |
+| Resource Events | 资源事件 |
 | Session Events | Session 事件 |
 | Agent Events | Agent 事件 |
-| Model Events | Model 事件 |
-| Tool Events | Tool 事件 |
-| User Bash Events | User Bash 事件 |
-| Input Events | Input 事件 |
+| Model Events | 模型事件 |
+| Tool Events | 工具事件 |
+| User Bash Events | 用户 Bash 事件 |
+| Input Events | 输入事件 |
 | ExtensionContext | ExtensionContext |
-| ctx.ui | ctx.ui |
-| ctx.mode | ctx.mode |
-| ctx.hasUI | ctx.hasUI |
-| ctx.cwd | ctx.cwd |
-| ctx.isProjectTrusted() | ctx.isProjectTrusted() |
-| ctx.sessionManager | ctx.sessionManager |
-| ctx.modelRegistry / ctx.model / ctx.thinkingLevel / ctx.scopedModels | ctx.modelRegistry / ctx.model / ctx.thinkingLevel / ctx.scopedModels |
-| ctx.signal | ctx.signal |
-| ctx.isIdle() / ctx.abort() / ctx.hasPendingMessages() | ctx.isIdle() / ctx.abort() / ctx.hasPendingMessages() |
-| ctx.shutdown() | ctx.shutdown() |
-| ctx.getContextUsage() | ctx.getContext使用方式() |
-| ctx.compact() | ctx.compact() |
-| ctx.getSystemPrompt() | ctx.getSystemPrompt() |
 | ExtensionCommandContext | ExtensionCommandContext |
-| ctx.getSystemPromptOptions() | ctx.getSystemPromptOptions() |
-| ctx.waitForIdle() | ctx.waitForIdle() |
-| ctx.newSession(options?) | ctx.newSession(options?) |
-| ctx.fork(entryId, options?) | ctx.fork(entryId, options?) |
-| ctx.navigateTree(targetId, options?) | ctx.navigateTree(targetId, options?) |
-| ctx.switchSession(sessionPath, options?) | ctx.switchSession(sessionPath, options?) |
-| Session replacement lifecycle and footguns | Session replacement lifecycle and footguns |
-| ctx.reload() | ctx.reload() |
-| ExtensionAPI Methods | ExtensionAPI Methods |
-| pi.on(event, handler) | pi.on(event, handler) |
-| pi.registerTool(definition) | pi.registerTool(definition) |
-| pi.sendMessage(message, options?) | pi.sendMessage(message, options?) |
-| pi.sendUserMessage(content, options?) | pi.sendUserMessage(content, options?) |
-| pi.appendEntry(customType, data?) | pi.appendEntry(customType, data?) |
-| pi.setSessionName(name) | pi.setSessionName(name) |
-| pi.getSessionName() | pi.getSessionName() |
-| pi.setLabel(entryId, label) | pi.setLabel(entryId, label) |
-| pi.registerCommand(name, options) | pi.registerCommand(name, options) |
-| pi.getCommands() | pi.getCommands() |
-| pi.registerMessageRenderer(customType, renderer) | pi.registerMessageRenderer(customType, renderer) |
-| pi.registerMarkdownTransformer(transformer) | pi.registerMarkdownTransformer(transformer) |
-| pi.registerEntryRenderer(customType, renderer) | pi.registerEntryRenderer(customType, renderer) |
-| pi.registerShortcut(shortcut, options) | pi.registerShortcut(shortcut, options) |
-| pi.registerFlag(name, options) | pi.registerFlag(name, options) |
-| pi.exec(command, args, options?) | pi.exec(command, args, options?) |
-| pi.getActiveTools() / pi.getAllTools() / pi.setActiveTools(names) | pi.getActiveTools() / pi.getAllTools() / pi.setActiveTools(names) |
-| pi.setModel(model) | pi.setModel(model) |
-| pi.getThinkingLevel() / pi.setThinkingLevel(level) | pi.getThinkingLevel() / pi.setThinkingLevel(level) |
-| pi.events | pi.事件 |
-| pi.registerProvider(name, config) | pi.registerProvider(name, config) |
-| pi.unregisterProvider(name) | pi.unregisterProvider(name) |
+| ExtensionAPI Methods | ExtensionAPI 方法 |
 | State Management | 状态管理 |
-| Custom Tools | 自定义工具 |
-| Tool Definition | Tool Definition |
-| Overriding Built-in Tools | Overriding Built-in Tools |
-| Extension's read tool replaces built-in read | Extension's read tool replaces built-in read |
-| No built-in tools, only extension tools | No built-in tools, only extension tools |
-| Remote Execution | Remote Execution |
-| Output Truncation | Output Truncation |
-| Multiple Tools | Multiple Tools |
-| Custom Rendering | Custom Rendering |
-| Dynamic Tool Loading | Dynamic Tool Loading |
-| Custom UI | Custom UI |
-| Dialogs | Dialogs |
-| Widgets, Status, and Footer | Widgets, Status, and Footer |
-| Autocomplete Providers | Autocomplete Providers |
-| Custom Components | Custom Components |
-| Custom Editor | Custom Editor |
-| Message and Entry Rendering | Message and Entry Rendering |
-| Theme Colors | Theme Colors |
+| Custom Tools | 自定义 Tool |
+| Dynamic Tool Loading | 动态加载 Tool |
+| Custom UI | 自定义 UI |
 | Error Handling | 错误处理 |
-| Mode Behavior | Mode Behavior |
-| Examples Reference | Examples Reference |
+| Mode Behavior | 不同运行模式 |
+| Examples Reference | 示例索引 |
+
+## 快速开始
+
+创建 `~/.pi/agent/extensions/my-extension.ts`，导出一个接收 `ExtensionAPI` 的默认 factory。
+
+factory 可以注册事件、Tool 和命令。事件 handler 通常接收两个参数：事件对象和当前 `ExtensionContext`。
+
+`session_start` 适合显示“已加载”提示；`tool_call` 发生在 Tool 真正执行前，可以检查参数并阻止危险操作；`registerTool()` 把 Tool definition 和执行函数交给 Runtime；`registerCommand()` 把 `/hello` 这类用户命令交给 Extension。
+
+一个最小实现的执行顺序可以这样理解：
+
+1. Pi 发现并加载模块。
+2. 调用默认 factory，把 `pi` API 传进去。
+3. factory 注册 handler、Tool 和 command。
+4. Session 启动时触发 `session_start`。
+5. 用户输入 prompt 后，Runtime 依次触发输入、Agent、模型和 Tool 生命周期事件。
+6. 模型生成 `greet` Tool Call 时，Pi 找到注册的 definition 并运行 `execute()`。
+
+`pi -e ./my-extension.ts` 可以临时加载 Extension。这个参数适合实验和调试，不代表该文件会被全局自动发现。
+
+> 译者注：注册 Tool 只是把能力放入 Registry，不等于模型已经执行。模型只能生成结构化 Tool Call；真正的 `execute()` 由 Agent Runtime 调用。`tool_call` 可以阻止执行，但不能把 Extension 的检查当成完整 sandbox。
+
+## Extension 位置与发现
+
+自动发现有四类位置：全局单文件、全局目录入口、项目本地单文件、项目本地目录入口。
+
+全局位置是 `~/.pi/agent/extensions/*.ts` 和 `~/.pi/agent/extensions/*/index.ts`，对所有项目生效。
+
+项目位置是 `.pi/extensions/*.ts` 和 `.pi/extensions/*/index.ts`，只对当前项目生效。
+
+项目本地 Extension 只有在项目通过信任检查后才加载。这个顺序很重要：如果在信任决定前就执行项目代码，恶意仓库可以通过 Extension 在用户确认之前运行任意逻辑。
+
+也可以在 `settings.json` 的 `extensions` 数组中声明本地路径，或用 `packages` 引入 npm/git Pi package。
+
+`settings.json` 中的 `packages` 负责安装/解析包，`extensions` 负责从路径载入入口。包安装使用生产依赖安装，因此运行时需要的库必须放在 `dependencies`，不能只放在 `devDependencies`。
+
+> 译者注：发现路径是“入口来源”，不是安全边界。即使路径来自全局目录，Extension 仍然拥有当前 Pi 进程的权限。真正的权限边界应该由操作系统账号、容器、网络策略和人工批准共同提供。
+
+### 项目信任与 Extension 加载
+
+`project_trust` 在 Pi 决定是否信任项目动态配置之前触发。只有用户级、全局和命令行 `-e` Extension 参与这个事件；项目本地 Extension 要等信任结果确定后才会加载。
+
+handler 可以返回 `trusted: "yes"`、`"no"` 或 `"undecided"`。第一个明确的 yes/no 决定会负责本次判断；`undecided` 把决定交给后续 handler 或内置流程。
+
+`remember: true` 会保存决定，否则只影响当前进程。没有 UI 时应检查 `ctx.hasUI`，不要无条件调用 confirm。
+
+> 译者注：这不是普通的“启动事件”。它位于代码加载的安全闸门前。将项目配置和项目 Extension 分开处理，目的是先确认“这个仓库能否获得动态代码权限”。
+
+## 可用导入
+
+Extension 通常从 `@earendil-works/pi-coding-agent` 导入 `ExtensionAPI`、`ExtensionContext`、事件类型、内置 Tool factory 和截断工具。
+
+`typebox` 用来声明 Tool 参数 schema。Schema 不只是给 TypeScript 编译器看的类型，也是发给 LLM 的 JSON Schema，以及执行前校验参数的依据。
+
+`@earendil-works/pi-ai` 提供 `StringEnum` 等 AI 层辅助。Google 兼容 API 对字符串枚举的表示有额外限制，使用推荐 helper 比手写 `Type.Union` 更可靠。
+
+`@earendil-works/pi-tui` 提供 `Text`、`Box`、`Component` 等 TUI 组件，只有需要自定义渲染或复杂交互时才使用。
+
+Node 内置模块如 `node:fs`、`node:path` 也可以使用。Extension 目录旁的 `package.json` 可以声明 npm 依赖；运行时依赖要放在 `dependencies`。
+
+Extension 由 `jiti` 加载，因此可以直接运行 TypeScript，不需要预先把文件编译成 JavaScript。
+
+> 译者注：`jiti` 解决的是模块加载和 TypeScript 执行，不是隔离。它不会阻止模块读取环境变量、打开文件或启动子进程。
+
+## 编写 Extension
+
+默认导出 factory。factory 可以同步返回，也可以返回 Promise。
+
+同步 factory 适合只注册 handler 和静态 Tool 的小型扩展。异步 factory 适合启动前需要一次性读取远程配置、发现模型或准备 schema 的场景。
+
+Pi 会等待异步 factory 完成，再继续启动。因此在 factory 中注册的 Provider 可以在 `session_start`、交互式启动和 `pi --list-models` 前生效。
+
+不要从 factory 启动长期资源，例如 watcher、socket、timer 或子进程。某些调用只做 model listing 或配置检查，可能根本不会开始 Session；如果 factory 已经启动资源，就没有对应的 `session_shutdown` 可以清理。
+
+需要长期资源时，在 `session_start` 或真正使用资源的 command/Tool/event 中启动，并注册幂等的 `session_shutdown` 清理逻辑。
+
+> 译者注：异步 factory 的 Promise 只是“启动阶段依赖”。它不应被误解为整个 Agent Run 的后台任务。Java 中可以把它类比为应用启动时等待的初始化 Future；Go 中则更接近启动函数返回前完成一次阻塞初始化。
+
+### Extension 的组织方式
+
+单文件 Extension 适合一个 Tool 或几个简单 handler。入口约定是文件默认导出 factory。
+
+目录型 Extension 用 `index.ts` 作为入口，把 Tool、UI 和辅助函数拆到多个模块。
+
+带依赖的 Extension 在目录中放 `package.json` 和 lockfile，安装后从 `node_modules` 解析依赖，并在 `pi` 字段中声明入口。
+
+组织方式不改变 Extension 的权限和生命周期；它只改善代码边界、依赖管理和发布方式。
+
+> 译者注：Extension 的目录结构类似 Java 项目中的模块或 Go package，但 Pi 的发现规则仍然只关心入口。不要因为把代码拆成多个文件，就认为它获得了更细的权限隔离。
+
+## 事件
+
+事件是 Extension 观察或介入 Pi 生命周期的主要方式。不同事件的返回值语义不一样：有些只是通知，有些可以替换数据，有些可以取消动作。
+
+阅读事件时要同时看四个问题：事件何时触发、handler 收到什么快照、返回值是否影响主流程、异步 handler 是否会阻塞下一阶段。
+
+### 生命周期总览
+
+一次用户 prompt 大致经过以下链路：
+
+1. Pi 启动并处理项目可信度。
+2. 创建或恢复 Session，触发 `session_start`。
+3. 发现 Skills、prompts、themes，触发 `resources_discover`。
+4. 用户输入先经过 Extension command 检查。
+5. 未被 command 处理的输入触发 `input`。
+6. Skill/template 展开后触发 `before_agent_start`。
+7. 开始 Agent run，触发 `agent_start`。
+8. 每个 turn 触发 `turn_start`，准备 context 和 Provider request。
+9. Provider 返回 assistant message 或 Tool Call。
+10. Tool 执行经过 `tool_execution_start`、可阻断的 `tool_call`、更新、`tool_result` 和结束事件。
+11. 没有后续工作时触发 `agent_end`，所有 retry/compaction/follow-up 都完成后才触发 `agent_settled`。
+
+`agent_end` 不一定意味着 UI 马上空闲。Pi 可能在低层 run 结束后继续自动 compaction、retry 或 follow-up；需要确定“完全不会继续”时监听 `agent_settled`。
+
+新建、恢复、fork 或 clone Session 时会有 switch/shutdown/start 的边界。Extension 应在 `session_shutdown` 释放旧 Session 状态，并在新的 `session_start` 重建内存状态。
+
+`/compact` 相关事件用于观察或改写 compaction；`/tree` 相关事件用于导航；模型和 thinking level 有独立通知事件。
+
+> 译者注：事件顺序就是 Extension 能看到的“生命周期协议”。不要只记事件名字。比如 `tool_call` 在 Tool 执行前，`tool_result` 在执行后；把两者交换会导致审计和安全策略落在错误的时间点。
+
+### 资源事件：`resources_discover`
+
+它在 `session_start` 之后触发，让 Extension 追加 Skill、prompt 和 theme 路径。
+
+启动时 `event.reason` 是 `startup`，reload 时是 `reload`。返回的路径会进入资源加载流程，而不是直接把全部文件内容塞进系统提示词。
+
+多个 Extension 都可以贡献路径。资源发现的职责是声明来源，资源加载器负责后续读取、解析和去重。
+
+不要在这个事件里偷偷执行 Skill 脚本或发送网络请求；这里只应完成路径贡献和轻量配置工作。
+
+### Session 事件
+
+`session_start` 在 Session 启动、加载或 reload 时触发。`event.reason` 区分 startup、reload、new、resume 和 fork，replacement flow 还可能带 `previousSessionFile`。
+
+它适合恢复内存缓存、设置 UI 初始状态、重新注册与 Session 相关的运行时资源。不要假设上一个 Extension 实例中的变量仍然存在。
+
+`session_info_changed` 在 `/name`、RPC 或 `pi.setSessionName()` 修改展示名称时触发。它影响 Session selector 的显示，不等于修改对话消息。
+
+`session_before_switch` 在 `/new` 或 `/resume` 之前触发。返回 `{ cancel: true }` 可以取消切换。切换成功后旧实例先收到 `session_shutdown`，新实例重新加载并收到 `session_start`。
+
+`session_before_fork` 在 `/fork` 或 `/clone` 前触发。它可以取消操作，也可以使用保留字段控制后续 conversation restore 行为。成功后同样会经过 shutdown 和新的 start。
+
+`session_before_compact` 可以取消 compaction，或返回自定义 summary。`reason` 可能是 manual、threshold 或 overflow，`willRetry` 表示 overflow recovery 是否会重新尝试被中断的 turn。
+
+`session_compact` 表示 compaction 已保存，包含 compaction entry 和是否来自 Extension；`session_compact_failed` 表示失败或 abort，并提供错误信息和 aborted 标志。
+
+`session_before_tree` 可以取消 tree navigation，或提供 branch summary；`session_tree` 在导航完成后通知新旧 leaf 和 summary 信息。
+
+`session_shutdown` 是清理 session-scoped 资源的地方。它可能由 quit、reload、new、resume 或 fork 触发。
+
+> 译者注：Session 生命周期事件不是“对象构造/析构”的简单镜像。Pi 会重新绑定 Extension 实例；如果把旧 `SessionManager`、文件句柄或闭包状态带到新 Session，就会访问过期对象。
+
+### Agent 事件
+
+`before_agent_start` 在用户 prompt 通过输入处理后、Agent loop 开始前触发。它可以注入持久 message，也可以修改当前 turn 的 system prompt。
+
+`event.systemPrompt` 是到当前 handler 为止的链式结果，后续 handler 仍可以继续修改。`systemPromptOptions` 让 Extension 查看 custom prompt、active tools、tool snippets、guidelines、cwd、context files 和 skills，而不必重新解析 CLI 参数。
+
+注入的 message 会进入 Session 并发送给 LLM；它不是只给 UI 显示的状态。如果只想保存 TUI 内容，应使用 `appendEntry` 和 entry renderer。
+
+`agent_start` 代表低层 Agent run 开始。`agent_end` 带有该低层 run 的 messages，但自动 retry、compaction retry 和 queued continuation 可能仍未完成。
+
+`agent_settled` 适合更新“彻底空闲”的外部状态。此时通常 `ctx.isIdle()` 为 true，除非另一个 Extension 又启动了新 run。
+
+`ui_prompt_start` 和 `ui_prompt_end` 是阻塞式用户 UI 的通知事件，覆盖 select、confirm、input、editor 和 custom。它们不是业务结果，不应被当作用户确认值。
+
+`turn_start`/`turn_end` 描述一个 assistant response 加对应 Tool batch 的 turn。`message_start`/`message_update`/`message_end` 描述消息生命周期；update 主要用于 assistant streaming。
+
+`message_end` handler 可以返回新的 message，但必须保持相同 role。它适合追加 usage 或修正显示数据，不应借此破坏 Tool Call/Tool Result 配对。
+
+### Provider 与 Context 事件
+
+`context` 在每次 LLM call 前触发。它收到可安全修改的 message 深拷贝，可以裁剪、排序或增加临时上下文；修改后的结果只影响本次请求，不应误认为永久改变 Session tree。
+
+`before_provider_headers` 在 HTTP headers 组装后触发。handler 可以增加、覆盖或用 `null` 删除 header。它每次 Provider request 运行一次，retry 通常复用同一组 headers。
+
+`before_provider_request` 在 Provider-specific payload 构造后、请求发出前触发。返回 `undefined` 保持不变；返回其他值会替换后续 handler 和最终 request 看到的 payload。
+
+payload 级替换可能修改或删除 Provider 的 system instruction，但不会同步改变 `ctx.getSystemPrompt()`。后者报告的是 Pi 的系统提示词字符串，不是最终序列化的厂商 payload。
+
+`after_provider_response` 在收到 HTTP response、消费 stream body 之前触发。它能观察 status 和 normalized headers，但某些抽象 transport 不暴露原始 header。
+
+> 译者注：`getSystemPrompt()`、`context` message 和 `before_provider_request` payload 位于不同层。前者是提示词构建结果，中间层是消息上下文，最后一层是厂商协议序列化；不能用其中一层的日志推断另外两层完全相同。
+
+### 模型事件
+
+`model_select` 在 `/model`、模型循环切换或 Session restore 时触发。事件带当前模型、旧模型和 source，可用于刷新状态栏或执行模型专属初始化。
+
+`thinking_level_select` 在 thinking level 改变时触发。它是通知事件，返回值会被忽略；非 reasoning 模型可能把 level clamp 到 `off`。
+
+不要在 model event 中假设已经有活动 Agent run。模型选择可能发生在 idle UI、Session restore 或命令处理阶段。
+
+### Tool 事件
+
+`tool_execution_start` 表示 Tool batch 的 preflight 开始。并行模式下，start 通常按 assistant source order 发出。
+
+`tool_call` 发生在真正执行前，能够阻断。`event.input` 可原地修改，后续 handler 会看到修改结果，但 Pi 不会因为 Extension 修改而再次 schema validation，因此修改必须严格符合 Tool 输入约定。
+
+同一 assistant message 的 sibling Tool Call 在并行模式下会依次 preflight、并发执行。一个 Tool 的 handler 不应假设另一个 sibling 的 result 已经写入 Session。
+
+`tool_execution_update` 报告渐进结果；`tool_execution_end` 报告一个 Tool 完成。并行时 update 可以交错，end 按完成顺序出现；最终 Tool Result message 仍按 assistant source order 发送。
+
+`tool_result` 在执行完成后、最终 Tool Result message 发出前触发，可以返回 content、details、isError 或 usage 的 partial patch。多个 handler 按加载顺序像 middleware 一样串联。
+
+`ctx.signal` 应传给 handler 内部的 fetch、模型请求和其他 abort-aware 操作。用户按 Escape 时，Pi 可以取消主 run；Extension 自己启动的异步工作只有正确传递 signal 才能及时停止。
+
+> 译者注：事件顺序和并行顺序不是一回事。审计日志要记录 Tool Call 的 source index、call id 和完成时间，不能用事件到达顺序代替模型原始顺序。
+
+### 用户 Bash 事件
+
+`user_bash` 在用户输入 `!` 或 `!!` 命令时触发，并允许 Extension 接管执行。
+
+Extension 可以返回远程 operations，例如 SSH；也可以包装 Pi 的 `createLocalBashOperations()`，复用本地 shell 的启动、shell 选择和进程树终止；还可以直接返回最终 result 完全替换后端。
+
+`!!` 的 `excludeFromContext` 表示命令输出不进入模型上下文。Extension 仍需考虑命令本身、工作目录、环境变量和敏感输出的泄露。
+
+> 译者注：`user_bash` 是用户主动执行命令的扩展点，不是给模型 Tool 自动授权的开关。远程执行后端仍要实现超时、取消、stdout/stderr 限制和权限审计。
+
+### 输入事件
+
+`input` 在 Extension command 检查之后、Skill 和 prompt template 展开之前触发，因此看到的是原始输入。
+
+处理顺序是：先查 `/command`；找到就执行 command，跳过 input；否则触发 input；未处理的输入再展开 `/skill:name` 和 template；最后进入 `before_agent_start` 与 Agent。
+
+handler 可以 `continue`、`transform` 或 `handled`。`continue` 让输入保持原样；`transform` 修改 text/images 后继续展开；`handled` 表示 Extension 自己完成处理，不启动 Agent。
+
+多个 transform 按 handler 顺序串联。`event.source` 用来区分 interactive、RPC 和 Extension 注入；`streamingBehavior` 区分 idle、steer 和 followUp。
+
+> 译者注：这里的 `input` 不是“最终 prompt”。如果 Extension 想拦截 `/skill:foo`，必须在展开之前处理；如果等到 `before_agent_start`，它看到的可能已经是 Skill 正文。
+
+## ExtensionContext
+
+所有 handler 都收到 `ExtensionContext`。它提供的是受宿主约束的能力入口，不是任意访问内部对象的许可证。
+
+### `ctx.ui`
+
+`ctx.ui.select()`、`confirm()`、`input()`、`editor()` 是等待用户的交互方法；`notify()`、`setStatus()`、`setWidget()`、`setTitle()` 等通常是非阻塞显示方法。
+
+对话框返回的 `undefined`、`false` 等取消值要和有效的空字符串区分。可以使用 timeout 自动关闭，也可以传 `AbortSignal` 区分超时和用户按 Escape。
+
+`ctx.ui.custom()` 临时替换 editor，由组件调用 `done(value)` 完成。它适合向导、设置面板和复杂交互；组件必须处理键盘、焦点、尺寸和取消。
+
+### `ctx.mode` 与 `ctx.hasUI`
+
+`ctx.mode` 是 `tui`、`rpc`、`json` 或 `print`。TUI 才能安全使用终端组件、component factory 和直接渲染。
+
+`ctx.hasUI` 在 TUI 和 RPC 为 true，在 print 和 json 为 false。RPC 有 UI 协议但不是本地终端；某些 TUI-specific API 在 RPC 中是 no-op 或返回默认值。
+
+因此应分别检查：需要终端组件时检查 `ctx.mode === "tui"`；需要对话框或通知能力时检查 `ctx.hasUI`。
+
+### `ctx.cwd` 与项目配置
+
+`ctx.cwd` 是当前工作目录。构造项目配置路径时使用 `CONFIG_DIR_NAME`，不要硬编码 `.pi`，因为 rebranded distribution 可能使用其他目录名。
+
+### 项目信任、Session 与模型
+
+`ctx.isProjectTrusted()` 反映当前 Session context 的实际信任状态，包括临时信任和 CLI override，不只是全局 trust store 中的保存值。
+
+`ctx.sessionManager` 提供只读 Session 状态：entries、branch、经过 compaction 的 context entries 和 leaf id。`tool_call` handler 运行前，当前 assistant message 已同步；并行 sibling result 不保证存在。
+
+`ctx.modelRegistry` 可查询 Provider、认证和可用模型。`ctx.model` 是当前模型，`ctx.thinkingLevel` 是有效 thinking level，`ctx.scopedModels` 是当前 Session 受 `--models` 和 enabledModels 限制后的只读集合。
+
+### `ctx.signal`、空闲与关闭
+
+`ctx.signal` 在活动 Agent turn 中通常存在，在 idle Session event、shortcut 或命令中可能是 undefined。把它传给所有可取消的嵌套 I/O。
+
+`ctx.isIdle()` 只有在当前 run、自动 retry、auto-compaction retry 和 queued continuation 都结束后才为 true。`ctx.hasPendingMessages()` 用于判断队列是否仍有工作。
+
+`ctx.abort()` 请求取消当前运行。它不等价于杀死线程，也不能撤销已经发送到远端 Provider 的计费请求。
+
+`ctx.shutdown()` 请求优雅关闭：TUI/RPC 会等到合适的 idle 边界，print 模式是 no-op，因为进程会在 prompt 处理完后退出。
+
+### Context usage、compaction 与 system prompt
+
+`ctx.getContextUsage()` 优先读取最近 assistant usage，必要时估算尾部 message 的 token。它用于显示和策略判断，不是精确 tokenizer 的替代品。
+
+`ctx.compact()` 异步触发 compaction，不等待结果；通过 `onComplete` 和 `onError` 处理完成/失败。调用后不要假设当前 handler 的内存快照已自动更新。
+
+`ctx.getSystemPrompt()` 返回当前系统提示词。它能反映到当前 `before_agent_start` handler 为止的链式变化，但不包含之后的 context message 修改或 provider payload rewrite。
+
+## ExtensionCommandContext
+
+命令 handler 收到的 `ExtensionCommandContext` 继承 `ExtensionContext`，增加 Session 控制方法。这些方法只在 command 中提供，是为了避免从普通 event handler 调用时形成等待自己完成的死锁。
+
+### 获取 prompt 输入与等待 idle
+
+`ctx.getSystemPromptOptions()` 返回 Pi 构建 system prompt 的基础输入：custom prompt、active tools、tool snippets、guidelines、cwd、context files 和 skills。
+
+这些内容可能包含完整项目指令，属于敏感数据。不要把它们放入 command 列表、autocomplete、日志或外发请求。
+
+`ctx.waitForIdle()` 会等待自动 retry、compaction retry 和 queued continuation 都结束。只有之后修改 Session tree 才不会和 Agent 当前写入竞争。
+
+> 译者注：事件 handler 里不能随意调用 Session 控制方法，不是 API 不够强，而是生命周期方向相反。command 是用户明确触发的入口，适合等待和切换；event handler 通常正在被主流程等待。
+
+### Session replacement 方法
+
+`ctx.newSession()` 创建新 Session，可设置 parent header、在切换前运行 setup，并通过 `withSession` 在新 context 中继续工作。
+
+`ctx.fork()` 从指定 entry 创建新文件。`position: "before"` 通常把选中的 user prompt 恢复到 editor；`position: "at"` 复制当前路径但不恢复 editor 文本。
+
+`ctx.navigateTree()` 在同一个 Session tree 中移动 leaf，可以选择为被放弃的 branch 生成 summary，并附加 label。
+
+`ctx.switchSession()` 切换到已有 Session 文件。可用 `SessionManager.list()` 或 `listAll()` 发现候选文件。
+
+replacement 成功后，旧 Session 会 shutdown，新 Session 绑定并启动。`withSession` 收到的是新的 `ReplacedSessionContext`，只能使用 callback 参数提供的 context。
+
+不要捕获旧的 `pi`、旧 `ctx`、旧 `SessionManager` 或文件句柄后在 callback 中复用。可以捕获字符串、id 和序列化配置等普通数据。
+
+> 译者注：这是一个典型的“闭包捕获旧对象”陷阱。Java 中类似把旧 Spring scope 的 bean 带到新上下文，Go 中类似保留已经关闭的 client/channel。类型系统未必能发现，生命周期约定必须由代码遵守。
+
+### `ctx.reload()`
+
+`ctx.reload()` 执行和 `/reload` 相同的流程：当前实例收到 `session_shutdown`，资源重新发现，新实例收到 `session_start` 和 `resources_discover`。
+
+当前 command 的调用栈不会被魔法替换。`await ctx.reload()` 之后仍然是旧 handler 的代码，旧的内存状态可能已失效；推荐把 reload 作为该 handler 的终点，调用后立即 return。
+
+Tool 不能直接调用 `ctx.reload()`。可以注册 command 作为 reload 入口，再让 Tool 通过 `pi.sendUserMessage()` 以 follow-up 方式排队这个 command。
+
+## ExtensionAPI 方法
+
+### `pi.on(event, handler)`
+
+订阅事件。事件的返回值、是否可取消以及是否会等待，必须以具体事件定义为准。
+
+### `pi.registerTool(definition)`
+
+注册可被 LLM 调用的 Tool。可以在 factory、`session_start`、command 或其他 event 中注册；Pi 会立即刷新当前 registry，不必 `/reload`。
+
+`pi.setActiveTools()` 控制哪些 Tool 出现在当前 request。`promptSnippet` 进入 system prompt 的一行 Available tools；`promptGuidelines` 进入 Guidelines，但它们是扁平追加，必须在每条 guideline 中明确写 Tool 名。
+
+### `pi.sendMessage(message, options?)`
+
+发送 custom message。它会进入 Session 和 LLM context。`deliverAs: "steer"` 在当前 assistant turn 的 Tool batch 后送达，`"followUp"` 等待当前 Agent 没有 Tool Call，`"nextTurn"` 留给下一次 user prompt。
+
+idle 时可用 `triggerTurn: true` 立即启动响应；`nextTurn` 不会触发当前 turn。
+
+如果只是保存并在 TUI 渲染、但不发送给模型，使用 `appendEntry()` 而不是 `sendMessage()`。
+
+### `pi.sendUserMessage(content, options?)`
+
+发送真正的 user message，语义等同于用户输入，并且总会触发 turn。content 可以是字符串，也可以是 text/image block 数组。
+
+Agent streaming 时必须明确 `deliverAs`；idle 时立即发送。`expandPromptTemplates` 默认 false，设为 true 才会进入 command dispatch、Skill 展开和 prompt template 展开。
+
+### `pi.appendEntry(customType, data?)`
+
+保存 Extension 自定义数据。custom entry 不进入 LLM context；配合 entry renderer 时可以显示在 TUI transcript。
+
+在 `session_start` 中遍历 `ctx.sessionManager.getEntries()`，根据 `type === "custom"` 和 `customType` 恢复状态。data 必须设计成可序列化并兼容 branch。
+
+### Session metadata
+
+`setSessionName()`/`getSessionName()` 管理 selector 展示名称；`setLabel(entryId, label)` 设置或清除 tree bookmark。label 会持久化并在重启后保留。
+
+### Commands 与 provenance
+
+`registerCommand()` 注册 slash command。相同名字可以共存，Pi 会按加载顺序附加 `:1`、`:2` 后缀。
+
+`getArgumentCompletions` 可根据 prefix 提供补全。handler 通过 `args` 获得命令参数，通过 command context 访问 Session。
+
+`getCommands()` 返回当前可调用的 Extension command、prompt template 和 Skill command，顺序是 Extension、template、skill。`sourceInfo` 是权威来源字段，不要从名称或路径猜归属。
+
+内置 interactive command 如 `/model`、`/settings` 不在该列表中，也不会因为调用 `prompt` 就自动执行。
+
+### 消息、Entry 与 Markdown 渲染
+
+`registerMessageRenderer()` 负责参与 LLM context 的 custom message；它由 `sendMessage()` 创建。
+
+`registerEntryRenderer()` 负责 TUI-only custom entry；它由 `appendEntry()` 创建，data 不发送给 LLM。
+
+`registerMarkdownTransformer()` 只改变显示 Markdown，不改变 Session 原消息和模型 context。多个 transformer 按加载顺序串联；异常时保留当前结果并继续下一个 transformer。由于它会在 streaming、restore 和 terminal width 变化时运行，应保持同步且轻量。
+
+### 快捷键、flags 与 shell
+
+`registerShortcut()` 注册快捷键，应使用 `keybindings.md` 中的命名空间和配置语义，不能硬编码不可配置的按键判断。
+
+`registerFlag()` 注册 CLI flag，可在 Extension 内通过 `getFlag()` 读取。flag 适合启动时选择模式，不能替代权限校验。
+
+`pi.exec()` 执行 shell command，返回 stdout、stderr、code 和 killed。它是宿主进程能力，调用前仍要限制参数、cwd、超时和敏感环境变量。
+
+### Tool 集合与模型
+
+`getActiveTools()` 返回当前 active Tool 名称，`getAllTools()` 返回所有 metadata，包括 promptGuidelines 和 sourceInfo。`setActiveTools()` 只应启用已经注册的名称。
+
+`setModel()` 切换当前模型；没有可用 API key 时返回 false。Provider 认证由 registry 解析，不要在 Extension 里自己打印 key。
+
+`getThinkingLevel()` 和 `setThinkingLevel()` 读取/设置 thinking level；有效值受模型能力 clamp，变更触发 `thinking_level_select`。
+
+### Extension event bus
+
+`pi.events` 是 Extension 之间共享的事件总线。它用于松耦合通信，不等于 Pi 主 Agent event；建议为自定义事件定义稳定 payload，避免不同 Extension 猜字段。
+
+### Provider 注册与撤销
+
+`registerProvider()` 可以覆盖已有 Provider、增加自定义 endpoint、注册 model catalog、实现 refresh 或 OAuth。factory 阶段的调用先排队，初始化结束后应用；之后的调用立即生效。
+
+Provider 的 `refreshModels` 应传递 `context.signal`，不要阻塞忽略取消。动态 catalog 可以返回实时模型而不持久化；需要持久化时使用 generation-checked publish，避免旧刷新结果覆盖新结果。
+
+完整 Provider 可以提供 auth、getModels、refreshModels、filterModels、stream 和 streamSimple；简单代理场景可使用 legacy config。
+
+`unregisterProvider()` 移除动态 Provider，并恢复此前被覆盖的 built-in models。它不会因为没有找到目标 Provider 而报错。
+
+> 译者注：Provider registration 是配置/适配层，不是把 Agent Loop 改造成某个厂商 SDK。Extension 负责注册，`pi-ai` 负责统一消息和流，Agent 仍只依赖统一 Model contract。
+
+## 状态管理
+
+Extension 的内存变量只在当前实例有效。reload、new、resume、fork 都可能创建新实例，因此不能只依赖闭包变量。
+
+需要跟随 branch 的状态应放在 Tool Result 的 `details` 中。每次 Tool 返回新的完整状态快照，`session_start` 从当前 branch 的 Tool Result 重建。
+
+需要只属于 Extension、且不进入模型上下文的状态，使用 `appendEntry()` 保存 custom entry，再在启动时按 `customType` 恢复。
+
+不要把连接池、socket 或 watcher 直接塞进 Session entry。持久化的是可重建配置或状态，资源本身要在 Session 生命周期中重新打开并在 shutdown 关闭。
+
+> 译者注：`details` 更适合“随 conversation branch 演进”的状态，custom entry 更适合“仅宿主/Extension 使用”的状态。两者都不能替代数据库事务；外部副作用仍需自己的幂等键和审计。
+
+## 自定义 Tool
+
+Tool definition 至少包含 name、label、description 和 parameters。description 会帮助 LLM 选择工具，parameters schema 约束 arguments，execute 才执行副作用。
+
+`promptSnippet` 是可选的短提示，`promptGuidelines` 是 active 时附加的规则。guideline 必须写明 Tool 名，否则扁平文本中的“使用这个工具”没有明确指代。
+
+`prepareArguments()` 在 schema validation 前运行，可把旧 Session 的参数形状迁移到新 schema。它不应把 deprecated 字段加入公开 schema，也不能用来绕过 validation。
+
+执行失败必须 throw error，Pi 才会把结果标成 `isError: true` 并告诉 LLM。返回一个带 error 字段的普通值不会自动成为失败。
+
+返回 `terminate: true` 是提前终止提示，只有当前 batch 中所有 finalized Tool Result 都是 terminating 时才会跳过下一次 LLM request。
+
+嵌套 LLM 调用产生的 usage 应通过 Tool Result 的 `usage` 返回，Pi 才能把它计入 Session、footer 和 RPC totals。
+
+自定义 Tool 若修改文件，应调用 `withFileMutationQueue()`。并行 Tool Call 可能同时 read-modify-write 同一文件；把整个读改写窗口排入按绝对路径规范化的队列，而不是只排最终 write。
+
+如果接受路径参数，要用 `ctx.cwd` 或 Tool 工作目录解析绝对路径，并处理 `@` 前缀、symlink 和新文件路径。
+
+> 译者注：Schema validation 解决的是“参数形状”，permission policy 解决的是“是否允许做这件事”，sandbox 解决的是“即使允许，操作系统还能限制到什么程度”。三层不能相互替代。
+
+### 覆盖内置 Tool
+
+注册同名 Tool 可以覆盖 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 等 built-in Tool。交互模式会提示覆盖发生。
+
+也可以使用 `--no-builtin-tools` 禁用内置 Tool，只保留 Extension Tool。
+
+覆盖执行和覆盖渲染是两个独立槽位。缺少 `renderCall` 或 `renderResult` 时，Pi 可以继承 built-in renderer；但 promptSnippet、promptGuidelines 不会自动继承，覆盖者要显式重新声明。
+
+结果 shape、尤其是 `details` 类型必须和宿主约定完全匹配。UI、Session 状态和后续 handler 都可能依赖这些字段。
+
+### 远程执行
+
+built-in Tool 支持注入 ReadOperations、WriteOperations、EditOperations、BashOperations、PowerShellOperations、LsOperations、GrepOperations 和 FindOperations。
+
+这允许把文件和 shell 操作转给 SSH、容器或其他远程 backend。更换 operations 不会自动产生安全隔离，远端系统仍要执行权限、路径和超时检查。
+
+`createLocalBashOperations()` 可以复用 Pi 的本地 bash backend。`spawnHook` 可在进程启动前修改 command、cwd 和 env，例如进入 sandbox 或设置 CI 标志。
+
+Tool 还可能获得 `PI_SESSION_ID`、`PI_SESSION_FILE`、`PI_PROVIDER`、`PI_MODEL` 和 `PI_REASONING_LEVEL`。如果 Extension 保留 env，应使用展开后的 env；设置 `exposeSessionEnvironment: false` 可以关闭注入。
+
+### 输出截断
+
+Tool 输出必须限制，否则一个 `grep` 或 shell 日志就能耗尽 Context Window。内置上限是 50KB 或 2000 行，先达到哪个就截断哪个。
+
+`truncateHead` 适合文件和搜索结果，保留开头；`truncateTail` 适合日志，保留结尾；`truncateLine` 处理单行；`formatSize` 用于构造人类可读提示。
+
+截断后必须告诉 LLM 已截断、保留了多少以及完整输出保存在哪里。否则模型会把不完整内容误认为完整事实。
+
+临时文件也有安全要求：放在受控目录，避免把密钥或其他 Session 的输出暴露给模型或其他用户。
+
+> 译者注：截断不是纯 UI 优化，而是上下文正确性策略。正确的 Tool Result 应同时表达“看到的部分”和“没有看到的部分”。
+
+### 多 Tool、渲染与键位
+
+一个 Extension 可以注册共享状态的多个 Tool，例如 connect/query/close。共享连接必须在 Session shutdown 时清理，Tool 仍要处理并发、断线和 cancellation。
+
+`renderCall` 显示 Tool 调用头，`renderResult` 显示结果。默认 renderer 负责 Box、padding、syntax highlighting 和 diffs；自定义 renderer 应保持默认视图紧凑，并在 `isPartial`、`expanded` 和 `isError` 下给出合理输出。
+
+`renderShell: "self"` 让 Tool 自己负责外框、背景和 padding，只有默认 Box 无法满足稳定预览等需求时使用。
+
+renderer 的 context 包含 args、state、lastComponent、invalidate、toolCallId、cwd、executionStarted、argsComplete、isPartial、expanded、showImages 和 isError。
+
+跨 renderCall/renderResult 共享的数据放 `context.state`；slot 局部缓存放返回的 component 实例。可以复用 `lastComponent` 原地更新，避免 streaming 时反复创建对象。
+
+使用 `keyHint()`、`keyText()` 和 `rawKeyHint()` 显示快捷键；应引用命名空间 id，例如 `app.tools.expand` 或 `tui.select.confirm`，不要硬编码 `ctrl+o`。
+
+### 动态加载 Tool
+
+动态 Tool loading 的目标是：注册很多能力，但只把很小的 loader 集合放进初始 active Tool list。
+
+第一步注册所有 searchable Tool；第二步只激活 `search_tools`；第三步 loader 执行时调用 `setActiveTools([...current, ...matching])`，且只能做 additive change；第四步 Pi 把 newly added names 记录在 Tool Result；第五步下一次模型请求获得新增 definition。
+
+支持 native deferred loading 的 Anthropic 和 OpenAI 模型会在 Tool Result 位置引用新 Tool，稳定的初始 prompt prefix 可以保留。其他 Provider 会在下一次 request 正常发送完整 active list。
+
+如果 active set 不是纯 additive，例如替换一组 Tool，仍然能工作，但通常会重建工具定义和缓存 prefix。
+
+`promptSnippet` 或 `promptGuidelines` 的变化还可能重建 system prompt。懒加载 Tool 通常应该依赖 description，避免不必要的 active-only metadata。
+
+> 译者注：动态加载是 Context Engineering，而不是安全授权。Tool 进入 active set 只说明模型可以尝试调用；执行前仍要做 schema、权限、资源和网络策略检查。
+
+## 自定义 UI
+
+`ctx.ui` 提供 select、confirm、input、editor、notify 等基础交互；`ctx.ui.custom()` 提供完整 TUI component 能力。
+
+### 对话框与取消
+
+select 返回选项或 undefined；confirm 返回 boolean；input/editor 返回文本或 undefined。空值必须按各 API 语义处理，不能把 undefined 当成用户输入的空字符串。
+
+timeout 会显示倒计时，到期时 select/input 返回 undefined，confirm 返回 false。使用 AbortSignal 可以由 Extension 取消，并区分 controller abort 和用户按 Escape。
+
+nested prompt 会合并 waiting span，事件 handler 是 best-effort，不应依赖它完成业务事务。
+
+### Status、working indicator、widget、footer
+
+`setStatus(id, text)` 在 footer 保留状态直到传 undefined 清除；id 应稳定，否则多个状态项会互相覆盖。
+
+`setWorkingMessage()` 修改 streaming 时的工作提示，`setWorkingVisible(false)` 隐藏内置 loader，`setWorkingIndicator()` 更换帧动画。自定义 frame 是原样渲染的，想要颜色必须自己用 theme 包装。
+
+`setWidget(id, content)` 可以在 editor 上方或下方放字符串行或 Component factory；传 undefined 清除。widget 适合显示可折叠的状态，不适合输出完整日志。
+
+`setFooter()` 完全替换 built-in footer，传 undefined 恢复默认。自定义 footer 必须处理宽度和 invalidate，否则终端 resize 后可能显示旧内容。
+
+`setHeader()` 可替换 startup header；`setTitle()` 更新终端标题；`setEditorText()` 和 `pasteToEditor()` 修改输入框，但 paste 会经过大内容折叠处理。
+
+### Autocomplete
+
+`addAutocompleteProvider()` 应叠加在内置 slash/path provider 之上。先检查光标前文本是否符合 Extension 语法；不匹配时委托给 current provider。
+
+`triggerCharacters` 声明触发字符，`getSuggestions()` 返回 prefix 和 items，`applyCompletion()` 通常委托旧 provider，`shouldTriggerFileCompletion()` 也应保留原判断。
+
+autocomplete provider 不应每次输入都做慢网络请求；可在 Session start 预加载数据，必要时加缓存和取消。
+
+### Custom Component 与 overlay
+
+`ctx.ui.custom()` callback 收到 tui、theme、keybindings 和 done。组件应处理 Enter、Escape、焦点、尺寸和 `done()` 只调用一次。
+
+overlay 模式把 component 浮在现有内容上，不清空屏幕。`anchor`、`width`、`margin` 和 visibility 可以通过 overlayOptions 控制；OverlayHandle 可以 focus、unfocus、hide 或永久 remove。
+
+暂时的 custom UI 关闭后，visible overlay 可能重新获得输入焦点。如果希望 editor 保持焦点，应显式 `unfocus({ target: editorComponent })`。
+
+### Custom Editor
+
+扩展 editor 应继承 `CustomEditor`，不要直接继承基础 `Editor`，这样才能保留 app keybindings，例如 Escape abort、Ctrl+D 和模型切换。
+
+只处理自己拥有的按键，其余输入调用 `super.handleInput(data)`。设置新 editor 前可用 `getEditorComponent()` 捕获旧 factory，从而包装其他 Extension 已设置的 editor。
+
+传 undefined 恢复默认 editor。自定义 editor 只应在 TUI 模式安装，RPC/JSON/print 不具备同样的终端组件语义。
+
+> 译者注：UI Extension 的责任类似 Java Swing/JavaFX component 加 listener，但 Pi 的 render callback 还受到 streaming、terminal width 和 keybinding manager 影响。不要在 render 函数中做网络、文件写入或不可控计算。
+
+### Message、Entry 与主题颜色
+
+Message renderer 用于会进入 LLM context 的 custom message；Entry renderer 用于只显示在 TUI 的 custom entry。两者都要清楚标记 `customType` 并处理 expanded 状态。
+
+theme 提供 `fg`、`bold`、`italic`、`strikethrough` 和语义颜色。优先使用主题 token，不要硬编码 ANSI 颜色；这样才能适配 light/dark theme。
+
+syntax highlighting 可通过 `highlightCode()` 和 `getLanguageFromPath()` 复用宿主能力。renderer 负责显示，不应改变原始 Session message。
+
+## 错误处理
+
+Extension factory 加载错误、handler 错误和 Tool 错误的处理策略不同，要看它们发生在哪一层。
+
+一般 Extension 错误会记录并让 Agent 继续；`tool_call` handler 抛错则 fail-safe 地阻止 Tool；Tool `execute` 抛错会被捕获，生成 `isError: true` 的 Tool Result 并让模型继续处理。
+
+安全策略 handler 应默认 fail-closed。不能把“检查函数失败”当成允许执行，也不能把网络超时静默转换成成功结果。
+
+事件 handler 的副作用可能已经发生，即使后续 Agent step 失败。需要 exactly-once 的外部写入必须有自己的 operation id、幂等键和恢复记录。
+
+日志不要包含 API key、Authorization header、完整 Tool arguments、文件内容或任意用户 secret。错误消息要保留诊断信息，但先做 redaction。
+
+> 译者注：Pi 的“Agent continues”不是“错误不存在”。它说明宿主把部分 Extension failure 当成可隔离的插件故障；如果你的 Extension 是权限闸门，必须明确选择 fail-closed，并为拒绝路径写测试。
+
+## 运行模式差异
+
+| 模式 | `ctx.mode` | `ctx.hasUI` | 适用能力 |
+| --- | --- | --- | --- |
+| Interactive | `tui` | true | 完整终端渲染、编辑器和对话框 |
+| RPC | `rpc` | true | JSON 协议承载对话框和通知，部分 TUI API 为 no-op |
+| JSON | `json` | false | stdout 事件流，不应写交互 UI |
+| Print | `print` | false | 非交互 prompt，dialog 无法使用 |
+
+TUI 模式拥有 terminal dimensions、keyboard input 和 Component tree；RPC 模式的 UI 调用交给协议客户端，不应假设存在本地终端。
+
+JSON mode 的 stdout 是机器可解析事件流，Extension 的普通 console 输出可能污染协议，因此日志应写 stderr 或使用宿主提供的诊断通道。
+
+Print mode 适合脚本化一次性请求。Extension 可以参与事件和 Tool，但 `notify`、dialog、custom component 要按 no-op/默认值处理。
+
+在代码中用 `ctx.mode === "tui"` 守护终端专属 API，用 `ctx.hasUI` 守护 dialog 和可跨 TUI/RPC 的通知 API。
+
+> 译者注：CLI、TUI、RPC、JSON 是宿主交互模式；MCP 是进程/网络间协议。RPC 能把 TUI 事件序列化出去，但它不因此变成 MCP，也不自动提供远程权限隔离。
+
+## Extension、Skill、MCP 与 Plugin 的边界
+
+Extension 是宿主内运行的代码，能监听生命周期并使用宿主 API。
+
+Skill 是渐进披露的指令和资源，通常先暴露 name/description，模型需要时再读取 `SKILL.md`；Skill 本身不是任意代码加载器。
+
+MCP 是外部 Client/Server 之间的 JSON-RPC 协议。MCP Tool 先由 Client 发现，再适配到 Agent Tool；它与 Extension 的宿主生命周期不同。
+
+Plugin 是更一般的可发现扩展单元。Java 的 `ServiceLoader` 通过 classpath 元数据发现实现，Go 通常显式 registry/factory；Pi Extension 则由 TypeScript module loader 和路径发现机制组合完成。
+
+Hook 是某个生命周期点上的拦截函数；Event 是通知/观察消息。一个 hook 可能可以修改或取消，普通 event 可能只读。
+
+> 译者注：不要用“支持插件”一句话覆盖这些差异。判断边界的办法是问：代码在哪里执行、谁发现它、谁拥有权限、它是否进入模型 context、它能否取消宿主动作、它的状态如何恢复。
+
+## 完整学习实验
+
+### 实验一：记录一次 Tool 生命周期
+
+目标是观察模型 Tool Call 到最终 Tool Result 的全部阶段。
+
+准备一个只返回 calculator Tool Call 的 Fake/ScriptedModel，并加载一个只读日志 Extension。
+
+在 `tool_execution_start`、`tool_call`、`tool_execution_update`、`tool_result` 和 `tool_execution_end` 中记录 call id、Tool name、source index 和时间。
+
+比较串行与并行模式下的事件顺序。确认最终发给模型的 Tool Result 仍按 assistant source order，而 update 可能交错。
+
+### 实验二：权限闸门
+
+在 `tool_call` 中只阻止危险命令，不要把所有 command 都交给 shell 字符串匹配。
+
+测试普通命令、包含危险子串的命令、用户取消 confirm、handler 异常和多个 sibling Tool Call。
+
+验证阻止结果是否带 `isError`、是否继续其他 Tool，以及 `terminate` 是否只有全 batch 都满足时才生效。
+
+### 实验三：Session replacement
+
+注册 command 调用 `newSession()`，在 `withSession` 中发送 kickoff user message。
+
+故意捕获旧 `ctx.sessionManager` 并在 callback 中使用，观察它为什么是 stale；然后改用 callback 参数并断言新 Session file。
+
+### 实验四：动态 Tool 与 Context
+
+注册三个 searchable Tool，只激活 loader。第一次 request 只应看到 loader；执行 loader 后，下一次 request 才出现匹配 Tool。
+
+在 Anthropic/OpenAI 支持 native deferred loading 的模型与普通 Provider 上分别观察 Tool definition 的位置和 system prompt prefix 是否变化。
+
+### 实验五：跨模式 UI
+
+同一个 Extension 在 TUI、RPC、JSON、print 下运行。记录 `ctx.mode`、`ctx.hasUI`、notify、select、custom 的结果。
+
+确认任何协议 stdout 不被调试日志污染，并为不可用 UI 提供文本或 no-op 降级。
+
+## Java、Go 与 Pi 对照
+
+| 能力 | Pi Extension | Java 常见实现 | Go 常见实现 |
+| --- | --- | --- | --- |
+| 发现 | module/path/jiti | `ServiceLoader`、ClassLoader | explicit registry/factory |
+| 事件 | `pi.on` callback | Listener/Interceptor | callback/channel |
+| 生命周期 | session/agent/tool events | application lifecycle | context + explicit hooks |
+| Tool | `registerTool` + schema | interface + JsonNode | interface + json.RawMessage |
+| 取消 | `AbortSignal` | Future/interruption | `context.Context` |
+| UI | `ctx.ui`/TUI Component | UI toolkit component | host callback/CLI |
+| 状态 | Session entry/details | store/event log | JSONL/store |
+
+Java 侧的 `ClassLoader` 能实现动态发现，但需要明确 classpath 和版本兼容；Go 不应为了模仿 Node 动态 import 而强行使用原生 `plugin`，显式注册通常更可移植。
+
+Pi 的 `AbortSignal` 是取消协作协议，不保证杀死任意异步 I/O。Java interruption 和 Go context 也一样要求底层操作配合检查。
+
+> 译者注：跨语言比较应该比较“责任”和“生命周期”，而不是比较类名。一个 Go callback 也可以承担 Java Listener 的职责，一个 Java interface 也可以承担 Pi Tool definition 的职责；真正不同的是运行时加载和资源管理机制。
+
+## 小结
+
+Extension 是 Pi 内的受信任代码扩展点：它通过路径或 package 被发现，由 factory 注册能力，在事件边界观察/修改宿主行为。
+
+Tool、command、Provider、UI、Session entry 和 renderer 都有自己的数据流和生命周期，不应混成“插件可以做任何事”。
+
+编写 Extension 时优先明确四件事：能力由谁执行、状态存在哪里、取消如何传播、错误如何 fail-open 或 fail-closed。
+
+最后用固定 commit 的源码确认行为：Extension API 类型在 `packages/coding-agent/src/core/extensions/types.ts`，加载逻辑在 `loader.ts`，事件和 Tool 调度连接在 `runner.ts` 与 `agent-session.ts`。官方文档给出使用契约，当前源码决定实际边界。
 
 ## 使用建议
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+1. 先运行最小 `my-extension.ts`，确认 factory、事件和命令都能加载。
+2. 再只注册一个 Tool，观察 definition、arguments validation、execute 和 result。
+3. 最后加入 UI、Session state、Provider 或远程 operations，每增加一种能力就为成功、取消、错误和 reload 写测试。
+4. 阅读下方完整英文原文时，把代码与上面的中文解释配对；原文代码和字段保持原样，便于复制到当前 Pi。
 
 ## 完整原文对照
 

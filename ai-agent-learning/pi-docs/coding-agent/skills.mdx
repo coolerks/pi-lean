@@ -46,6 +46,77 @@ Pi 对名称超长、非法字符、连字符问题或 description 超长给 war
 3. 分别测试 `--skill`、`--no-skills`、未信任项目、无 description、非法 name 和同名冲突。
 4. 在 fake workspace 中放置带脚本的 Skill，审阅脚本后才执行；验证凭据不会进入日志、Tool Result 或提交记录。
 
+### Discovery 与 progressive disclosure 的执行顺序
+
+Skill discovery 是启动阶段的目录扫描，不是把每个 `SKILL.md` 全文读入 Context。Pi 先收集可用 Skill 的 `name`、`description` 和路径，再以 XML 形式提供简短目录；模型判断任务匹配后，才通过 `read` 读取完整正文，随后按需要读取 `references/` 或 `assets/`。
+
+```text
+扫描目录
+  -> 解析 frontmatter
+  -> 保留 name/description/path
+  -> 写入 system prompt 的 Skill 列表
+  -> 模型决定需要某项能力
+  -> read SKILL.md
+  -> read scripts/references/assets
+  -> 按相对路径执行工作流
+```
+
+这样做不是为了隐藏能力，而是控制 Context 成本。若有 50 个 Skill、每个完整说明 2000 token，常驻全文约 100000 token；只保留平均 30 token 的 metadata，则约 1500 token，模型在需要时再付费加载相关正文。代价是模型可能不主动读取全文，因此任务明确要求时可使用 `/skill:name`。
+
+> 译者注：progressive disclosure 解决的是“什么时候把说明放进 Context”，不是安全隔离。Skill 仍可指示模型执行 shell、读取凭据或访问网络；真正的权限必须在 Tool/Runtime 层决定。Java/Go 实现都应把 discovery 和 content loading 做成两个可测试接口。
+
+### 各个位置的差异
+
+全局位置 `~/.pi/agent/skills/`、`~/.agents/skills/` 影响用户所有项目；项目 `.pi/skills/` 和 `.agents/skills/` 需要 project trust；package 和 settings 是显式资源来源；CLI `--skill <path>` 是 additive 的人工指定。`--no-skills` 关闭自动发现，但不能抵消显式 `--skill`，否则用户无法在临时运行中选择一个明确 Skill。
+
+根目录 Markdown 的规则有意不同：在 `~/.pi/agent/skills/` 和 `.pi/skills/` 中，带有效 Skill frontmatter 且有非空 `description` 的根 `.md` 可作为单文件 Skill；`.agents/skills/` 忽略根 `.md`，但会发现分组目录中的有效 `.md`。所有位置递归寻找目录内的 `SKILL.md`。普通 Markdown 若不符合 Skill 形状会静默忽略，避免把 README 当成可调用能力。
+
+### `SKILL.md` 的文件结构
+
+Skill 目录至少有 `SKILL.md`，其余文件由作者定义。常见布局是 `scripts/` 放辅助程序、`references/` 放按需文档、`assets/` 放模板或数据。正文内的相对路径以 Skill 目录为基准，不以当前项目 cwd 为基准；这使同一个 Skill 从不同仓库调用时仍能找到自己的资源。
+
+```text
+review-skill/
+├── SKILL.md
+├── scripts/check.sh
+├── references/style.md
+└── assets/template.json
+```
+
+一个可执行 Skill 应在正文中分开写 Setup、Usage、输入输出和失败处理；不要只写“运行脚本即可”。脚本需要说明依赖、超时、网络、文件输出和凭据来源。资源文件虽不是 prompt text，也可能包含 prompt injection 或恶意 payload，加载前仍需审阅。
+
+> 译者注：`SKILL.md` 是给模型阅读的说明，不等于宿主已经验证过的计划。把它类比成 Java classpath 上的一份操作手册更合适，而不是已注册的安全 Service。Go 的 `filepath.WalkDir` 或 Java 的 `Files.walk` 只能发现文件，不能替代后续 allowlist 和审批。
+
+### Frontmatter 校验与 name 规则
+
+必填字段是 `name` 和 `description`。`name` 长度 1–64，只允许小写字母、数字和连字符，不能首尾连字符或连续连字符；`description` 最多 1024 字符，应写“做什么以及什么时候使用”。可选字段包括 `license`、`compatibility`、`metadata`、`allowed-tools` 和 `disable-model-invocation`。
+
+Pi 对多数违规只发 warning 并继续，但缺少 description 的 declared Skill 不会加载，损坏的 frontmatter 也会被跳过。未知字段会被忽略。Pi 允许 name 与父目录名不同，这是它与标准的一处有意差异；共享 Skill 目录时这很方便，但会增加路径和名称排查成本。
+
+有效示例：`pdf-processing`、`data-analysis`、`code-review`；无效示例：`PDF-Processing`、`-pdf`、`pdf--processing`。description “Helps with PDFs” 太宽泛，应该写清提取文本、表格、表单和使用场景，帮助模型做出 discovery 决策。
+
+### 冲突、失败与安全检查
+
+同名 Skill 冲突时，Pi 发 warning 并保留发现顺序中第一个。多个目录都存在 `review` 时，不要只看名称，应记录来源路径、scope、发现顺序和实际 `SKILL.md`。验证失败不只看 frontmatter，还应检查：脚本是否可执行、相对路径是否越出 Skill 根目录、是否读取环境凭据、是否连接网络、输出是否包含秘密，以及正文是否试图绕过用户确认。
+
+Skill 可携带任意指令，甚至让模型执行 executable code，所以第三方 Skill 与第三方 Extension 一样需要源代码审查。区别是 Extension 直接运行宿主代码并注册事件/工具；Skill 通常通过文字指导模型使用已有 Tool。MCP 是跨进程协议，Skill 不是 MCP server，也不会因为写出 `tools/call` 就自动拥有远端连接。
+
+> 译者注：安全策略要放在最终 effect 前。即使 Skill 声称“只读”，模型仍可能把路径传给 `bash`；因此 Tool Registry、PermissionPolicy 和 sandbox 必须独立校验。Go/Java 示例中的 skill discovery 只能演示 metadata 和资源读取，不能当作生产隔离。
+
+### 可执行实验：观察一次 Skill 加载
+
+1. 在临时项目创建 `skills/review/SKILL.md`，只写合法 `name`、`description` 和一段正文。
+2. 让项目通过 trust，再启动 Pi，记录 system prompt 里出现的 metadata；确认完整正文尚未自动注入。
+3. 输入匹配任务，让模型或用户执行 `/skill:review`，使用 `read` 获取全文。
+4. 再读取一个 reference，检查路径相对于 Skill 目录解析。
+5. 使用坏 name、空 description、重复 name 和缺失文件重复测试，记录 warning 与是否加载。
+6. 加入一个脚本但先只审阅，不执行；测试脚本调用的 Tool 是否经过正常权限检查。
+7. 对照 `--no-skills` 和显式 `--skill ./path`，确认 additive 规则。
+
+实验报告应包含 discovery path、frontmatter 结果、system prompt 摘要、实际读取文件、token 变化、权限判断和失败日志。不要在实验 Skill 中放 API key、SSH 文件或会修改真实仓库的脚本。
+
+> 译者注：如果模型没有读取 Skill 全文，优先检查 description 是否足够具体、任务是否真正匹配，以及是否启用了 `enableSkillCommands`；不要立刻把全文硬编码进 system prompt。这样会破坏 progressive disclosure 的成本边界。
+
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

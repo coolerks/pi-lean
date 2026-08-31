@@ -1,14 +1,257 @@
 ---
 title: "Java 01：最小 LLM Client"
-description: "使用 Java 21 HttpClient 发出一次非流式模型请求。"
+description: "使用 Java 21 HttpClient 发出一次带 JSON、认证和错误处理的模型请求。"
 ---
 
 # Java 01：最小 LLM Client
 
-`HttpModel.complete` 使用 `HttpRequest`、`HttpResponse<String>` 和 Jackson：构造 JSON、设置认证 header、检查 2xx、解析 assistant message。它只负责 Provider 边界，不执行 Tool。
+## 本阶段目标与边界
 
-Java 的同步 `HttpClient.send` 适合先讲清协议；需要异步时可放入 `ExecutorService`/`CompletableFuture`，但 cancellation 仍要传给 Model 和 Tool。
+本阶段只做一件事：发送一次 OpenAI-compatible Chat Completions 请求，并把第一条 assistant message 解码回来。它还不是 Agent，因为没有 Tool、没有第二轮请求，也没有 Session。
 
-## 实验
+完成后你要能看着一次 HTTP 调用回答：请求发到哪里、body 是什么、header 怎样设置、2xx 以外为何失败、响应 JSON 缺什么会报错。
 
-用本地 fake server 返回成功、429、500、空 choices 和 malformed JSON；断言错误不会泄露 API key。Loop 测试使用 `ScriptedModel`，不调用收费服务。
+本阶段明确不做：SSE、Tool Calling、重试策略、并行、文件读写和真实 API 账号。先把 Provider 边界做成可以用 fake server 断言的普通 Java 代码。
+
+## 前置 Java 知识
+
+需要理解：
+
+- `record` 是带有不可变组件和访问器的值类型；本项目用它保存 `Message`、`Request`、`Response`。
+- `interface` 只声明能力；`HttpModel implements Model` 表示它能完成一次模型请求。
+- `HttpClient` 负责发送请求，`HttpRequest` 描述请求，`HttpResponse<T>` 携带状态码、header 和 body。
+- checked exception 可以沿调用栈抛出；本示例的 `Model.complete` 使用 `throws Exception`，让教学重点先放在边界。
+
+`ObjectMapper.writeValueAsString` 把 Java 对象或树写成 JSON；`readTree` 把 JSON 文本读成 Jackson `JsonNode`。它们不是模型推理，只是协议编码和解码。
+
+## 上一阶段输入与新增接口
+
+这是 Java 路线的第一步，没有上一阶段的运行时输入。我们先定义一个最小 Model contract：
+
+```java
+public interface Model {
+    Response complete(Request request, CancellationToken cancellation) throws Exception;
+}
+```
+
+`Request` 包含消息和 Tool definitions；虽然 Java 01 暂时传空 Tool 列表，但不要为每个阶段重写接口。`CancellationToken` 让后续阶段能在发请求前检查取消。
+
+当前文件：`examples/java-agent/src/main/java/learning/agent/Model.java`、`Request.java`、`Response.java`、`HttpModel.java`。
+
+## 问题：为什么不能只调用一个 URL
+
+一个真实调用至少有这条链：
+
+```text
+Request messages
+ -> ObjectMapper JSON
+ -> HttpRequest URI + headers + timeout
+ -> HttpClient.send
+ -> HttpResponse status/body
+ -> status check
+ -> JsonNode decode
+ -> Response(Message, stopReason, Usage)
+```
+
+失败 trace 例子：
+
+```text
+HTTP 200 + {"choices":[]}
+ -> JSON 能解析
+ -> 但没有 assistant message
+ -> 不能返回空答案
+ -> 抛出 "model response has no choices"
+```
+
+另一个失败：
+
+```text
+HTTP 429
+ -> body 可能是 provider 的错误 JSON
+ -> 先检查 status
+ -> 不把错误 body 当作正常 assistant
+```
+
+状态码和 JSON 结构是两层校验，少一层都会让错误看起来像成功。
+
+## `HttpModel.complete` 的真实代码
+
+```java
+@Override
+public Response complete(Request request, CancellationToken cancellation) throws Exception {
+    cancellation.throwIfCancelled();
+    String body = mapper.writeValueAsString(payload(request, false));
+    HttpRequest httpRequest = HttpRequest.newBuilder(endpoint)
+            .timeout(Duration.ofMinutes(2))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer " + apiKey)
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build();
+    HttpResponse<String> response = client.send(
+            httpRequest, HttpResponse.BodyHandlers.ofString());
+    if (response.statusCode() < 200 || response.statusCode() >= 300) {
+        throw new IllegalStateException(
+                "model request failed (" + response.statusCode() + "): "
+                        + response.body());
+    }
+    return decode(mapper.readTree(response.body()));
+}
+```
+
+逐段理解：
+
+1. `throwIfCancelled` 把已经取消的工作挡在网络调用之前。
+2. `payload(request, false)` 把内部 `Request` 转成 provider JSON，并显式关闭 stream。
+3. `HttpRequest.newBuilder(endpoint)` 使用构造函数传入的完整 URI，不猜 provider 的路径。
+4. `.timeout(Duration.ofMinutes(2))` 是单次请求的 deadline；它不是整个 Agent Run 的预算。
+5. `Authorization` header 由 adapter 设置，业务 Loop 不应该拼 Bearer token。
+6. `client.send` 是同步调用，返回 `HttpResponse<String>`；本示例没有把它伪装成异步。
+7. 非 2xx 先抛错，避免把 provider error 当 assistant text。
+8. `decode` 负责 choices、message、tool calls 和 usage 的结构检查。
+
+## payload：内部消息如何变成 JSON
+
+```java
+private ObjectNode payload(Request request, boolean stream) {
+    ObjectNode root = mapper.createObjectNode()
+            .put("model", modelId)
+            .put("stream", stream);
+    ArrayNode messages = root.putArray("messages");
+    for (Message message : request.messages()) {
+        ObjectNode item = messages.addObject();
+        item.put("role", message.role().name().toLowerCase());
+        item.put("content", message.content());
+    }
+    return root;
+}
+```
+
+输入是 provider-neutral `Request`；输出是 JSON object。`role` 的 Java enum 名称是 `USER`，而协议要求小写 `user`，所以代码显式转换。这个转换点是 Provider adapter 的责任；如果把 Java enum 直接传给所有 provider，字段大小写和消息形状会泄漏。
+
+当前完整 `payload` 还会编码 `toolCallId`、`toolName`、assistant `toolCalls` 和 Tool definitions。Java 01 先观察空列表，Java 03 再补上结构化 Tool。
+
+## decode：响应的三个结果层
+
+```java
+private Response decode(JsonNode root) throws Exception {
+    JsonNode choices = root.path("choices");
+    if (!choices.isArray() || choices.isEmpty()
+            || !choices.path(0).isObject()) {
+        throw new IllegalStateException("model response has no choices");
+    }
+    JsonNode choice = choices.path(0);
+    JsonNode encodedMessage = choice.path("message");
+    if (!encodedMessage.isObject()) {
+        throw new IllegalStateException(
+                "model response choice has no message");
+    }
+    Message message = Message.assistant(
+            encodedMessage.path("content").asText(""));
+    JsonNode usage = root.path("usage");
+    Usage tokenUsage = new Usage(
+            usage.path("prompt_tokens").asInt(),
+            usage.path("completion_tokens").asInt(),
+            usage.path("total_tokens").asInt(), 0);
+    return new Response(message,
+            choice.path("finish_reason").asText("stop"), tokenUsage);
+}
+```
+
+`Message` 是内容和工具调用的内部状态；`stopReason` 是 Loop 的控制信息；`Usage` 是计费/诊断数据。不要把三者拼成一段字符串。缺失 `usage` 时当前教学代码得到零值；生产 adapter 应区分 provider 没有提供 usage 和真实的零 token。
+
+## 认证和密钥边界
+
+`HttpModel` 的 `apiKey` 由构造函数接收，`Main` 从 `AGENT_API_KEY` 环境变量读取。示例不把 key 写入源码、JSON 日志或异常文本。HTTP 错误 body 可能含 provider 信息，生产日志还应做 secret redaction。
+
+请求 header 至少有 `Content-Type: application/json` 和 Bearer Authorization。流式请求下一阶段还会加 `Accept: text/event-stream`。header 是网络协议，不是 `Message` 的一部分。
+
+## JUnit 测试设计
+
+`HttpModelTest.sendsJsonAndConsumesCompleteAndSseResponses` 用 JDK `HttpServer` 监听 localhost 随机端口：
+
+1. 从 `exchange.getRequestBody()` 读取 body，断言存在 `model`、`messages` 和 `stream:false`。
+2. 记录 `Authorization`，断言是 `Bearer test-key`。
+3. 返回固定 JSON，断言 `Response.message().content()` 是 `hello back`。
+4. 不访问真实 Provider，不需要环境变量。
+
+还要为这些场景写测试：
+
+| 输入 | 预期 |
+| --- | --- |
+| 2xx + 正常 choices | 返回 assistant message |
+| 401/429/500 | 抛出 status error，不解析为成功 |
+| 200 + `choices:[]` | 抛出 no choices |
+| 200 + 非法 JSON | Jackson decode error |
+| cancellation 已设置 | `HttpClient.send` 前即取消 |
+| 慢 server 超过 timeout | 请求失败，不能无限等待 |
+
+测试“没有调用 Tool”也很重要：Java 01 根本没有 Tool Registry，证明本阶段只做 adapter。
+
+## Maven 运行与预期输出
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=HttpModelTest test
+mvn test
+```
+
+成功时 Surefire 没有错误输出并返回 exit code 0。不要把“没有打印文字”误解成没有运行；JUnit 默认只在失败时详细打印。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- Pi 的统一消息和 `AssistantMessage` 在 `packages/ai/src/types.ts`。
+- Provider dispatch 和 `streamSimple` 在 `packages/ai/src/models.ts`。
+- OpenAI Chat Completions 的请求/响应转换在 `packages/ai/src/api/openai-completions.ts`。
+- Anthropic 与 Google 有不同的消息和流格式，分别由各自 adapter 处理；不能让 Agent Loop 直接依赖 OpenAI JSON。
+
+Java 示例只做一个 compatible adapter；Pi 的 provider catalog、认证、retry 和 thinking 字段更多。
+
+## Go 对照
+
+| Java 21 | Go | 责任 |
+| --- | --- | --- |
+| `HttpClient` | `http.Client` | 发送请求 |
+| `HttpRequest` | `http.NewRequestWithContext` | 请求描述 |
+| `HttpResponse<String>` | `http.Response` | status/body |
+| `ObjectMapper` | `encoding/json` | JSON 编解码 |
+| checked exception | `error` | 失败传播 |
+| `CancellationToken` | `context.Context` | 取消意图 |
+
+Go 把 context 放入请求函数参数；Java 示例把 token 放入 Model 方法，再由 HttpClient timeout 约束网络层。
+
+## 动手实验
+
+### 目标
+
+让 fake server 根据请求内容返回不同结果，并观察 status、body 和 decoded `Response` 的边界。
+
+### 准备
+
+阅读 `HttpModelTest`，准备 JDK 21。不要设置真实 API key，也不要把请求发送到生产 endpoint。
+
+### 步骤
+
+1. 在 fake server 中打印请求 body，但把 Authorization 替换为 `[redacted]`。
+2. 让响应从 200 改为 429，观察异常类型和 message。
+3. 返回 `choices:[]`，确认 HTTP 成功不等于模型响应合法。
+4. 返回坏 JSON，确认 decode 阶段失败。
+5. 将 `CancellationToken.cancel()` 放在调用前，确认 server 没有收到请求。
+6. 把 `modelId` 改成另一个值，确认它进入 JSON 而不改变 Loop。
+
+### 观察点
+
+模型 adapter 的输出应该是 `Response`，而不是把 HTTP response 原样泄漏给 AgentLoop。错误应该保留 status/解析阶段信息，同时不包含 API key。
+
+### 预期结果
+
+你能画出 `Request → JSON → HttpRequest → HttpResponse → Response` 的转换链，并指出每一步可能失败的位置。
+
+### 思考题
+
+如果 HTTP 返回 200 但 `finish_reason` 是 `length`，Java 01 应该把它当成功还是需要由 Loop 决定是否继续？如果 provider 的认证 header 不是 Bearer，应该改 Model interface 还是只改 adapter？为什么不能让 Tool 直接读取环境变量中的 key？
+
+## 小结与下一阶段
+
+Java 01 建立的是协议边界，不是智能循环。`HttpModel` 负责 HTTP、认证、状态码和 JSON；`Model` 只向上暴露 provider-neutral `Response`。下一阶段把同一条 HTTP 边界改成 SSE，并解释“收到一行”不等于“收到一个完整语义结果”。

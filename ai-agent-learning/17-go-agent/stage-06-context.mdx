@@ -1,12 +1,301 @@
 ---
-title: "Go 06：Context 与 Message"
-description: "明确内部消息、工具定义和 Provider payload 的边界。"
+title: "Go 06：Context、Message 与 Request"
+description: "把对话历史、Tool Call、工具定义和取消信号拆成可测试的边界。"
 ---
 
-# Go 06：Context 与 Message
+# Go 06：Context、Message 与 Request
 
-`Message` 是内部 transcript；`Request` 把 messages 和可用 Tool Definitions 交给 Model；`ToolResult` 再成为下一轮上下文。不要把 system prompt、工具 schema 和历史消息混成一个字符串。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-打印每次 request 的 message roles、tool call id 和定义数量，加入 system message，再断言 Tool Result 与对应 call id 配对。用 `context.Context` 同时传取消和 deadline。
+- 说明 `Message`、`Request`、`Response`、`ToolCall` 和 `ToolResult` 的关系。
+- 解释为什么内部消息不能直接等同于某个 Provider 的 JSON。
+- 把 system、user、assistant、tool 四种消息放进同一条可追踪历史。
+- 让 `context.Context` 从 Agent Loop 传到模型和工具。
+- 用测试证明 Tool Result 与原来的 `ToolCallID` 配对。
+
+## 本阶段的输入、增加的能力与明确不做什么
+
+输入是上一阶段已经能够发送 HTTP/SSE 请求的 `Model` 和 Tool Registry。本阶段新增一个 Provider-neutral（不绑定厂商）的领域模型：`Message` 表示内部 transcript，`Request` 表示一次模型输入，`Response` 表示一次模型输出。
+
+本阶段不实现新的 Provider，不实现真正的 tokenizer，也不把 `context.Context` 当成“强杀线程”。Context 只提供取消和截止时间信号；模型、HTTP 请求、Tool 和 shell 必须主动观察它。
+
+## 前置 Go 知识
+
+你需要知道：
+
+1. `struct` 用字段表示数据；
+2. `json` tag 控制序列化字段；
+3. interface 只描述调用契约；
+4. `context.Context` 通过参数向下传递；
+5. `json.RawMessage` 可以暂时保留尚未解析的 JSON。
+
+`json.RawMessage` 适合 Tool arguments，因为 Runtime 要先保留模型原文，再由具体 Tool 解析。不要先把所有参数转成 `map[string]any`，否则类型错误和原始 JSON 的边界会变模糊。
+
+## 问题场景：把一切都塞进字符串
+
+一个初学实现可能这样做：
+
+```text
+system prompt + 用户问题 + 工具说明 + 工具输出
+```
+
+它看起来简单，但发生三个问题：
+
+- Provider 不能区分 assistant tool call 和普通文字；
+- Tool Result 无法带回 `tool_call_id`；
+- 取消、Usage、stop reason 没有明确归属。
+
+失败 trace：
+
+```text
+模型返回 call-7/read/{"path":"a.go"}
+-> Runtime 把它拼成字符串
+-> read 返回文件内容
+-> 下一轮模型看不到 call-7
+-> Provider 拒绝 tool result，或者模型重复调用 read
+```
+
+解决办法不是增加分隔符，而是让领域对象携带身份和角色。
+
+## 逐步实现方案
+
+### 第一步：先定义角色
+
+`model.go` 中的 `Role` 是一个字符串类型，并定义了 `RoleSystem`、`RoleUser`、`RoleAssistant`、`RoleTool`。角色是最小状态信息：它告诉投影器如何把消息转换到 Provider payload。
+
+```go
+type Role string
+
+const (
+    RoleSystem Role = "system"
+    RoleUser Role = "user"
+    RoleAssistant Role = "assistant"
+    RoleTool Role = "tool"
+)
+```
+
+这段代码的输入是无；输出是四个稳定的领域值；状态变化是没有副作用；失败点是调用方自己构造了未知角色。当前示例没有在 `Message` 构造时拒绝未知字符串，因此生产版本应增加显式校验。
+
+### 第二步：定义 Tool Call 和 Message
+
+```go
+type ToolCall struct {
+    ID        string          `json:"id"`
+    Name      string          `json:"name"`
+    Arguments json.RawMessage `json:"arguments"`
+}
+
+type Message struct {
+    Role       Role       `json:"role"`
+    Content    string     `json:"content,omitempty"`
+    ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+    ToolCallID string     `json:"tool_call_id,omitempty"`
+    ToolName   string     `json:"name,omitempty"`
+    IsError    bool       `json:"is_error,omitempty"`
+    Timestamp  time.Time  `json:"timestamp,omitempty"`
+}
+```
+
+输入是模型输出或 Runtime 产生的字段；输出是可以保存和再次投影的消息；状态变化是追加 transcript；失败点包括空 role、错误 JSON 和没有配对的 Tool Result。
+
+注意注释中的关键事实：`ToolCall` 是模型输出，不是执行证据。只有 `Tool.Execute` 返回后，Runtime 才能创建 `RoleTool` 消息。
+
+### 第三步：定义 Request、Response 和 Model
+
+```go
+type Response struct {
+    Message    Message  `json:"message"`
+    StopReason string   `json:"stop_reason"`
+    Usage      Usage    `json:"usage"`
+}
+
+type Request struct {
+    Messages []Message        `json:"messages"`
+    Tools    []ToolDefinition `json:"tools,omitempty"`
+}
+
+type Model interface {
+    Complete(context.Context, Request) (Response, error)
+}
+```
+
+`Request` 把历史和工具定义放在一起，但没有强迫 Agent Loop 依赖 OpenAI 或 Anthropic 的请求类型。输入是内部 history 和当前 registry；输出是模型可理解的请求；失败点是 Provider adapter 无法编码或模型返回错误。
+
+`Usage` 单独存在，不放入 `Message.Content`。这样 UI 可以显示文本，Telemetry 可以统计 token，Session 可以决定是否保存 metadata，而不会解析自然语言。
+
+### 第四步：在 loop 中追加，而不是覆盖
+
+`AgentLoop.Run` 开始时复制初始 history：
+
+```go
+history := append([]Message(nil), initial...)
+```
+
+每个 step 构造：
+
+```go
+Request{Messages: history, Tools: l.Tools.Definitions()}
+```
+
+模型返回 assistant 后，先追加 assistant message；有 Tool Call 时，`executeBatch` 返回结果，然后为每个 call 创建 `RoleTool`：
+
+```go
+toolMessage := Message{
+    Role:       RoleTool,
+    Content:    result.Content,
+    ToolCallID: message.ToolCalls[index].ID,
+    ToolName:   message.ToolCalls[index].Name,
+    IsError:    result.IsError,
+    Timestamp:  time.Now(),
+}
+history = append(history, toolMessage)
+```
+
+输入是 assistant message、按相同 index 返回的结果和旧 history；输出是增加了 tool messages 的 history；状态变化是下一轮模型能看到结果；失败点是结果顺序或 index 配错。
+
+### 第五步：让 context 穿过整个调用链
+
+模型边界：
+
+```go
+func (m *HTTPModel) Complete(ctx context.Context, request Request) (Response, error)
+```
+
+HTTP 请求使用：
+
+```go
+http.NewRequestWithContext(ctx, http.MethodPost, m.URL, bytes.NewReader(body))
+```
+
+Tool 边界：
+
+```go
+type Tool interface {
+    Definition() ToolDefinition
+    Execute(context.Context, json.RawMessage) (ToolResult, error)
+}
+```
+
+shell Tool 再把这个 context 交给 `exec.CommandContext`。同一个取消信号因此可以从 `Agent.Abort` 到 Agent Loop、HTTP、Tool 和子进程。
+
+它不是隐式全局变量。调用方必须显式传入 `ctx`，测试可以使用 `context.WithTimeout`，也可以在固定时机调用 cancel。
+
+## Provider-neutral 不等于没有转换
+
+内部 `Message` 的目标是稳定边界，不是保证每个 Provider 都接受同一 JSON。例如 OpenAI-compatible payload 需要：
+
+```json
+{
+  "role": "assistant",
+  "tool_calls": [
+    {"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.go\"}"}}
+  ]
+}
+```
+
+当前 `HTTPModel.payload` 负责把 `ToolCall.Arguments` 转成字符串；内部仍保持 `json.RawMessage`。Anthropic 或其他 Provider 可能使用 content blocks，转换应留在 adapter，不应污染 Loop。
+
+## 运行命令
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestToolCallIsExecutedAndReturnedToModel|TestInvalidArgumentsDoNotInvokeTool'
+go vet ./...
+```
+
+预期结果包含测试通过和 `go vet` 无输出。完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+预期输出包含：
+
+```text
+tool[calculator]> 5
+assistant> 2 + 3 = 5
+final> 2 + 3 = 5
+```
+
+命令的输入是本地源码和离线 `ScriptedModel`；输出是测试和演示日志；状态变化会生成 `.agent-session.jsonl`，它不是源码的一部分，验证后可以删除。
+
+## 测试设计
+
+`TestToolCallIsExecutedAndReturnedToModel` 的 ScriptedModel 有两轮：第一轮返回 calculator Tool Call，第二轮返回 `5`。测试检查：
+
+1. 请求次数是 2；
+2. 第二个 request 最后一条是 `RoleTool`；
+3. tool result 内容是 `5`；
+4. final message 是 `5`。
+
+`TestInvalidArgumentsDoNotInvokeTool` 给必填 `value` 缺失的 JSON。Registry 返回错误 Tool Result，`countingTool.calls` 仍是 0。这证明 schema gate 在副作用之前。
+
+追加一个练习测试：让第一轮 assistant 返回两个 call，故意让工具完成顺序不同，检查 `result.Messages` 仍按 source index 写回。这个断言不是实现细节，而是保证 Provider 收到可配对历史的必要条件。
+
+## 与 Pi 的对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- Pi `packages/ai/src/types.ts` 的 `Context`、`AssistantMessage`、`ToolCall`、`Usage` 承担统一消息契约。
+- Pi `packages/ai/src/models.ts` 将 Provider/Model 解析与 stream dispatch 放在 AI 层。
+- Pi `packages/agent/src/agent-loop.ts` 将 assistant response、tool result 和下一轮请求连接起来。
+- Go `model.go` 的 `Model` interface 对应 Pi 的模型边界，但只实现教学级 OpenAI-compatible shape。
+
+源码事实是“各层有类型和转换”；教学解释是“把 Provider 的差异锁在边界后，Loop 才能测试”。不要把两者混成 Pi 官方声明。
+
+## Java 对照
+
+Java 示例用 `Message`、`Request`、`Response` record 以及 `JsonNode` 保存结构；Go 用 `json.RawMessage` 延迟解析。两者都通过 Model interface 注入 Fake Model。
+
+Go 的：
+
+```go
+Complete(context.Context, Request) (Response, error)
+```
+
+可类比 Java 的：
+
+```java
+Response complete(Request request, CancellationToken cancellation) throws Exception;
+```
+
+Java `CancellationToken` 不是 `Thread.stop`，Go `context.Context` 也不是强制终止 goroutine。真正停止依赖 HTTP、Tool 和循环代码协作。
+
+## 实验：观察一次请求的 context
+
+### 目标
+
+证明同一个 context 能取消模型等待，并且 Tool Result 会带回 call id。
+
+### 准备
+
+打开 `model.go`、`loop.go`、`agent_test.go`，只使用 ScriptedModel，不需要 API key。
+
+### 步骤
+
+1. 在测试里给第一轮 response 加一个 Tool Call。
+2. 在 `ScriptedModel.Requests` 中打印每轮 message role。
+3. 打印第二轮最后一条的 `ToolCallID`。
+4. 给模型设置 `Delay`，用 `context.WithTimeout` 包围 `loop.Run`。
+5. 断言返回 `context deadline exceeded` 或等价取消错误。
+6. 删除打印，保留结构化断言。
+
+### 观察点
+
+模型只消费 Request；Tool Result 由 Loop 追加；取消错误从 Model 回到 Loop；没有任何地方需要全局变量。
+
+### 预期结果
+
+你能画出：`ctx -> AgentLoop -> Model/Tool -> HTTP/exec`，并指出 message history 在每一步如何增长。
+
+### 思考题
+
+如果把 Tool Call 的 arguments 提前执行，再把结果补到 history，会在哪个边界失去权限检查？如果 Provider 需要不同的 tool block，应该改 `Message` 还是改 adapter？
+
+## 小结与下一阶段
+
+本阶段建立了 Go 示例最重要的领域边界：Message 是事实历史，Request 是一次模型输入，ToolDefinition 是能力描述，ToolCall 是候选动作，ToolResult 是执行结果，Context 是显式控制信号。
+
+下一阶段进入 `RetryPolicy` 和 `Agent.Abort`。你会看到同一个 context 不只是传给模型，还要贯穿退避等待、HTTP 和工具执行。

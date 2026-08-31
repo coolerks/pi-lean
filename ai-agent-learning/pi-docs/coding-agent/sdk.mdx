@@ -9,113 +9,1457 @@ description: "以 SDK 创建 AgentSession、配置资源、运行模式和导出
 
 ## 中文导读
 
-以 SDK 创建 `AgentSession`、配置资源、运行模式和导出。本页先给出完整的中文操作说明，再保留源文件的完整内容供逐段核对。API 名称、命令、路径、配置字段和 TypeScript 标识符保持原样；实现行为以研究 commit 的源码和测试为准。
+本页是 `packages/coding-agent/docs/sdk.md` 的逐节中文参考译本。SDK 不是另一个 Agent Loop，而是把 Pi 的核心 Agent、资源发现、Session、运行模式和扩展边界组合成可被程序调用的 API。
+
+阅读时要先区分三层：`@earendil-works/pi-ai` 负责 Provider、Model 和消息协议；`@earendil-works/pi-agent-core` 负责一次 Agent Loop 的状态转移；`@earendil-works/pi-coding-agent` 的 SDK 负责资源、Session、设置、运行模式和 Coding Agent 体验。
+
+本文保留所有 TypeScript 标识符、配置字段、命令和路径。代码后面的中文说明解释数据如何流动、Promise 何时 resolve、callback 何时执行，以及失败如何传播。
 
 ## 中文译文
 
-### SDK 的用途、安装与快速开始
+### SDK 能解决什么问题
 
-SDK 是在程序中调用 Pi Agent 能力的入口。它适合嵌入 Web、桌面或移动 UI，接入已有后端工作流，构建自动化 pipeline，注册自定义 Tool，或者在测试中用代码观察 Agent 行为。它不是一个新的模型 Provider：SDK 负责把 `AgentSession`、资源加载、事件和运行模式组合成应用可调用的接口。
+SDK 给 Node.js 程序提供了访问 Pi Agent 能力的入口。
 
-安装主 package 即可：
+它可以把 Pi 嵌入 Web、桌面或移动应用的后端。
+
+它可以让自动化流水线用代码提交 prompt，而不是模拟键盘输入。
+
+它可以让测试用 fake model 检查 Agent 是否正确调用了工具。
+
+它可以让应用注册自己的 Tool、Extension、Skill 和上下文文件。
+
+它也可以让应用选择 TUI、print 或 RPC 运行方式。
+
+SDK 不会把模型变成一个可信的执行者。
+
+模型仍然只产生消息和结构化 Tool Call。
+
+真正调用文件系统和 shell 的是 runtime 中的 Tool Executor。
+
+SDK 负责把这些边界装配起来，并把事件、状态和错误交给应用。
+
+> 译者注：Java 开发者可以把 SDK 看成一组 facade、factory 和 service object，而不是一个继承层次。
+> `createAgentSession()` 类似应用服务工厂，`AgentSession` 类似有状态的 service，事件 listener 类似 Java Listener。
+> Go 中通常用构造函数返回 struct，再用 interface 和 callback 注入 Model、Tool 和事件接收器。
+
+### Quick Start：最小可运行流程
+
+最小流程有四步。
+
+第一步，创建 `ModelRuntime`。
+
+第二步，用 `createAgentSession()` 创建 `AgentSession`。
+
+第三步，用 `session.subscribe()` 订阅流式事件。
+
+第四步，等待 `session.prompt()` 完成。
+
+典型代码如下：
+
+```typescript
+import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+
+const modelRuntime = await ModelRuntime.create();
+const { session } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(),
+  modelRuntime,
+});
+
+const unsubscribe = session.subscribe((event) => {
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta);
+  }
+});
+
+await session.prompt("What files are in the current directory?");
+unsubscribe();
+session.dispose();
+```
+
+`await ModelRuntime.create()` 会返回一个 Promise。
+
+Promise 表示一个以后完成或失败的异步操作，不表示已经拿到模型回答。
+
+`createAgentSession()` 还要加载资源、解析设置和连接 Model，因此也必须等待。
+
+`subscribe()` 是同步注册，返回一个取消订阅函数。
+
+回调在事件到达时被调用，不能假设它只执行一次。
+
+`prompt()` 的 Promise 在整个 accepted run 结束后才 resolve。
+
+如果模型发生 retry，调用者仍要等 retry 完成。
+
+如果 accepted run 失败，Promise 和事件的具体语义要以当前 `AgentSession` 实现为准。
+
+> 译者注：不要把 `message_update` 当成最终消息。
+> 它可能只是一个 text delta，也可能是 thinking 或 Tool Call 的增量。
+> 最终状态要看 `message_end`、`agent_end` 和 session messages。
+
+### Installation：安装边界
+
+SDK 包含在主 package 中。
+
+安装命令是：
 
 ```bash
 npm install @earendil-works/pi-coding-agent
 ```
 
-最小流程是创建 `ModelRuntime`，用 `createAgentSession` 创建 session，订阅 `message_update` 中的 `text_delta`，然后调用 `session.prompt`。`SessionManager.inMemory()` 适合测试和临时 UI；需要跨进程继续时，应选择持久化 SessionManager。订阅回调只负责显示事件，`prompt()` 的 Promise 仍要等待整个 accepted run（包括重试）结束。
+不需要再安装一个名为 pi-sdk 的独立 package。
 
-### `createAgentSession()` 与 `AgentSession`
+应用的直接依赖通常是 `@earendil-works/pi-coding-agent`。
 
-`createAgentSession()` 是单个 `AgentSession` 的工厂。它会使用 `ResourceLoader` 提供 extensions、skills、prompt templates、themes 和 context files；不传 loader 时使用 `DefaultResourceLoader` 做标准发现。可在 options 中指定 `model`、`tools`、`customTools`、`sessionManager`、`settingsManager`、`cwd` 和 `modelRuntime`。
+它会间接使用 `@earendil-works/pi-agent-core` 和 `@earendil-works/pi-ai`。
 
-`AgentSession` 是一次 Coding Agent 生命周期的编排对象。它维护 Agent 消息、当前 model 和 thinking level，处理 compaction、Session 写入、事件流以及运行中的队列。常用方法和状态如下：
+应用不应从内部构建目录导入私有模块。
 
-- `prompt(text, options?)` 发送输入并等待接受的运行完成；`images` 可传入图像内容。
-- `steer(text)` 在当前工作仍进行时排队纠偏；`followUp(text)` 在当前 Agent 原本要结束时追加请求。
-- `subscribe(listener)` 返回取消订阅函数；不要把旧 session 的订阅误认为会自动跟随新 session。
-- `setModel`、`setThinkingLevel`、`cycleModel` 和 `cycleThinkingLevel` 改变运行配置。
-- `agent.state`、`messages`、`isStreaming` 提供当前状态；`navigateTree` 在当前文件中移动 branch，`compact` 触发压缩，`abort` 取消当前 operation，`dispose` 释放资源。
+这样可以让 SDK 维持公开类型和内部实现的边界。
 
-`AgentSession` 不负责替换活动 session。`newSession`、`switchSession`、`fork` 和 import 属于 `AgentSessionRuntime`；这是“当前 Agent”与“承载当前 Agent 的运行时”的边界。
+Node.js 项目需要正确配置 ESM 和 TypeScript 转译。
 
-### `createAgentSessionRuntime()` 与 `AgentSessionRuntime`
+官方示例使用 `.ts` 文件和 package export。
 
-当应用需要执行 `/new`、`/resume`、`/fork`、`/clone` 或从 JSONL 导入时，使用 runtime API。`createAgentSessionRuntime()` 接受一个 runtime factory 和初始 `cwd`/session target。factory 根据有效 cwd 创建 cwd 绑定的 services，再解析 session options，返回 session、services 和 diagnostics。
+运行时要确认 Node.js 版本、包版本和 provider 配置一致。
 
-runtime 会替换 `runtime.session`。原 session 上的订阅不会迁移，所以替换后要取消旧 listener、读取新 session 并重新订阅；如果使用 extensions，还要对新 session 再次执行 `bindExtensions`。创建或替换失败会抛异常，由调用者决定显示、重试或退出。`runtime.diagnostics` 用来查看资源和模型发现时的诊断，而不是把 warning 当作 Agent message。
+> 译者注：安装成功不代表可以发起模型请求。
+> 还要有可解析的 model、认证凭据和正确的 Provider adapter。
+> 测试阶段优先使用 in-memory SessionManager 和 fake model，避免把网络、费用和文件系统问题混在一起。
 
-### Prompt、队列与 `AgentState`
+### Core Concepts：SDK 的核心对象
 
-`PromptOptions` 控制模板展开、图像、流式期间的消息投递方式以及 preflight 回调。`preflightResult(true)` 表示 prompt 已被接受、排队或立即处理；`false` 表示在 acceptance 之前被拒绝。它只回调一次，不能用来判断 accepted run 最终成功与否；accepted run 的失败应从事件和消息中观察。
+SDK 的核心对象不是一个“大而全”的 Agent 类。
 
-流式运行期间必须明确 `streamingBehavior`，可取 `steer` 或 `followUp`；省略会抛错。Extension command 会立即执行，并由 extension 自己通过 `pi.sendMessage()` 管理模型交互；file-based prompt template 会在发送或排队前展开；extension command 不能排进 `steer()`/`followUp()`。因此“当前输入”“纠偏”“完成后追加”是三个不同的队列语义，不是同一个字符串列表。
+`ModelRuntime` 管理模型目录、认证和 Provider 解析。
 
-底层 `Agent`（来自 `@earendil-works/pi-agent-core`）通过 `session.agent` 暴露。`AgentState` 至少包含 `messages`、`model`、`thinkingLevel`、`systemPrompt`、`tools`、部分生成中的 `streamingMessage` 和最新错误。替换 state.messages 或 state.tools 会复制顶层数组，但调用者仍要保证消息结构合法；`waitForIdle()` 等待核心 Agent 结束。`Agent` 负责 Loop 和队列，SDK session 负责把它接到资源、持久化和 UI。
+`ResourceLoader` 发现 extensions、skills、prompts、themes 和 context files。
 
-### Events：从流式 delta 到生命周期
+`SessionManager` 负责内存或持久化 Session 的读写。
 
-`session.subscribe` 收到的是运行事件，而非只有最终文本。`message_update` 的 `assistantMessageEvent.type` 可以是 `text_delta` 或 `thinking_delta`；`tool_execution_start/update/end` 描述 Tool 的开始、增量输出和结束；`message_start/end` 包住消息生命周期；`agent_start/end` 包住一次 Agent 运行；`turn_start/end` 表示一次 assistant response 加其 Tool batch。
+`AgentSession` 编排一次当前 session 的 Agent 生命周期。
 
-`queue_update` 观察 steering/follow-up 队列，`compaction_start/end` 观察压缩，`auto_retry_start/end` 观察 Provider retry，`summarization_retry_*` 观察摘要重试。事件 handler 应该短小、可容错并脱敏；不要在 `message_update` 中假定已经有完整 assistant message，也不要把 `tool_execution_end` 当作 Session 已经成功提交的唯一证明。
+`AgentSessionRuntime` 负责替换当前 active session。
 
-### Options：目录、模型、认证和系统提示
+`Agent` 保存底层 Loop 的状态和消息。
 
-`cwd` 是 `DefaultResourceLoader` 的项目发现根，影响 project extensions、`.pi/skills/`、`.agents/skills/`、`.pi/prompts/`、向上查找的 `AGENTS.md`/`CLAUDE.md`、Session 命名和工具路径。`agentDir` 是全局配置根，包含 global extensions/skills/prompts、settings、models、credentials 和 sessions。传入自定义 `ResourceLoader` 后，二者不再决定资源发现，但仍会影响 session 命名和 Tool 路径解析。
+`SettingsManager` 处理全局和项目设置。
 
-`ModelRuntime` 负责模型目录、认证和 Provider 选择。`getModel`/`runtime.getModel` 只查找模型定义，不保证已有 API key；`getAvailable` 才筛出已有有效认证的模型。`thinkingLevel` 和 `scopedModels` 控制当前模型及 cycling。未显式传 model 时，SDK 依次尝试从继续中的 Session 恢复、使用 settings 默认值、再选择第一个可用模型。
+`InteractiveMode`、`runPrintMode` 和 `runRpcMode` 是不同的外层交互模式。
 
-认证解析优先级是 runtime override（`setRuntimeApiKey`，不写盘）、`auth.json` 中的 API key/OAuth、环境变量，再到 custom provider resolver。`authPath`、`modelsPath` 和自定义 `CredentialStore` 适合测试或多租户应用；不要把 key 放入 prompt、源码或 project 文件。模型目录 refresh 可带 `signal`、`allowNetwork`、`force` 和 timeout；网络刷新失败不应撤销已经成功的 credential mutation。
+这些对象之间不是同义词。
 
-`ResourceLoader` 的 `systemPromptOverride` 可以替换系统提示。系统提示、Session messages、Tool definitions 和 model options 是不同输入：不要把工具 schema 或历史消息拼成一段 user text。若要调试，应分别打印最终 system prompt、投影后的 messages、active tools 和 request options，并脱敏。
+例如，换模型不等于换 session。
 
-### Options：Tools 与 Custom Tools
+新建 session 也不等于清空某个普通数组。
 
-`tools` 是 active tool allowlist；内建名称包括 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find`、`ls`，默认是 `read`、`bash`、`edit`、`write`。`noTools: "all"` 关闭全部；`noTools: "builtin"` 只关闭默认内建工具而保留 extension/custom tools；`excludeTools` 在 allowlist 后继续排除指定名称。自定义 `cwd` 时，选中的内建工具也按该 cwd 创建。
+`fork()` 会改变 Session tree 和 active leaf。
 
-`defineTool()` 用 TypeBox schema 和 `execute` 定义一个 `customTool`。definition 只告诉模型 name、description 和 parameters；真正的 `execute` 在 Runtime 中运行，并应自己处理权限、超时、取消、输出上限和敏感数据。`customTools` 会与 Extension 注册的工具合并；如果同时传 `tools`，还必须把自定义工具名加入 allowlist。`edit` 的 `details.diff` 面向 TUI，`details.patch` 是 SDK 消费者可处理的 unified patch。
+`compact()` 会改变上下文投影，但不是删除所有历史。
 
-### Options：Extensions、Skills、Context files 与 Slash Commands
+可以把一次调用抽象为：
 
-`DefaultResourceLoader` 从 global/project 目录和 `settings.json` 发现 Extensions，也可以接收 `additionalExtensionPaths` 与 `extensionFactories`。Extension 能注册 Tool、Command、事件 handler、共享 event bus 和 UI 行为；inline factory 可以通过 `InlineExtension.name` 获得稳定显示名。Extension 的错误、权限和生命周期属于宿主边界，不因为它运行在同一进程就自动安全。
+```text
+Application
+  -> AgentSessionRuntime
+  -> AgentSession
+  -> Agent
+  -> pi-agent-core loop
+  -> pi-ai Model
+  -> Provider API
+```
 
-Skill 是包含 `name`、`description`、`filePath`、`baseDir` 和 `source` 的资源描述。`skillsOverride` 可增加或过滤 Skill；通常只把 metadata 放入 system prompt，模型需要时再通过 read/资源操作读取 `SKILL.md`。这就是 progressive disclosure：Skill 与 Extension 的代码生命周期不同，不能把 Skill 文本当成可信可执行代码。
+返回路径则是：
 
-`agentsFilesOverride` 可加入虚拟 `AGENTS.md`，影响 system prompt 的 project instructions。`promptsOverride` 可加入 `PromptTemplate`，使 `/deploy` 之类 slash command 展开成 prompt；模板只是输入资源，不应静默覆盖用户原始请求。修改后调用 `loader.reload()`，并在创建 session 前确认 diagnostics。
+```text
+Provider stream
+  -> Agent event
+  -> AgentSession event
+  -> application callback
+```
 
-### Options：Session 与 Settings
+> 译者注：Spring 应用里，这些角色可能分散在 bean、service、repository 和 event publisher 中。
+> Pi SDK 把它们显式暴露出来，学习重点是识别责任，而不是记住每个 factory 的参数。
 
-`SessionManager.inMemory()` 不写文件，适合单元测试；`create(cwd)` 创建持久化 Session；`continueRecent` 恢复最近 session；`open(path)` 打开指定 JSONL；`list`/`listAll` 列出项目或全局 sessions。Session 以 `id`/`parentId` 连接树，`branch`/`navigateTree` 改变当前 leaf，保留共享前缀而不复制全部历史。`newSession`、`switchSession`、`fork`、`importFromJsonl` 通过 runtime 替换活动 session。
+### `createAgentSession()`：创建一个当前 Session
 
-`SettingsManager.create` 合并 global `~/.pi/agent/settings.json` 和 project `.pi/settings.json`；项目设置覆盖全局，嵌套对象按 key 合并。`inMemory` 不读写文件，适合测试；setter 更新内存后异步排队写入，必须在进程退出或测试断言前 `await flush()`。设置 I/O 错误从 `drainErrors()` 取出，不能假设 setter resolve 就表示磁盘已完成。
+`createAgentSession()` 是创建单个 `AgentSession` 的主要 factory。
 
-### `ResourceLoader` 与返回值
+它可以接收 `model`、`modelRuntime`、`tools`、`customTools`、`sessionManager` 和 `resourceLoader`。
 
-调用 `loader.reload()` 后，可以分别读取 `getExtensions()`、`getSkills()`、`getPrompts()`、`getThemes()` 和 `getAgentsFiles().agentsFiles`。这些结果是资源发现/诊断，不是自动赋予每个资源执行权限。
+不传 `resourceLoader` 时，SDK 使用 `DefaultResourceLoader`。
 
-`createAgentSession()` 返回 `session`、`extensionsResult` 和可选的 `modelFallbackMessage`。`extensionsResult` 包含成功加载的 extensions、带 path/error 的失败数组和 `ExtensionRuntime`。模型从旧 Session 恢复失败时，fallback message 是诊断提示；不能把它当作模型已执行的回答。应用应展示可操作的 error，同时让测试断言失败 extension 是否影响 fail-fast 策略。
+不传 `sessionManager` 时，调用者应确认默认行为是否适合当前场景。
 
-### 完整示例的阅读方法
+最小调用可以是：
 
-官方完整示例依次创建自定义 `ModelRuntime`、从环境变量读取 runtime API key、定义 `statusTool`、选择 model、配置 in-memory settings、定制 `systemPromptOverride`、限制 active tools、创建 in-memory session、订阅事件并调用 `session.prompt`。这里的关键不是复制某个模型 id，而是观察装配顺序：Provider/auth → resources → Tool registry → Session → event consumer → prompt。
+```typescript
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
 
-示例中 `statusTool` 返回结构化 text content 和 details；它仍需通过 schema、权限和 output policy。将 `SessionManager.inMemory()` 换成持久化 manager，将 `SettingsManager.inMemory()` 换成文件 manager，就会改变 durability 边界，而不会改变 Agent Loop 的 Tool Calling 语义。
+const { session } = await createAgentSession();
+```
 
-### `InteractiveMode`、`runPrintMode` 与 `runRpcMode`
+它返回一个 Promise，因为创建过程可能加载资源和模型。
 
-SDK 导出三种建立在 runtime 之上的运行模式。`InteractiveMode` 提供完整 TUI、编辑器、聊天历史和内建命令；`runPrintMode` 发送初始消息和 follow-up 后输出结果并退出，适合脚本；`runRpcMode` 通过 stdin/stdout 运行 JSON-RPC，适合远程或其他进程控制。三者都通过同一个 `CreateAgentSessionRuntimeFactory` 创建 services 和 session，因此运行模式不应各自复制 Agent Loop。
+返回值是对象，而不是直接返回 session。
 
-Interactive mode 需要提供 `initialMessage`、`initialImages` 和 `initialMessages` 等 UI 输入；print mode 需要明确输出 `mode` 和初始 prompt；RPC mode 的 framing、commands、events、UI request/response 和错误处理见 RPC 文档。SDK 使用者应确保 stdout 不被调试日志污染 RPC 帧。
+这样可以同时返回 extension 加载结果和模型 fallback 诊断。
 
-### RPC alternative、Exports 与 Java/Go 边界
+自定义 options 的例子：
 
-如果调用方不在 Node.js 进程内，或希望进程隔离，可以直接运行 `pi --mode rpc --no-session`，让其他语言通过协议控制 Agent。SDK 适合同进程、类型安全、直接访问状态和程序化注册 Tool；RPC 适合 Java/Go 客户端、语言无关集成和隔离。RPC 与 MCP 都可能使用 JSON，但 RPC 控制 Pi Agent，MCP 发现和调用外部 Tool，不能互换。
+```typescript
+const { session } = await createAgentSession({
+  model: myModel,
+  tools: ["read", "bash"],
+  sessionManager: SessionManager.inMemory(),
+});
+```
 
-主入口导出 factory、`ModelRuntime`/`ModelRegistry`、认证同步错误、模型 resolver、`DefaultResourceLoader`、`createEventBus`、路径 helper、`SessionManager`、`SettingsManager`、内建 Tool factory，以及 `CreateAgentSessionOptions`、`ExtensionFactory`、`ToolDefinition`、`Skill`、`PromptTemplate` 等类型。需要 Extension 的完整方法时查看 Extensions 文档，不要根据导出名猜测生命周期。
+`tools` 是 active allowlist，不是“模型建议使用的工具列表”。
 
-Java/Go 实现不应复制 TypeScript 的动态 module loading：Java 可把 `AgentSession`/runtime 理解成 interface + service object，用 `ServiceLoader`/Listener 组合资源与事件；Go 可用 interface、显式 registry、struct 和 `context.Context`。`Promise`/`async` 对应 Java `Future` 或 Go goroutine/channel，但 cancellation、Session persistence、Tool permission 和 event ordering 仍是应用必须定义的语义。
+工具是否真正执行，还要通过 registry、schema 和权限检查。
 
-**实验**：先用 `SessionManager.inMemory()` 和一个只返回文本的 fake model，订阅并打印所有 `AgentSessionEvent`；再注册 `statusTool`，比较 `tools` allowlist 和 `excludeTools` 的行为；最后通过 `runPrintMode` 或 RPC 驱动同一 session。记录每次请求的 system prompt、messages、tools、事件和 Session entry，并说明哪些状态在重启后仍存在。
+`SessionManager.inMemory()` 不产生跨进程持久化。
+
+它非常适合单元测试和一次性 UI。
+
+持久化应用必须明确传入持久化 manager。
+
+### `AgentSession`：当前 Agent 的生命周期
+
+`AgentSession` 管理一个 session 的运行状态。
+
+`prompt(text, options?)` 发送用户输入，并等待 accepted operation 结束。
+
+`steer(text)` 将新指令加入正在运行的工作边界。
+
+`followUp(text)` 在当前响应本来要结束时追加工作。
+
+`subscribe(listener)` 注册事件并返回 unsubscribe function。
+
+`setModel(model)` 更换后续请求使用的模型。
+
+`setThinkingLevel(level)` 更换 thinking level。
+
+`cycleModel()` 在 scoped models 中切换模型。
+
+`cycleThinkingLevel()` 在允许的级别中切换 thinking。
+
+`messages` 是当前 session 的消息投影。
+
+`agent` 是底层 `Agent` 对象。
+
+`isStreaming` 只表示当前是否存在活动流，不代表 session 是否有未持久化内容。
+
+`navigateTree()` 在当前 session file 中移动 branch leaf。
+
+`compact()` 请求一次上下文压缩。
+
+`abortCompaction()` 只处理 compaction operation，不应被误用为普通 run abort。
+
+`abort()` 请求中止当前 operation。
+
+`dispose()` 释放 session 相关运行资源。
+
+`sessionFile` 可能是 undefined，例如 in-memory session。
+
+`sessionId` 是 session 的稳定身份，不是每一条 message 的 id。
+
+> 译者注：`AgentSession` 与 `AgentSessionRuntime` 的差异是 SDK 最容易混淆的地方。
+> 前者管理“这个 session 如何运行”，后者管理“当前应用正在使用哪个 session”。
+> `/new`、`/resume`、`/fork` 会替换后者的 `session`，不会自动把旧 session 的 callback 搬过去。
+
+### `createAgentSessionRuntime()`：替换当前运行时
+
+需要支持 `/new`、`/resume`、`/fork`、`/clone` 或 JSONL import 时，应使用 runtime API。
+
+`createAgentSessionRuntime()` 接收 runtime factory 和初始运行参数。
+
+factory 根据有效 `cwd` 创建 cwd 绑定的 services。
+
+然后 factory 将 services、session manager 和 session start event 交给 `createAgentSessionFromServices()`。
+
+最后 runtime 获得一个完整的 session 和诊断结果。
+
+核心关系是：
+
+```text
+runtime.session -> 当前 AgentSession
+runtime.newSession() -> 创建并替换
+runtime.switchSession() -> 打开并替换
+runtime.fork() -> 从 tree 分支并替换
+```
+
+替换后，`runtime.session` 指向新对象。
+
+旧对象上的 subscription 仍然属于旧对象。
+
+调用者必须取消旧订阅，再订阅新 session。
+
+如果 extension 绑定在 session 上，也要对新 session 重新 `bindExtensions()`。
+
+示例：
+
+```typescript
+let session = runtime.session;
+let unsubscribe = session.subscribe(handleEvent);
+await runtime.newSession();
+unsubscribe();
+session = runtime.session;
+unsubscribe = session.subscribe(handleEvent);
+```
+
+这里 `await runtime.newSession()` 可能抛异常。
+
+异常意味着替换没有完成，不应静默把旧 session 当成新 session。
+
+`runtime.diagnostics` 用来暴露资源或模型发现问题。
+
+> 译者注：这和 Java 中重新创建 request-scoped service 很像。
+> 如果 listener 持有旧对象引用，替换 service 后它不会魔法般更新。
+> Go 中则常见为返回一个新的 struct 和新的 channel subscription。
+
+### Prompt、Promise 和消息队列
+
+`prompt()` 不只是把字符串放进 messages。
+
+它可能先展开 prompt template。
+
+它可能处理 images。
+
+它可能执行 extension command。
+
+它可能在 streaming 期间按指定策略入队。
+
+它还可能调用 preflight callback。
+
+`PromptOptions` 的重要字段包括：
+
+- `expandPromptTemplates` 控制文件模板是否展开。
+- `images` 传递图像内容块。
+- `streamingBehavior` 指定 `steer` 或 `followUp`。
+- `source` 标记输入来自哪里。
+- `preflightResult` 接收 acceptance 之前的结果。
+
+`preflightResult(true)` 只表示输入被接受、排队或立即处理。
+
+它不表示最终模型回答成功。
+
+`preflightResult(false)` 表示在 acceptance 之前被拒绝。
+
+accepted run 之后发生的模型错误，不应重新伪装为 preflight rejection。
+
+普通 prompt：
+
+```typescript
+await session.prompt("What files are here?");
+```
+
+带图像：
+
+```typescript
+await session.prompt("What's in this image?", {
+  images: [{ type: "image", source: { type: "base64", mediaType: "image/png", data: "..." } }],
+});
+```
+
+streaming 期间：
+
+```typescript
+await session.prompt("Stop and do this instead", { streamingBehavior: "steer" });
+await session.prompt("After you're done, also check X", { streamingBehavior: "followUp" });
+```
+
+没有 `streamingBehavior` 的 streaming prompt 会抛错。
+
+这不是接口任性，而是为了防止同一个输入同时拥有两种队列语义。
+
+Extension command 立即执行，不进入 steer/follow-up 队列。
+
+文件 prompt template 会在发送或排队前展开。
+
+`steer()` 更像修正当前计划。
+
+`followUp()` 更像在本轮完成后追加任务。
+
+> 译者注：不要在当前 provider request 已经发出后直接修改数组。
+> 当前请求看到的 messages 必须保持稳定；队列消息在 Loop 的安全边界被消费。
+> 这也是 Pi 的 steering/follow-up 与简单的 `List<Message>.add()` 不同之处。
+
+### Agent 与 AgentState
+
+`session.agent` 来自 `@earendil-works/pi-agent-core`。
+
+它处理底层模型交互和 Agent Loop。
+
+`state.messages` 是当前对话历史。
+
+`state.model` 是当前模型。
+
+`state.thinkingLevel` 是当前 thinking 配置。
+
+`state.systemPrompt` 是当前系统提示。
+
+`state.tools` 是当前可用工具。
+
+`state.streamingMessage` 是可能尚未完成的 assistant message。
+
+`state.errorMessage` 是最新错误消息的投影。
+
+替换 messages 时，SDK 复制顶层数组，但调用者仍要保证 message 配对和字段合法。
+
+替换 tools 时，也要注意 model 看到的 definitions 必须和执行 registry 一致。
+
+```typescript
+const state = session.agent.state;
+state.messages = [...messages];
+state.tools = [...tools];
+await session.agent.waitForIdle();
+```
+
+`waitForIdle()` 返回 Promise。
+
+它等待当前 Agent 不再处理活动工作。
+
+它不是一个“取消所有工作”的 API。
+
+如果要取消，应调用明确的 `abort()`。
+
+> 译者注：TypeScript 的 Promise 组合可以类比 Java `Future` 或 `CompletableFuture`，但语义仍要看调用者是否等待。
+> Go 的等价边界通常是 `context.Context` 加一个返回 channel；channel 关闭也不等于业务成功。
+
+### Events：事件是观察面
+
+`session.subscribe()` 让应用观察 Agent，而不是直接进入内部状态机。
+
+`message_update` 通常携带一个 assistant message event。
+
+`text_delta` 是文本增量。
+
+`thinking_delta` 是 thinking 增量。
+
+`tool_execution_start` 表示工具开始执行。
+
+`tool_execution_update` 表示工具产生增量输出。
+
+`tool_execution_end` 表示工具执行结束，并可能带 `isError`。
+
+`message_start` 和 `message_end` 包围一个消息生命周期。
+
+`agent_start` 和 `agent_end` 包围一次 Agent operation。
+
+`turn_start` 和 `turn_end` 包围一次 assistant response 及其工具批次。
+
+`queue_update` 观察 steering/follow-up 队列变化。
+
+`compaction_start` 和 `compaction_end` 观察压缩。
+
+`auto_retry_start` 和 `auto_retry_end` 观察重试。
+
+`summarization_retry_*` 观察摘要重试。
+
+事件 callback 是普通函数。
+
+callback 中抛出的异常可能影响宿主，因此显示层应捕获并脱敏。
+
+不要在 `text_delta` 中假设已经有完整 JSON。
+
+不要在 `tool_execution_start` 中假设工具一定成功。
+
+不要把最后一个事件当成 session 已写盘的证明。
+
+示例：
+
+```typescript
+const unsubscribe = session.subscribe((event) => {
+  switch (event.type) {
+    case "message_update":
+      if (event.assistantMessageEvent.type === "text_delta") {
+        process.stdout.write(event.assistantMessageEvent.delta);
+      }
+      break;
+    case "tool_execution_end":
+      console.log(event.isError ? "tool failed" : "tool succeeded");
+      break;
+  }
+});
+```
+
+> 译者注：事件和持久化不是一回事。
+> Event 是实时通知，Session entry 才是可恢复历史的候选事实。
+> 如果 Java Listener 负责写数据库，必须单独处理 listener 失败和重复通知。
+
+### Options：`cwd` 与 `agentDir`
+
+`cwd` 是 DefaultResourceLoader 的项目发现根。
+
+它影响 `.pi/extensions/`。
+
+它影响 `.pi/skills/`。
+
+它影响 `.agents/skills/` 的祖先目录搜索。
+
+它影响 `.pi/prompts/`。
+
+它影响向上查找的 `AGENTS.md`。
+
+它也影响 Session 命名和 Tool 的路径解析。
+
+`agentDir` 是全局配置根。
+
+它包含 global extensions。
+
+它包含 global skills。
+
+它包含 global prompts。
+
+它包含 `settings.json`。
+
+它包含 `models.json`。
+
+它包含 `auth.json`。
+
+它包含 sessions 目录。
+
+```typescript
+const { session } = await createAgentSession({
+  cwd: process.cwd(),
+  agentDir: "~/.pi/agent",
+});
+```
+
+传入 custom `ResourceLoader` 后，`cwd` 和 `agentDir` 不再决定资源发现。
+
+但是它们仍可能影响 session 命名。
+
+它们也可能影响工具路径解析。
+
+路径不是模型可信输入，Tool 仍要做 workspace 和权限检查。
+
+> 译者注：`cwd` 同时影响 discovery 和执行路径，容易被误认为只是 `process.chdir()`。
+> 生产应用应该固定 workspace，并在日志中记录 effective cwd。
+
+### Model：模型解析与可用性
+
+`getModel(provider, id)` 只查找模型定义。
+
+查找到定义不代表认证可用。
+
+`ModelRuntime.getModel()` 也主要解决 provider/id 到 Model 的映射。
+
+`ModelRuntime.getAvailable()` 才用于筛选有有效认证的模型。
+
+`ModelRuntime.create()` 默认可以恢复缓存的 catalog。
+
+它不一定在每次启动都从网络刷新。
+
+需要刷新时可以传 `allowModelNetwork` 和 timeout。
+
+```typescript
+const modelRuntime = await ModelRuntime.create({
+  allowModelNetwork: true,
+  modelRefreshTimeoutMs: 15_000,
+});
+```
+
+远程 catalog 的刷新可能超时。
+
+超时不应让应用无限等待。
+
+`PI_OFFLINE` 可以禁用模型网络访问。
+
+`refresh()` 可以接收 `signal`。
+
+`AbortSignal` 是取消信号，不是强制杀死线程。
+
+调用者可以使用：
+
+```typescript
+const signal = AbortSignal.timeout(15_000);
+const result = await modelRuntime.refresh({
+  providers: ["anthropic"],
+  signal,
+});
+if (result.aborted) console.warn("using cached models");
+```
+
+模型解析也支持 CLI 风格的 provider/model/level 字符串。
+
+`resolveCliModel()` 返回 error 或 warning 诊断。
+
+`resolveModelScopeWithDiagnostics()` 返回 scoped models 和 diagnostics。
+
+> 译者注：Java 中可以把 catalog 看成 `Map<ProviderId, Map<ModelId, Model>>`，把 available 看成经过 CredentialStore 过滤后的视图。
+> Go 中不要让 `map[string]any` 直接散落在 Loop；应在 adapter 边界转换成结构化 Model。
+
+### API Keys 与 OAuth
+
+认证解析有明确优先级。
+
+第一层是 runtime override。
+
+第二层是 `auth.json` 中的存储凭据。
+
+第三层是环境变量。
+
+第四层是 custom provider fallback resolver。
+
+runtime override 不应写入磁盘。
+
+`setRuntimeApiKey()` 适合临时请求和测试。
+
+自定义 authPath 和 modelsPath 适合多租户或隔离测试。
+
+也可以注入 `InMemoryCredentialStore`。
+
+```typescript
+const credentials = new InMemoryCredentialStore();
+const runtime = await ModelRuntime.create({ credentials });
+await runtime.setRuntimeApiKey("anthropic", process.env.MY_KEY!);
+```
+
+示例中的 key 只从环境变量读取。
+
+不要把 key 放到 prompt。
+
+不要把 key 写入 session entry。
+
+不要把 key 打进 event、Tool result 或错误日志。
+
+OAuth 通常包括 login、refreshToken 和 getApiKey。
+
+refreshToken 必须响应 AbortSignal。
+
+凭据操作 resolve 后，受影响的本地 catalog 和 availability snapshot 应保持一致。
+
+远程 catalog refresh 失败不应撤销已经成功的 credential mutation。
+
+`CredentialSynchronizationError` 包含 providerId、operation、credential 和 cause 等诊断。
+
+> 译者注：异常对象可以包含敏感字段，打印前要做 redaction。
+> Java 应用通常用 `CredentialsProvider` interface；Go 应用可以用 `CredentialStore` interface 加 `context.Context`。
+
+### System Prompt：资源如何进入 Context
+
+可以通过 `ResourceLoader` 覆盖 system prompt。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  systemPromptOverride: () => "You are a helpful assistant.",
+});
+await loader.reload();
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+`systemPromptOverride` 是一个 callback。
+
+它的返回值是 system prompt 文本。
+
+`reload()` 返回 Promise，因为资源发现可能异步。
+
+System prompt 不等于所有 context。
+
+Session messages 是另一组输入。
+
+Tool definitions 是结构化请求的一部分。
+
+Model options 也不应拼进 user message。
+
+项目 `AGENTS.md`、Skills 和 prompt templates 可能影响最终 system prompt。
+
+调试时应分别打印四个投影：
+
+1. 最终 system prompt。
+2. provider messages。
+3. active tool definitions。
+4. request options。
+
+打印时必须去掉 API key、凭据、完整文件内容和敏感 Tool args。
+
+> 译者注：所谓“Context”不是一根字符串。
+> 它是多个有不同生命周期和权限来源的输入集合；把它们混成字符串会丢失边界。
+
+### Tools：内置工具的 allowlist
+
+内置工具包括 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find` 和 `ls`。
+
+默认内置工具是 `read`、`bash`、`edit` 和 `write`。
+
+`tools` 可以显式选择 active tool names。
+
+`noTools: "all"` 关闭所有工具。
+
+`noTools: "builtin"` 关闭默认内置工具，但保留 extension/custom tools。
+
+`excludeTools` 在 allowlist 之后继续排除名称。
+
+```typescript
+const { session } = await createAgentSession({
+  tools: ["read", "grep", "find", "ls"],
+});
+```
+
+`tools` 只控制暴露和选择。
+
+它不是安全策略的全部。
+
+Tool schema 要验证参数。
+
+Tool executor 要做路径、命令、超时和输出上限检查。
+
+Extension 也不能绕过宿主权限。
+
+自定义 cwd 时，内置 Tool 会绑定到该 cwd。
+
+Windows 环境可以选择 `powershell`。
+
+`edit` 结果的 `details.diff` 适合 TUI 展示。
+
+`details.patch` 是 SDK 消费者可处理的 unified patch。
+
+> 译者注：allowlist、schema validation 和 sandbox 是三道不同的门。
+> allowlist 解决“能否看到这个工具”，schema 解决“参数形状是否可接受”，sandbox 解决“副作用在哪些资源范围内发生”。
+
+### Custom Tools：定义可测试的能力
+
+`defineTool()` 用 TypeBox schema 定义自定义 Tool。
+
+```typescript
+const statusTool = defineTool({
+  name: "status",
+  label: "Status",
+  description: "Get system status",
+  parameters: Type.Object({
+    input: Type.String({ description: "Input value" }),
+  }),
+  execute: async (_toolCallId, params) => ({
+    content: [{ type: "text", text: `Result: ${params.input}` }],
+    details: {},
+  }),
+});
+```
+
+`name` 是模型和 registry 使用的稳定标识。
+
+`description` 帮助模型选择工具，但不是安全授权。
+
+`parameters` 是模型可见的 JSON Schema。
+
+`execute` 是真正产生结果或副作用的 callback。
+
+`execute` 返回 Promise，因为工具可能进行文件或网络 I/O。
+
+`customTools` 会和 extension 注册的工具合并。
+
+如果传 `tools` allowlist，也必须包含自定义 Tool 名称。
+
+工具实现应检查 cancellation。
+
+工具实现应限制输出大小。
+
+工具实现应拒绝越过 workspace 的路径。
+
+工具实现不应读取凭据并回传给模型。
+
+> 译者注：Java 的对应物是 `Tool` interface 加 `JsonNode schema()` 和 `execute()`；Go 是 `Tool` interface 加 `json.RawMessage`。
+> 两种实现都应该让 schema gate 发生在副作用之前，而不是先调用函数再验证参数。
+
+### Extensions：资源加载与生命周期
+
+Extensions 由 `ResourceLoader` 发现。
+
+默认 loader 会搜索 global/project extension 路径。
+
+也可以传 `additionalExtensionPaths`。
+
+也可以直接传 `extensionFactories`。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  additionalExtensionPaths: ["/path/to/my-extension.ts"],
+  extensionFactories: [
+    (pi) => {
+      pi.on("agent_start", () => {
+        console.log("agent starting");
+      });
+    },
+  ],
+});
+await loader.reload();
+```
+
+factory 是 callback，收到 `ExtensionAPI`。
+
+Extension 可以注册 Tool。
+
+Extension 可以注册 command。
+
+Extension 可以监听 event。
+
+Extension 可以连接 event bus。
+
+inline factory 默认显示为 `<inline:1>` 等名称。
+
+用 `InlineExtension` 对象可以提供稳定显示名。
+
+```typescript
+const named: InlineExtension = {
+  name: "my-provider",
+  factory: (pi) => {
+    pi.on("agent_start", () => console.log("starting"));
+  },
+};
+```
+
+Extension 的代码和 Skill 的 markdown 不是同一种资源。
+
+Extension 在宿主进程中执行，因此拥有较高权限风险。
+
+加载失败应出现在 `extensionsResult.errors`，不能被静默吞掉。
+
+> 译者注：Java `ServiceLoader` 通常在进程启动时加载实现类；Pi Extension 更接近运行时 factory。
+> Go 更适合显式 registry 和 factory，不要为了模仿 Node 动态 import 而强行使用 native `plugin`。
+
+### Skills：只先加载 metadata
+
+Skill 对象通常包含 name、description、filePath、baseDir 和 source。
+
+`DefaultResourceLoader` 可以发现 Skill。
+
+`skillsOverride` 可以增加、过滤或替换 discovered skills。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  skillsOverride: (current) => ({
+    skills: [...current.skills, customSkill],
+    diagnostics: current.diagnostics,
+  }),
+});
+await loader.reload();
+```
+
+启动时通常只把 name 和 description 放进 system prompt。
+
+模型判断需要时，再读取 `SKILL.md`。
+
+这叫 progressive disclosure。
+
+它降低启动 token 成本。
+
+它也避免把几十个完整说明污染每一次请求。
+
+Skill 的正文是输入资源，不是自动可信的脚本。
+
+Skill 附带的 scripts 仍需要权限和执行隔离。
+
+> 译者注：Skill 更像“可按需加载的操作手册”，Extension 更像“在宿主中注册行为的代码模块”。
+> 把二者混为一谈会导致 markdown 被误当作安全插件，或让插件生命周期无法管理。
+
+### Context Files：项目规则的来源
+
+`agentsFilesOverride` 可以加入虚拟 `AGENTS.md`。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  agentsFilesOverride: (current) => ({
+    agentsFiles: [
+      ...current.agentsFiles,
+      { path: "/virtual/AGENTS.md", content: "# Guidelines\n\n- Be concise" },
+    ],
+  }),
+});
+await loader.reload();
+```
+
+Context file 通常会进入 system prompt 或 project instruction 区域。
+
+它不是普通 user message。
+
+它的来源、路径和优先级会影响最终指令。
+
+`AGENTS.md` 的向上搜索边界与 `cwd` 和 git root 有关。
+
+虚拟文件适合测试，不代表磁盘上真的有文件。
+
+应用应该在诊断中保留 path，方便解释规则来自哪里。
+
+用户指令、项目规则和 Skill 指令可能冲突。
+
+冲突解决策略应在 system prompt 和 runtime policy 中明确。
+
+> 译者注：Context file 不是权限文件。
+> 它可以告诉模型“不要改数据库”，但不能阻止恶意或错误 Tool 调用；阻止副作用仍要靠宿主权限和 sandbox。
+
+### Slash Commands：模板与输入展开
+
+Prompt template 可以变成 `/deploy` 之类的 slash command。
+
+```typescript
+const customCommand: PromptTemplate = {
+  name: "deploy",
+  description: "Deploy the application",
+  source: "(custom)",
+  content: "# Deploy\n\n1. Build\n2. Test\n3. Deploy",
+};
+```
+
+`promptsOverride` 可以把它加入 loader 的 prompt 列表。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  promptsOverride: (current) => ({
+    prompts: [...current.prompts, customCommand],
+    diagnostics: current.diagnostics,
+  }),
+});
+await loader.reload();
+```
+
+模板展开发生在 prompt 发送或排队之前。
+
+模板不是模型回答。
+
+模板也不是 extension command 的等价物。
+
+Extension command 可以自己调用 `pi.sendMessage()`。
+
+模板只是输入内容资源。
+
+模板内容仍然可能包含危险指令。
+
+部署类 command 需要额外审批和环境保护。
+
+> 译者注：把 `/deploy` 显示为命令，不等于用户已经授权部署。
+> UI command、prompt template、Tool execution 和外部副作用必须分开审计。
+
+### Session Management：持久化和分支
+
+Session 使用 `id`/`parentId` 连接 entry tree。
+
+`SessionManager.inMemory()` 只存在于当前进程。
+
+`SessionManager.create(cwd)` 创建持久化 session。
+
+`continueRecent(cwd)` 尝试恢复最近 session。
+
+`open(path)` 打开指定 JSONL。
+
+`list(cwd)` 列出当前项目 session。
+
+`listAll(cwd)` 列出更广范围的 session。
+
+```typescript
+const { session } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(),
+});
+const { session: persisted } = await createAgentSession({
+  sessionManager: SessionManager.create(process.cwd()),
+});
+```
+
+Session tree 允许在旧 entry 上分支。
+
+branch 移动当前 leaf，不必复制所有历史文本。
+
+fork 可以把一个路径提取到新的文件。
+
+`AgentSessionRuntime` 处理 active session replacement。
+
+`runtime.newSession()` 创建新 session。
+
+`runtime.switchSession(path)` 打开另一个 session。
+
+`runtime.fork(entryId)` 从指定 entry 分支。
+
+`runtime.fork(entryId, { position: "at" })` 可用于 clone path。
+
+分支会影响 context projection。
+
+它不应伪装成删除历史。
+
+> 译者注：Session 是持久化对话树，Context 是某次模型请求的投影。
+> 一个 session 可以有很多 branch，但每次 request 只选择当前 leaf 路径及必要的 compaction summary。
+
+### SessionManager tree API
+
+`getEntries()` 返回除 header 外的 entries。
+
+`getTree()` 返回完整 tree structure。
+
+`getPath()` 返回 root 到当前 leaf 的路径。
+
+`getLeafEntry()` 返回当前 leaf。
+
+`getEntry(id)` 按 id 查 entry。
+
+`getChildren(id)` 查直接子节点。
+
+`getLabel(id)` 查 label。
+
+`appendLabelChange(id, label)` 添加 label change entry。
+
+`branch(entryId)` 移动 leaf。
+
+`branchWithSummary(id, summary)` 在分支处写摘要。
+
+`createBranchedSession(leafId)` 创建新的 session 文件。
+
+这些操作改变的是 tree view。
+
+应用不应该直接修改返回的数组来绕过 SessionManager。
+
+对于持久化错误，要保留错误上下文。
+
+对于不存在的 entry，应报告明确的 id。
+
+对 branch 操作，要考虑当前 stream 是否已结束。
+
+### Settings Management：设置的同步与异步
+
+`SettingsManager.create()` 读取 global 和 project 设置。
+
+`SettingsManager.inMemory()` 不做文件 I/O。
+
+项目设置覆盖全局设置。
+
+嵌套对象按 key 合并。
+
+setter 先改变内存状态，再异步排队持久化写入。
+
+因此 setter 返回不一定等于文件已落盘。
+
+需要 durability boundary 时调用 `await settingsManager.flush()`。
+
+```typescript
+const settingsManager = SettingsManager.create();
+settingsManager.applyOverrides({
+  compaction: { enabled: false },
+  retry: { enabled: true, maxRetries: 5 },
+});
+await settingsManager.flush();
+```
+
+测试中应该 flush 后再读文件。
+
+进程退出前应该 flush。
+
+`drainErrors()` 用来读取设置 I/O 错误。
+
+SDK 不会把所有设置错误自动打印到终端。
+
+多租户应用应为每个租户使用独立路径或 manager。
+
+> 译者注：这和 Java 中“内存对象 setter + 异步 repository flush”相同。
+> 如果测试只断言 setter 返回而没有等待 flush，测试可能在磁盘写入之前结束。
+
+### ResourceLoader：发现资源
+
+`DefaultResourceLoader` 负责发现 extensions、skills、prompts、themes 和 context files。
+
+```typescript
+const loader = new DefaultResourceLoader({
+  cwd,
+  agentDir: getAgentDir(),
+});
+await loader.reload();
+const extensions = loader.getExtensions();
+const skills = loader.getSkills();
+const prompts = loader.getPrompts();
+const themes = loader.getThemes();
+const contextFiles = loader.getAgentsFiles().agentsFiles;
+```
+
+`reload()` 重新扫描资源并更新诊断。
+
+getter 返回的是资源描述和加载结果。
+
+它们不代表所有资源都已经执行。
+
+Extension factory 可能在创建阶段运行。
+
+Skill 正文通常仍按需读取。
+
+ResourceLoader 也可以用 override callback 注入测试资源。
+
+它是资源边界，不是权限边界。
+
+资源路径要按来源分类。
+
+项目资源和全局资源可能有不同优先级。
+
+> 译者注：loader 的核心价值是把“在哪里找资源”和“如何运行 Agent”拆开。
+> 这样测试可以注入虚拟资源，生产环境可以使用标准发现，而 Agent Loop 不必知道磁盘目录结构。
+
+### Return Value：创建结果和诊断
+
+`createAgentSession()` 返回 `CreateAgentSessionResult`。
+
+其中 `session` 是主要 AgentSession。
+
+`extensionsResult` 包含 extension 加载结果。
+
+`modelFallbackMessage` 表示 session 中的模型无法恢复时的提示。
+
+`extensionsResult.extensions` 是成功加载的 Extension。
+
+`extensionsResult.errors` 是 `{ path, error }` 数组。
+
+`extensionsResult.runtime` 是 ExtensionRuntime。
+
+```typescript
+const result = await createAgentSession(options);
+console.log(result.session.sessionId);
+for (const failure of result.extensionsResult.errors) {
+  console.warn(failure.path, failure.error);
+}
+```
+
+资源加载失败不应被转换成“没有任何 extension”。
+
+应用可以选择 fail-fast 或显示可恢复诊断。
+
+模型 fallback message 不是 assistant message。
+
+它不应该写进对话历史当成模型回答。
+
+如果 session 创建抛异常，应用要释放已经创建的资源。
+
+如果部分 extension 成功、部分失败，要保留两类结果。
+
+> 译者注：诊断和业务消息分开，类似 Java 的 `Result<T, List<Diagnostic>>`。
+> Go 可以返回 `struct + error`，但不要把 warning 丢进普通字符串导致调用方无法区分严重程度。
+
+### Complete Example：按装配顺序阅读
+
+完整示例先创建自定义 ModelRuntime。
+
+它使用自定义 authPath 和 modelsPath。
+
+如果环境变量存在，示例设置 runtime API key。
+
+然后定义 `statusTool`。
+
+再解析具体 model。
+
+再创建 in-memory SettingsManager。
+
+再创建带 systemPromptOverride 的 ResourceLoader。
+
+最后创建 AgentSession、订阅事件并 prompt。
+
+这条顺序很重要：
+
+```text
+credentials
+  -> model runtime
+  -> resources
+  -> tools
+  -> session manager
+  -> event subscriber
+  -> prompt
+```
+
+`statusTool` 的 `execute` 返回 content 和 details。
+
+content 是模型可见的 Tool Result 投影。
+
+details 可以供 UI 或 SDK 调用方使用。
+
+它仍然必须经过 schema 和权限边界。
+
+把 in-memory manager 换成持久化 manager，会改变 durability。
+
+但不会改变 Tool Calling 的基本控制流。
+
+应用应在 `try/finally` 中取消 subscription 和 dispose session。
+
+API key 不要通过完整 options 对象写日志。
+
+> 译者注：示例中最容易漏掉的是 cleanup。
+> Promise 只表示某个异步操作结束，不能代替 `unsubscribe()`、`dispose()` 或 `flush()`。
+
+### Run Modes：三种应用外壳
+
+SDK 的 run mode 都建立在 runtime 之上。
+
+`InteractiveMode` 是完整 TUI。
+
+`runPrintMode` 是单次输入并输出结果的脚本模式。
+
+`runRpcMode` 是通过 stdin/stdout 的 JSON-RPC 模式。
+
+三者应共享同一套 runtime factory。
+
+否则每种模式都会重新实现资源加载和 Session replacement。
+
+运行模式不是三套 Agent Loop。
+
+它们只是不同的输入输出外壳。
+
+### InteractiveMode
+
+`InteractiveMode` 提供编辑器、聊天历史和内建命令。
+
+它需要 runtime 和初始 UI 配置。
+
+`initialMessage` 是启动时输入。
+
+`initialImages` 是启动图像。
+
+`initialMessages` 是启动前的消息。
+
+`await mode.run()` 会进入交互循环。
+
+TUI 的 stdout/stderr 处理要和日志策略协调。
+
+长时间运行的 callback 不应阻塞 UI。
+
+事件订阅应在 session replacement 后重新绑定。
+
+### `runPrintMode`
+
+print mode 适合脚本和一次性自动化。
+
+它可以发送 `initialMessage`。
+
+也可以发送 `messages` 中的 follow-up。
+
+`mode: "text"` 表示文本输出。
+
+调用返回后进程可以退出。
+
+脚本要明确处理非零退出和错误输出。
+
+不要在 stdout 写入与结果格式冲突的 debug 日志。
+
+如果需要 JSON 结果，选择相应输出协议而不是解析自然语言。
+
+### `runRpcMode`
+
+RPC mode 通过 stdin/stdout 传输 JSON-RPC。
+
+stdout 只能写协议帧。
+
+诊断日志应写 stderr。
+
+RPC client 必须处理 event、UI request/response 和错误。
+
+runtime replacement 后 client 仍要理解 session identity 变化。
+
+RPC mode 适合 Java、Go 或其他语言的集成。
+
+但它与 MCP 不同：RPC 控制 Pi，MCP 暴露外部工具。
+
+### RPC Mode Alternative：直接运行 CLI
+
+如果应用不在 Node.js 进程内，可以直接运行：
+
+```bash
+pi --mode rpc --no-session
+```
+
+SDK 适合同进程调用。
+
+它提供 TypeScript 类型安全。
+
+它可以直接访问 Agent state。
+
+它可以直接注册 Tool 和 Extension。
+
+RPC 适合跨语言。
+
+RPC 也天然提供进程隔离边界。
+
+跨语言调用方不需要安装 Node SDK。
+
+代价是要实现 framing、协议错误和生命周期管理。
+
+> 译者注：RPC 和 MCP 都常用 JSON，但它们的控制方向不同。
+> RPC client 是控制 Pi Agent 的应用；MCP client 是把外部 server 的能力适配成 Agent Tool 的组件。
+
+### Exports：公开入口与边界
+
+主入口导出 factory。
+
+它导出 `createAgentSession`。
+
+它导出 `createAgentSessionRuntime`。
+
+它导出 `AgentSessionRuntime`。
+
+它导出 `ModelRuntime` 和 `ModelRegistry`。
+
+它导出认证同步错误和 model resolver。
+
+它导出 `DefaultResourceLoader`、`ResourceLoader` 和 `createEventBus`。
+
+它导出路径 helper，例如 `getAgentDir`、`getPackageDir`、`getDocsPath`。
+
+它导出 `SessionManager` 和 `SettingsManager`。
+
+它导出内置 Tool factory。
+
+它导出 `CreateAgentSessionOptions`、`CreateAgentSessionResult`、`ExtensionFactory`、`ToolDefinition`、`Skill` 和 `PromptTemplate` 等类型。
+
+导出名称是公共契约。
+
+未导出的内部函数不能被应用假定为稳定 API。
+
+Extension 的完整 API 仍应阅读 Extensions 文档。
+
+### SDK、Core、CLI/TUI/RPC 的最终边界
+
+`pi-ai` 处理 provider-neutral Model、Message、Stream、Usage 和 Stop Reason。
+
+`pi-agent-core` 处理 Agent state 和 Loop。
+
+coding-agent SDK 负责把 core 接到资源、Session、Tool、设置和 Extension。
+
+CLI 负责参数和进程入口。
+
+TUI 负责交互编辑器和视觉呈现。
+
+RPC 负责跨进程控制协议。
+
+MCP 负责外部 server 的 Tool/resource/prompt 协议。
+
+Skill 负责按需加载的指令资源。
+
+RAG 负责检索知识片段。
+
+它们都可能出现在同一个应用里，但不是同一个层。
+
+一次完整请求可以表示为：
+
+```text
+用户输入
+ -> AgentSession.prompt
+ -> Prompt/Context assembly
+ -> Agent Loop
+ -> ModelRuntime / Provider
+ -> streaming events
+ -> Tool validation/execution
+ -> Tool Result
+ -> next turn
+ -> final message
+ -> Session persistence
+```
+
+当排查问题时，要先定位是哪一层失真。
+
+如果 model 未找到，是 ModelRuntime 问题。
+
+如果 tool 名不在 definitions，是 allowlist/Resource 配置问题。
+
+如果 tool 调用了但参数不合法，是 schema/runtime 问题。
+
+如果事件看到了但 session 没恢复，是 event 与 persistence 混淆。
+
+如果 RPC 输出坏了，是 stdout framing 问题，不一定是 Agent Loop 问题。
+
+> 译者注：这张边界图是使用 SDK 的真正目标。
+> 记住每个对象负责什么，比记住一个最小示例更重要。
+
+### SDK 实验：从文本到可观测 Tool
+
+#### 实验目标
+
+用一个 fake model 运行一次无 Tool 请求。
+
+再注册一个 `status` Tool。
+
+观察 message、tool execution、turn 和 agent 事件。
+
+最后恢复一个持久化 session。
+
+#### 准备
+
+使用 `SessionManager.inMemory()` 开始。
+
+不要设置真实 API key。
+
+不要把 Tool 指向生产目录。
+
+准备一个只返回两轮结果的 ScriptedModel。
+
+第一轮返回 Tool Call。
+
+第二轮返回 final text。
+
+#### 步骤
+
+1. 打印每个 event 的 `type`。
+2. 对 `message_update` 单独打印 delta。
+3. 在 `tool_execution_start` 记录 tool name。
+4. 在 `tool_execution_end` 记录 `isError`。
+5. 在 `turn_end` 记录 tool results。
+6. 对照 `session.messages` 检查追加顺序。
+7. 把 session manager 换成持久化版本。
+8. 进程重启后重新打开 session。
+9. 比较 session tree 和本次 Context 投影。
+10. 调用 `unsubscribe()` 和 `dispose()`。
+
+#### 观察点
+
+`text_delta` 不等于完整回答。
+
+Tool Call 不等于函数已经执行。
+
+Tool Result 必须带对应 call identity。
+
+事件可以实时到达，但持久化可能在之后完成。
+
+Prompt Promise resolve 只代表 accepted operation 的生命周期结束。
+
+`preflightResult(true)` 不能替代最终 outcome 判断。
+
+#### 失败实验
+
+让 fake model 返回未知 Tool。
+
+让 Tool 返回参数错误。
+
+让 ModelRuntime 使用不存在的 model id。
+
+让资源 loader 加载一个坏 extension。
+
+让 SettingsManager 写入不可写路径。
+
+对每个错误记录层级、错误类型和是否可重试。
+
+#### 思考题
+
+为什么 `AgentSession` 不直接负责新建 session？
+
+为什么 `AgentSessionRuntime` 替换后必须重新订阅？
+
+为什么 `preflightResult` 不能当作 final success？
+
+为什么 `noTools: "builtin"` 仍可能保留 extension tools？
+
+为什么 RPC stdout 不能混入调试日志？
+
+Java 应该用 `ServiceLoader` 还是显式 registry 替代 ResourceLoader？
+
+Go 应该如何用 `context.Context` 让 Tool 取消？
+
+### 小结
+
+SDK 是一个可组合的应用边界。
+
+它把 ModelRuntime、ResourceLoader、AgentSession、SessionManager、SettingsManager 和运行模式连接起来。
+
+`AgentSession` 运行当前 session。
+
+`AgentSessionRuntime` 替换当前 session。
+
+Model、Tool、Extension、Skill、Context file 和事件各有生命周期。
+
+Promise、callback 和 AbortSignal 都需要在具体边界上解释。
+
+SDK 不会自动解决权限、幂等、沙箱、崩溃恢复或费用控制。
+
+这些是宿主应用和更高层 Harness 必须承担的工程责任。
 
 ## 章节对照
 

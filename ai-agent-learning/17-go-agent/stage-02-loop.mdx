@@ -1,11 +1,50 @@
 ---
 title: "Go 03–04：Tool 与 Agent Loop"
-description: "实现 Tool interface、schema gate、消息回传和 maxSteps。"
+description: "从 Tool interface 和 schema gate 走到可测试的两轮 Agent Loop。"
 ---
 
 # Go 03–04：Tool 与 Agent Loop
 
-## Tool interface
+本页连接 Go 03 与 Go 04：先把“模型提出一个动作”表示成 Go 数据，再把数据送进有限循环。分成两步做，是为了保持一个清晰的事实边界：解析和校验不等于执行。
+
+## 本阶段完成什么
+
+- 定义 `ToolDefinition`，描述给模型看的 name、description 和 JSON Schema。
+- 定义 `Tool`，让 Runtime 找到真正可执行的对象。
+- 用 `Registry` 注册工具并拒绝重复名称。
+- 用 `json.RawMessage` 延迟解析参数，先做统一 schema gate。
+- 实现 `AgentLoop.Run`：Model → assistant → Tool Call → Tool Result → Model。
+- 支持多个 Tool Call 的顺序和并行执行，并保持返回消息的 source order。
+- 以 `MaxSteps` 终止异常模型，区分 final、tool error 和 model error。
+
+## 本阶段不完成什么
+
+本页不实现真实文件工具、Session、MCP、完整 JSON Schema draft，也不讨论生产级 transaction。这里的 `Validate` 只检查当前课程需要的 object 和 required 字段；type、enum、additionalProperties 等校验仍可作为练习加入。
+
+## 前置知识与输入
+
+完成 Go 01/02，理解 `Model.Complete` 返回一个 `Response`，其 `Message` 可能有 `ToolCalls`。当前 `Message` 关键字段是：
+
+```go
+type Message struct {
+    Role       Role
+    Content    string
+    ToolCalls  []ToolCall
+    ToolCallID string
+    ToolName   string
+    IsError    bool
+}
+
+type ToolCall struct {
+    ID        string
+    Name      string
+    Arguments json.RawMessage
+}
+```
+
+`ToolCall` 是模型输出的结构化数据，不是函数调用记录。只有 `Execute` 返回后，Runtime 才能说 Tool 产生了结果。
+
+## Go interface 的两个方向
 
 ```go
 type Tool interface {
@@ -14,18 +53,300 @@ type Tool interface {
 }
 ```
 
-`ToolDefinition` 是给模型的 metadata；`Execute` 是 Runtime 的副作用。`Registry.Validate` 先查找工具、解析 object 和 required 字段，只有通过后才会调用 `Execute`。
+Go interface 是隐式满足的：任何类型只要有这两个方法，就能放进 Registry。`Definition` 是“给模型的能力说明”，`Execute` 是“给 Runtime 的副作用入口”。不要在 Definition 中读取文件，也不要在 Execute 中重新决定工具名称。
 
-## Loop 的边界
+```go
+type ToolDefinition struct {
+    Name        string         `json:"name"`
+    Description string         `json:"description"`
+    Schema      map[string]any `json:"parameters"`
+}
 
-`AgentLoop.Run` 每步向 Model 发 `Request{Messages, Tools}`；assistant 有 Tool Calls 时执行 batch，把每个结果转换成 `RoleTool` 消息；没有 Tool Calls 时检查 follow-up。`LoopOptions.MaxSteps` 防止模型不断返回调用。
+type ToolResult struct {
+    Content   string
+    Details   map[string]any
+    IsError   bool
+    Terminate bool
+}
+```
 
-## 错误语义
+`Schema` 是动态 JSON，因此这里使用 `map[string]any`；`ToolResult` 的 `Details` 适合诊断，但展示给模型的主文本是 `Content`。`Terminate` 让某些 Tool 结果表达“不要再自动请求模型”，不是普通 stop reason。
 
-unknown tool、坏 JSON、缺 required 参数和执行异常变成 error `ToolResult`，让下一轮模型可见；模型请求错误由 retry policy 处理，耗尽后返回错误。取消通过 `context.Context`，而不是把进程强杀。
+## Registry 为什么存在
 
-## 练习
+```go
+type Registry struct {
+    mu    sync.RWMutex
+    tools map[string]Tool
+}
 
-1. 增加一个 counter Tool，断言 unknown tool 不会增加调用数。
-2. 让 ScriptedModel 返回两轮：calculator call、final text。
-3. 只给一轮 Tool Call，`MaxSteps=1`，断言返回 max steps error。
+func (r *Registry) Register(tool Tool) error {
+    definition := tool.Definition()
+    if definition.Name == "" {
+        return errors.New("tool name cannot be empty")
+    }
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    if _, exists := r.tools[definition.Name]; exists {
+        return fmt.Errorf("tool %q is already registered", definition.Name)
+    }
+    r.tools[definition.Name] = tool
+    return nil
+}
+```
+
+Registry 有三个职责：按名字查找执行对象、把 definitions 发送给模型、在执行前做 gate。`RWMutex` 让并发读取 definitions/get 与注册行为不会产生 map race；它不是权限系统。
+
+### schema gate 的 trace
+
+```text
+assistant.tool_calls[0]
+ -> Registry.Get(call.Name)
+ -> json.Unmarshal(call.Arguments, &object)
+ -> 检查 object != nil
+ -> 检查 schema.required
+ -> 通过：返回 Tool
+ -> 失败：返回 error，不调用 Execute
+```
+
+当前实现：
+
+```go
+func (r *Registry) Validate(call ToolCall) (Tool, error) {
+    tool, ok := r.Get(call.Name)
+    if !ok {
+        return nil, fmt.Errorf("unknown tool %q", call.Name)
+    }
+    definition := tool.Definition()
+    var object map[string]any
+    if err := json.Unmarshal(call.Arguments, &object); err != nil {
+        return nil, fmt.Errorf("tool %q arguments are invalid JSON: %w", call.Name, err)
+    }
+    if object == nil {
+        return nil, fmt.Errorf("tool %q arguments must be a JSON object", call.Name)
+    }
+    if required, ok := definition.Schema["required"].([]any); ok {
+        for _, item := range required {
+            name, ok := item.(string)
+            if ok {
+                if _, present := object[name]; !present {
+                    return nil, fmt.Errorf("tool %q is missing required argument %q", call.Name, name)
+                }
+            }
+        }
+    }
+    return tool, nil
+}
+```
+
+注意 `json.RawMessage` 可以先作为字节保存，`Validate` 才解码为 `map[string]any`。解析成功只说明它是合法 JSON；`{"path":"../../secret"}` 仍然需要后续 PermissionPolicy 检查。
+
+## AgentLoop 的每一步
+
+最小 loop 的控制流是：
+
+```text
+history = copy(initial)
+for step = 1..MaxSteps:
+    append steering messages at boundary
+    response = Model.Complete(ctx, {history, definitions})
+    append response.Message as assistant
+    if no ToolCalls:
+        consume FollowUps or return final
+    results = executeBatch(assistant.ToolCalls)
+    for each source index:
+        append RoleTool(result, matching call id/name)
+    if all results request termination:
+        consume FollowUps or return
+return max steps error
+```
+
+当前 `AgentLoop.Run` 用 `append([]Message(nil), initial...)` 复制历史。原因是 Loop 会追加消息，不能偷偷修改调用方的 slice backing array。每轮请求都重新构造 `Request`，所以第二轮能看到 assistant Tool Call 和对应 Tool Result。
+
+核心代码（省略事件 helper）：
+
+```go
+history := append([]Message(nil), initial...)
+var final Message
+for step := 1; step <= options.MaxSteps; step++ {
+    for _, message := range drainMessages(options.Steering) {
+        history = append(history, message)
+    }
+    response, err := l.completeWithRetry(
+        ctx,
+        Request{Messages: history, Tools: l.Tools.Definitions()},
+        options.Retry,
+        step,
+    )
+    if err != nil {
+        return RunResult{Messages: history, Steps: step}, err
+    }
+    message := response.Message
+    if message.Role == "" {
+        message.Role = RoleAssistant
+    }
+    history = append(history, message)
+    final = message
+    if len(message.ToolCalls) == 0 {
+        followUps := drainMessages(options.FollowUps)
+        if len(followUps) == 0 {
+            return RunResult{Messages: history, Final: final, Steps: step}, nil
+        }
+        history = append(history, followUps...)
+        continue
+    }
+    results := l.executeBatch(ctx, message, options, step)
+    for index, result := range results {
+        history = append(history, Message{
+            Role: RoleTool, Content: result.Content,
+            ToolCallID: message.ToolCalls[index].ID,
+            ToolName: message.ToolCalls[index].Name,
+            IsError: result.IsError,
+        })
+    }
+}
+return RunResult{Messages: history, Final: final, Steps: options.MaxSteps},
+    fmt.Errorf("max steps exceeded (%d)", options.MaxSteps)
+```
+
+每行要点：`completeWithRetry` 的错误不会被当作 assistant；assistant 先追加再判断 calls；结果用同一个 index 绑定 call id；没有 call 才可能返回 final；循环总有上限。
+
+## 成功 trace：calculator
+
+`ScriptedModel` 依次返回两条 Response：
+
+```text
+step 1 Request: [user "2+3"], tools=[calculator]
+step 1 Response: assistant tool_call(call-1, calculator, {add,2,3})
+step 1 Execute: calculator -> ToolResult("5")
+step 2 Request: [user, assistant tool_call, tool "5"]
+step 2 Response: assistant "5", no calls
+return final "5"
+```
+
+`TestToolCallIsExecutedAndReturnedToModel` 断言第二个 request 的最后一条消息是 `RoleTool`，这比只断言最终文本更强：它验证了 Loop 真正把观察结果交回模型。
+
+## 失败 trace
+
+### unknown tool
+
+```text
+assistant calls missing
+ -> Validate: unknown tool
+ -> error ToolResult
+ -> Execute 没被调用
+ -> 下一轮模型可以看到 is_error
+```
+
+### invalid arguments
+
+```text
+arguments = {}
+ -> required path/value 缺失
+ -> Validate 返回 error
+ -> Execute 没被调用
+```
+
+### 模型永不停止
+
+```text
+step 1 tool call
+step 2 tool call
+...
+step MaxSteps tool call
+ -> return max steps exceeded
+```
+
+不能依赖模型“应该懂得停止”。`MaxSteps` 是 Runtime 的安全阀，且应在测试中被证明。
+
+## sequential 与 parallel
+
+`executeBatch` 为每个 call 创建一个 `results` 槽位：
+
+```go
+results := make([]ToolResult, len(assistant.ToolCalls))
+for index, call := range assistant.ToolCalls {
+    results[index] = l.executeOne(ctx, assistant, call, options, step)
+}
+```
+
+Sequential 适用于 write → read、同一资源有顺序关系的动作。Parallel 模式为每个 index 启动 goroutine，但仍写入各自的 `results[index]`；WaitGroup 等待全部完成，然后 Loop 按 index 追加消息。因此完成事件可以乱序，交回模型的消息不乱序。
+
+`read A` 和 `read B` 常可并行；`write A` 和 `read A` 不应仅凭“有两个 call”就并行。更成熟的 Harness 需要依赖分析、资源锁或让模型一次只提出顺序调用。
+
+## 运行与测试
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestToolCall|TestUnknown|TestMultiple|TestInvalid|TestRetry'
+go test -race ./...
+```
+
+关键测试：
+
+| 测试 | 保护的事实 |
+| --- | --- |
+| `TestToolCallIsExecutedAndReturnedToModel` | 两轮 history 和 Tool Result 回传 |
+| `TestUnknownToolDoesNotExecuteAnything` | unknown name 不进入 Execute |
+| `TestInvalidArgumentsDoNotInvokeTool` | schema gate 先于副作用 |
+| `TestMultipleToolCallsPreserveSourceOrder` | parallel 结果按 source order |
+| `TestRetryAndMaxSteps` | retry 有界、loop 有上限 |
+
+`ScriptedModel` 是 deterministically scripted provider：第一轮返回 Tool Call，第二轮返回 final。它让测试只关注 Loop，不依赖网络、模型随机性和收费 API。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/types.ts` 的 `AgentTool` 组合 schema、`execute` 和可选事件/详情。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall`、`executePreparedToolCall`、`executeToolCalls` 对应本页 gate、执行和 batch。
+- `packages/ai/src/types.ts` 的 `ToolCall`、`ToolResult` 具有更丰富的 content blocks、details 和 provider 字段。
+- `packages/agent/src/agent.ts` 在 Loop 外维护 steering/follow-up queue 与 lifecycle。
+
+Pi 的工具准备和结果事件比本教学版更细；本页保留相同的工程边界：模型只输出候选 call，Runtime 负责校验、执行和下一轮请求。
+
+## Java 对照
+
+Java 使用显式 `Tool` interface 和 Jackson `JsonNode`；Go 用隐式 interface 和 `json.RawMessage`。两种实现都应：
+
+1. 先按 name lookup。
+2. 再解析和校验 arguments。
+3. 通过后才允许 execute。
+4. 用 call id 把结果配回 assistant call。
+
+Java 的 `ExecutorService` 类似 Go 的 goroutine + WaitGroup，但 Future 更显式表达完成和异常。Go 的 `map[string]any` 灵活，Java `JsonNode` 更容易在运行时查询字段。
+
+## 实验：给 Registry 加一道校验
+
+### 目标
+
+证明合法 JSON 不等于合法 Tool 参数，且失败不能产生副作用。
+
+### 准备
+
+打开 `tool.go`、`agent_test.go`，以 `countingTool` 为观察对象。
+
+### 步骤
+
+1. 注册一个 required 为 `value` 的 Tool。
+2. 让 ScriptedModel 返回 `{}`。
+3. 在 `Execute` 中递增计数器。
+4. 运行 Loop 两轮，断言 count 为零。
+5. 再返回 `{"value":"ok"}`，断言 count 为一。
+6. 把参数改为数组 `[]`，确认 object gate 拒绝。
+
+### 观察点
+
+错误 Tool Result 仍要带 `ToolCallID` 和 name，让模型知道哪个 call 失败；但不会有真实文件、网络或计数副作用。
+
+### 预期结果
+
+失败参数只产生可观察的 error result；通过 gate 后才出现 Execute 的结果。
+
+### 思考题
+
+如果 Registry 在并行执行时被另一个 goroutine 注册新 Tool，definitions 是否应立即变化？如果 Tool Result 顺序乱了，模型如何把结果和 call id 配对？
+
+## 小结与下一阶段
+
+Go 03/04 建立了最小 Agent Loop：`ToolDefinition` 是描述，`Tool` 是执行，`Registry` 是门，`AgentLoop` 是控制流。下一页把这个 Loop 接上 read/write/edit/grep/shell，并讨论 workspace、输出上限、命令策略和副作用风险。

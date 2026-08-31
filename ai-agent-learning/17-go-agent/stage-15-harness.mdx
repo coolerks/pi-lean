@@ -1,17 +1,338 @@
 ---
-title: "Go 15：Harness"
-description: "把 Provider、Loop、工具、Session、Compaction、插件、Skill、MCP 和 Telemetry 组合起来。"
+title: "Go 15：组合 Agent Harness"
+description: "把 Model、Loop、工具、Session、权限、队列、Skill、MCP 和 Telemetry 组装成可测试边界。"
 ---
 
-# Go 15：Harness
+# Go 15：组合 Agent Harness
 
-`Harness` 是装配根：建立 PermissionPolicy 和 Registry，加载工具/插件，恢复 Session，运行 Agent，保存成功前缀并记录事件。它解决的是跨组件生命周期，而不只是多写一个 `while`。
+## 学习目标
+
+这是 Go 路线的组合阶段。完成后，你应该能够：
+
+- 解释 `Harness` 为什么是装配层，而不是另一个隐藏的 `while`。
+- 读懂 `NewHarness`、`LoadHarness`、`Prompt` 和 `Compact` 的生命周期。
+- 从 Session reload 后继续运行一个可测试的 Agent。
+- 指出 PermissionPolicy、Event/Telemetry、Plugin、Skill、MCP 各自的 owner。
+- 列出当前示例距离 durable Harness 还缺少什么。
+
+## 输入、增加的能力与明确不做什么
+
+输入是 Go 06–14 的 Model、AgentLoop、Registry、PermissionPolicy、Session、Compactor、Plugin、Skill、MCP 和 Recorder。本阶段把它们接到一个应用入口。
+
+本阶段不声称实现 Pi `AgentHarness` v2 的 operation intent/result、terminal transaction、crash recovery、exactly-once 或生产 sandbox。当前示例保存的是平面消息 transcript；它是可运行的教学 Harness，不是可直接托管支付/数据库写入的生产控制平面。
+
+## 前置 Go 知识
+
+需要理解：
+
+- constructor 负责装配依赖；
+- 方法调用顺序构成生命周期；
+- 一个对象不应同时拥有所有业务细节；
+- 失败需要带回调用方；
+- session reload 只能恢复被保存的状态。
+
+## 问题场景：各组件都“能跑”但系统不能恢复
+
+单独测试都通过并不意味着组合正确：
+
+```text
+Model 可调用
+Tool 可执行
+Session 可保存
+Telemetry 可记录
+-> Harness 把 prompt 加到错误的 history
+-> 运行失败时覆盖旧 session
+-> reload 后重复外部副作用
+```
+
+组合层的任务是定义输入、装配顺序、状态 owner 和失败边界。
+
+当前 Go Harness 的边界是：
+
+```text
+NewHarness
+  -> Registry + Policy + built-in tools
+  -> AgentLoop + retry + events
+  -> Session + optional path
+Prompt
+  -> Snapshot + user message
+  -> Agent.Run
+  -> Replace + Save
+```
+
+它没有把每一个 side effect 变成 operation record，因此必须在文档和测试中明确限制。
+
+## Harness 结构
+
+```go
+type Harness struct {
+    Agent       *Agent
+    Session     *Session
+    SessionPath string
+    Telemetry   *Recorder
+    Plugins     PluginManager
+}
+```
+
+输入是组件指针、session path 和 plugin manager；输出是组合根；状态变化由 Agent、Session 和 Recorder 分别拥有；失败点是 nil 组件、路径不可写、插件注册失败。
+
+这个 struct 没有把 MCP client、Skill registry 单独存为字段。当前示例中它们是可单独调用的能力，尚未成为 `NewHarness` 的自动启动步骤。不要从字段缺失推测完整功能已经集成。
+
+## NewHarness：装配顺序
+
+```go
+func NewHarness(model Model, workspace, sessionPath string) (*Harness, error) {
+    if model == nil {
+        return nil, errors.New("model is required")
+    }
+    registry := NewRegistry()
+    policy := PermissionPolicy{Workspace: workspace}
+    for _, tool := range []Tool{
+        ReadTool{Policy: policy}, WriteTool{Policy: policy},
+        EditTool{Policy: policy}, GrepTool{Policy: policy},
+        ShellTool{Policy: policy},
+    } {
+        if err := registry.Register(tool); err != nil { return nil, err }
+    }
+    // construct Recorder, LoopOptions, Agent and Session
+}
+```
+
+输入是 model、workspace、optional path；输出是 Harness 或 error；状态变化是 registry 有了受策略保护的 coding tools；失败点是 nil model、空 workspace、重复 Tool 名或注册失败。
+
+装配先建立 Policy，再把 Policy 复制到每个 Tool。这样 Tool 自己不会决定 workspace。随后构造 `Recorder` 和 Loop options：MaxSteps=12、Parallel tool mode、MaxAttempts=2，并把 OnEvent 连接到 Recorder。
+
+## LoadHarness：恢复消息，不恢复副作用
+
+```go
+func LoadHarness(model Model, workspace, sessionPath string) (*Harness, error) {
+    harness, err := NewHarness(model, workspace, sessionPath)
+    if err != nil { return nil, err }
+    if sessionPath != "" {
+        session, loadErr := LoadSession(sessionPath)
+        if loadErr != nil { return nil, loadErr }
+        harness.Session = session
+    }
+    return harness, nil
+}
+```
+
+输入是新 Model、workspace 和已有 path；输出是装配后的 Harness；状态变化是 Session 用 JSONL 内容替换空 Session；失败点是文件不存在以外的 open/decode/坏行错误。
+
+`LoadHarness` 只恢复消息历史和当前可运行组件。它不会恢复上次执行到哪个 Tool、哪个 operation 已经发生，也不会自动重放未完成副作用。
+
+这正是“session reload”和“crash recovery”的区别：前者读到了历史，后者还需要判断操作是否已执行。
+
+## Prompt：一次组合调用
+
+```go
+func (h *Harness) Prompt(ctx context.Context, text string) (RunResult, error) {
+    if h.Session == nil || h.Agent == nil {
+        return RunResult{}, errors.New("harness is not initialized")
+    }
+    history := h.Session.Snapshot()
+    history = append(history, Message{Role: RoleUser, Content: text})
+    result, err := h.Agent.Run(ctx, history)
+    h.Session.Replace(result.Messages)
+    if h.SessionPath != "" {
+        if saveErr := h.Session.Save(h.SessionPath); saveErr != nil && err == nil {
+            return result, saveErr
+        }
+    }
+    return result, err
+}
+```
+
+输入是 context 和 user text；输出是 RunResult/error；状态变化是把本轮成功前缀或最终 history 替换到 Session 并可选写盘；失败点是未初始化、模型/工具错误、保存失败、并发 Prompt。
+
+示例会在 Agent 返回后保存，即使 Loop 返回 model error 也可能有 history 前缀。这比只在 final 后 Save 好，但仍没有 durable operation intent。外部文件已修改而 Save 失败时，reload 无法单独证明文件状态。
+
+## Compact：组合层负责何时压缩
+
+```go
+func (h *Harness) Compact(maxTokens int) error {
+    compacted, err := Compact(h.Session.Snapshot(), maxTokens)
+    if err != nil { return err }
+    h.Session.Replace(compacted)
+    if h.SessionPath != "" { return h.Session.Save(h.SessionPath) }
+    return nil
+}
+```
+
+输入是 token budget；输出是 error；状态变化是 Session 替换并持久化；失败点是非法 budget、Session nil、写盘失败。当前方法没有自动检查 provider 的实际 window，也不生成可审计 compaction entry。
+
+调用方应先决定是只压缩下一次 Request，还是永久替换教学 Session。当前代码选择后者，所以实验必须保留备份或使用临时目录。
+
+## 权限边界
+
+`NewHarness` 创建 `PermissionPolicy{Workspace: workspace}`，并把它注入 read/write/edit/grep/shell。流程是：
+
+```text
+Tool Call
+-> Registry.Validate（名称、JSON、required）
+-> PermissionPolicy.ResolvePath/CheckCommand
+-> os.ReadFile/os.WriteFile/exec.CommandContext
+```
+
+输入是模型参数；输出是 ToolResult/error；状态变化可能是文件或进程；失败点是路径越界、危险命令、I/O error、取消。
+
+Policy 不是 sandbox。恶意进程、内核漏洞、网络出口、资源耗尽、secret redaction 和人工审批都不由示例解决。
+
+## Event 与 Telemetry 的 owner
+
+Harness 把 `LoopOptions.OnEvent` 指向 Recorder：
+
+```go
+OnEvent: func(event Event) {
+    fields := map[string]string{"step": strconv.Itoa(event.Step)}
+    finish := recorder.Start("agent."+event.Type, fields)
+    finish(event.Error)
+}
+```
+
+输入是 Event；输出无；状态变化是追加 Span；失败点是 event sink 阻塞、fields 泄露秘密、没有 parent run id。Recorder 只存 name、时间、step 和 error，不存 prompt、Tool args 或文件内容。
+
+Event 用于实时观察；Recorder 用于耗时/错误诊断；Session 用于 transcript。不要让 Recorder 取代 Session，也不要让 UI 自己执行工具。
+
+## Plugin、Skill、MCP 的集成边界
+
+当前 `Harness` 暴露 `Plugins PluginManager`，但 `NewHarness` 没有自动加载插件。需要显式：
+
+```go
+manager := &harness.Plugins
+err := manager.Load(plugin, harness.Agent.Loop.Tools)
+```
+
+Skill 通过 `DiscoverSkills(root)` 发现，MCP 通过 `MCPClient.ListTools` 得到 RemoteTool，再由调用方注册到同一 Registry。每一步都可能失败，不能只记录“能力已发现”。
+
+输入是外部扩展或 server；输出是 registry definitions；状态变化是能力目录增加；失败点是恶意 schema、注册冲突、server disconnect、技能 metadata 错误。
+
+## 运行命令与预期结果
 
 ```bash
 cd ai-agent-learning/examples/go-agent
 go test ./...
+go test -race ./...
 go vet ./...
 go run ./cmd/agent --demo
 ```
 
-当前示例是可测试教学 Harness；生产 durable 版本仍需 operation intent/result、崩溃恢复、幂等副作用和真正 sandbox，见 [成熟 Harness](/19-build-harness/architecture)。
+预期所有测试、race 和 vet 通过；demo 输出：
+
+```text
+tool[calculator]> 5
+assistant> 2 + 3 = 5
+final> 2 + 3 = 5
+```
+
+demo 使用 ScriptedModel，不需要 `AGENT_API_KEY`。HTTP 模式只有在显式提供 `-url`、`-model` 和环境变量 key 时才启用。运行后删除 `.agent-session.jsonl`。
+
+## 测试设计
+
+### Harness prompt/reload
+
+`TestHarnessPersistsAndReloads` 使用 `t.TempDir`，创建 Harness，Prompt 一个 scripted final，关闭路径，再 `LoadHarness`。它断言 reload 后有 user 和 assistant 两条 Message。
+
+这证明保存和恢复 transcript，不证明外部 Tool exactly-once。要测试副作用，使用 fake Tool 和 operation ledger，而不是把真实 shell 接入测试。
+
+### 组件边界
+
+组合测试应验证：
+
+- nil model 被拒绝；
+- workspace 路径由 Policy 限制；
+- Retry 与 MaxSteps 仍来自 LoopOptions；
+- OnEvent 能生成 Recorder Span；
+- Compact 后 Session 可 reload；
+- plugin 注册冲突返回 error；
+- Skill/MCP 失败不会伪装成 Tool success。
+
+### 故障 trace
+
+```text
+Save succeeds before model final
+-> reload sees partial prefix
+-> no operation record says tool write status
+-> recovery cannot safely retry unknown write
+```
+
+输入是崩溃点；输出是 partial Session 和无法判断的副作用状态；状态变化是“消息已保存但操作未知”；失败点是把 transcript 当 operation ledger。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent.ts`：Agent 生命周期、队列和 AbortController。
+- `packages/agent/src/agent-loop.ts`：模型 step、Tool batch、重试和事件。
+- `packages/coding-agent/src/core/agent-session.ts`：产品级 Session/Tool/Extension orchestration。
+- `packages/coding-agent/src/core/session-manager.ts`：JSONL entry、tree、leaf、branch。
+- `packages/coding-agent/src/core/extensions/runner.ts`：Hook 和 Extension 边界。
+- `packages/agent/src/harness/agent-harness.ts`：durable Harness public scaffold。
+
+Pi 目前可运行的 Coding Agent 主路径是 `Agent + AgentSession + SessionManager + ExtensionRunner`；Go `Harness` 是独立教学实现，不是 Pi core 的替代。
+
+## Java 对照
+
+| 责任 | Go | Java |
+| --- | --- | --- |
+| 装配 | `NewHarness` | `new Harness` |
+| 模型替身 | `ScriptedModel` | `ScriptedModel` |
+| Session reload | `LoadHarness` | `Harness.load` |
+| 取消 | `context.Context` | `CancellationToken` |
+| Tool registry | `Registry` | `ToolRegistry` |
+| 插件 | `PluginManager` | `ServiceLoader`/`PluginManager` |
+| 观测 | `Recorder` | `Telemetry` |
+
+Java 使用 checked exception 和 Jackson；Go 使用返回 error 和标准库 JSON。两者都要把 durable state 与 Event 分开。
+
+## 实验：从 demo 走到可恢复边界
+
+### 目标
+
+证明组合 Harness 能保存并 reload transcript，同时明确它还没有 crash-safe operation recovery。
+
+### 准备
+
+打开 `harness.go`、`session.go`、`agent.go` 和 `agent_test.go`。准备临时 workspace 和 session path。
+
+### 步骤
+
+1. 用 ScriptedModel 创建 Harness。
+2. 调用 Prompt，记录 RunResult 和 event spans。
+3. 打开 JSONL，识别 user、assistant、tool message。
+4. 用第二个 ScriptedModel 调用 LoadHarness。
+5. 断言 Session snapshot 与第一次结果一致。
+6. 在 fake Tool 中模拟“副作用完成但 Save 前失败”。
+7. 写下为什么 transcript 不能决定是否重放。
+8. 设计 `operation_intent`、`operation_result`、`operation_terminal` 三条记录。
+
+### 观察点
+
+组合根决定依赖和生命周期，但当前代码没有 single writer、operation id 或 recovery reducer。Recorder 的 Span 不会自动写入 Session。
+
+### 预期结果
+
+你能区分 session reload、context compaction 和 crash recovery；能指出 PermissionPolicy 只是一层应用检查。
+
+### 思考题
+
+如果两个 goroutine 同时调用 Harness.Prompt，Session 替换顺序由谁决定？如果 MCP response 丢失但 server 已写数据库，如何恢复？哪些能力应该由 Harness 自动加载，哪些必须显式注册？
+
+## 最终验收清单
+
+- [ ] Model 可以由 ScriptedModel 替换。
+- [ ] Tool arguments 在副作用前经过 Registry gate。
+- [ ] PermissionPolicy 限制 workspace 和危险命令。
+- [ ] `context.Context` 传到 model、tool、shell 和 backoff。
+- [ ] Session 能保存、加载和报告坏行。
+- [ ] Compact 的预算和语义损失有测试记录。
+- [ ] steering/follow-up/nextRun 有明确边界。
+- [ ] Event 与 Telemetry 不替代 durable state。
+- [ ] MCP request id、断线和生产缺口已解释。
+- [ ] Go 示例没有冒充 Pi durable v2。
+
+## 小结与后续
+
+Go 15 把前面各阶段组合成一个可运行、可测试、可 reload 的教学 Harness：`NewHarness` 负责装配，`AgentLoop` 负责控制流，`Session` 负责平面消息，Policy 负责基础约束，Recorder 负责诊断。
+
+下一步不是继续堆类，而是阅读 `19-build-harness`，把 operation intent/result、single writer、terminal state、幂等和 crash recovery 逐个加入设计。与此同时，回到 Pi 的 `AgentSession` 和 `SessionManager`，验证成熟 Coding Agent 如何把这些能力连接在一起。

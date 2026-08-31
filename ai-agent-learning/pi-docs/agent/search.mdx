@@ -13,33 +13,236 @@ Session 搜索 API、异步迭代和索引后端。 本页先用中文说明阅�
 
 ## 中文译文
 
-### 公共接口与稳定身份
+### 这份 API 解决什么问题
 
-Session Search 面向的是已经提交的 session entry。公共结果 `SessionSearchHit` 只包含 `sessionId` 和 `entryId`：前者定位所属 session，后者定位 session 内的 entry。它故意不把 snippet、时间、分数、metadata 或 offset 放进基础接口，因为 JSONL、内存、SQLite FTS 和远程索引无法保证这些字段具有相同含义。具体后端可以通过泛型 hit 扩展它们。
+Session Search 不是“把所有消息读出来再做字符串查找”的命令，而是一层稳定的查询契约。它只针对已经提交的 session entries 建立搜索视图，并把命中结果定位回 `(sessionId, entryId)`。这两个 id 是跨 JSONL、内存、SQLite FTS 和远程索引都能理解的最小身份；snippet、时间、分数、metadata 和字符 offset 则属于具体后端，不能擅自放进共享接口。
 
-调用 `search(text, options?)` 返回 `AsyncIterable<T>`。`entryTypes` 用 canonical entry type 过滤；`limit` 是最多返回多少条，后端可以少返回但不能超过它；`signal` 允许调用方取消。搜索 API 不负责 debounce：搜索框的调用者应在新 query 到来时 abort 旧请求。
+一次搜索的边界可以画成：
 
-### 为什么返回异步迭代器
+```text
+用户输入 query
+  -> UI 取消上一轮查询
+  -> SessionSearch.search(text, options)
+  -> 扫描器或索引后端
+  -> 返回稳定的 sessionId + entryId
+  -> 调用方按需读取完整 entry
+  -> UI 渲染 snippet 或详情
+```
 
-`AsyncIterable` 让 UI 在第一批结果到达时就渲染，而不是等完整数组；调用方也可以在足够结果后停止 `for await`。示例中的 `AbortController` 每次 query 先取消旧 controller，再把新 `signal` 传给 search。若后端以 `AbortError` 结束，UI 将它当作正常的“用户已输入新 query”，其他错误才继续抛出。
+这里有一个常见误解：命中结果不是一条新的 session message。搜索只读 canonical entry；它不改变 tree、leaf、branch、operation log，也不取得一个 Harness writer lease。要修改 session，仍必须走正常的 session mutation 边界。
 
-### 扫描实现
+### Core API 逐项说明
 
-扫描器把可读 session 适配为 `SessionSearchCandidate`。candidate 包含 entry id、序号、时间、用于匹配的 text 和可选 fields；匹配后公开的 `ScanningSessionSearchHit` 增加 timestamp 和 snippet。已经打开的 session/storage 可以直接扫描；JSONL 则先用只读的 metadata/list/load helper 发现并加载，再交给同一个 scanner。
+```ts
+export interface SessionSearchHit {
+  /** Logical identifier of the session that owns the entry. */
+  readonly sessionId: string;
 
-不要在 Harness 已持有的 session 上调用可能获取 writer lease 的 `SessionRepo.open()`。搜索是读路径，应使用只读加载；否则一个看似无害的搜索可能和正在运行的写操作争抢租约。扫描源也不能产出重复的 `sessionId`，因为基础 hit 的组合身份是 `(sessionId, entryId)`。
+  /** Logical identifier of the entry within that session. */
+  readonly entryId: string;
+}
 
-### SQLite FTS
+export interface SessionSearchOptions {
+  /** Restrict results to specific canonical entry types. */
+  readonly entryTypes?: readonly Entry["type"][];
 
-SQLite 后端返回 metadata、timestamp 和 score。第一次执行非空查询时，FTS 表和 triggers 可以惰性创建；首次创建会从 canonical `entries` 做一次 rebuild，之后由 trigger 跟随 insert、delete 和 payload update。因此 commit 后搜索保持新鲜，但 FTS trigger 失败也可能使 canonical SQLite 写入回滚。`entryTypes` 和 `limit` 仍通过公共 options 传入。
+  /** Maximum number of hits to return. Backends may return fewer, not more. */
+  readonly limit?: number;
 
-### 外部索引与一致性
+  /** Abort signal for cancellation, e.g. search-as-you-type. */
+  readonly signal?: AbortSignal;
+}
 
-Elasticsearch 示例不是核心内建的存储，而是应用侧 glue。应用把每个 entry 投影成包含 session/entry identity、seq、timestamp、cwd、text 和 metadata 的文档，通过 upsert/delete feed 维护索引，`flush` 后再提供 query。索引是 derived state：可以重试、重建或标记 stale，不能把它当作 canonical session。
+export interface SessionSearch<T extends SessionSearchHit = SessionSearchHit> {
+  search(text: string, options?: SessionSearchOptions): AsyncIterable<T>;
+}
+```
 
-索引 writer 需要处理 update/delete、bulk 失败和 refresh；查询结果仍须检查 `_source`、limit 和 cancellation。若系统需要显式维护索引，可以由 canonical write site 发出 no-op-by-default sink 事件；类似 telemetry 关闭时的 no-op，不应让“搜索未启用”改变主写入路径。
+`SessionSearchHit` 的两个属性都是 `readonly`，表示消费者不能通过修改结果来改变索引。`entryId` 只能在拿到 `sessionId` 后解释；不同 session 可能有同名 entry id，不能只用后者做全局主键。
 
-**实验**：先用两个内存 session 验证同一 query 的逐条输出，再切换 `limit=1` 和已取消 signal；随后模拟一个重复 session id、损坏 JSONL 和 SQLite trigger 失败。观察哪些是搜索错误、哪些是 canonical storage 错误，以及为什么重建索引不会修复错误的 session identity。
+`entryTypes` 过滤 canonical type。例如只搜索 `message` 和 `compaction`，可以排除 model-change、fact 或 operation record。过滤发生在哪里由后端决定，但返回结果必须符合过滤条件。`limit` 是上限，不是承诺一定返回这么多；索引刚重建、权限过滤或数据不足时可以少于该值。`signal` 只提供取消通道，不负责 debounce、节流、缓存或排序。
+
+泛型 `T extends SessionSearchHit` 让 SQLite 返回 `score`、扫描器返回 `snippet`、业务索引返回 metadata，同时保持基础调用方只依赖两个稳定 id。这是 TypeScript 的结构类型设计；Java 可以用 `SessionSearchHit` interface 加具体 record，Go 可以用基础 struct 加后端私有字段。
+
+> 译者注：不要把 `AsyncIterable` 翻译成“异步数组”。它是一种可以逐项产生结果的协议，类似 Java 的 Iterator/Publisher 组合，也可以类比 Go 中从 channel 读取结果。调用者结束消费后，后端是否真的停止工作仍取决于它是否检查 `AbortSignal`。
+
+### 为什么使用 AsyncIterable
+
+搜索框通常会连续产生 `a`、`au`、`aut`、`auth` 四个查询。如果每次都等待一个完整数组，旧查询可能在新查询之后返回，UI 就会闪回过期结果。正确的调用顺序是：先 abort 旧 controller，再创建新 controller，再把新的 signal 传进搜索。
+
+```ts
+let currentAbortController: AbortController | undefined;
+
+async function updateResults(query: string) {
+  currentAbortController?.abort();
+  const controller = new AbortController();
+  currentAbortController = controller;
+
+  try {
+    for await (const hit of search.search(query, { limit: 10, signal: controller.signal })) {
+      render(hit);
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+  }
+}
+```
+
+这段代码有四个状态变化：旧请求收到取消信号；当前 controller 被替换；新结果逐个渲染；只有 AbortError 被视为正常切换，坏 JSON、数据库断开和权限错误仍然向上传播。`for await` 结束后，调用方应避免让旧请求继续更新 UI，实际应用通常还要比较 query generation。
+
+Debounce 是 UI 责任，不在接口里强行实现。可以在输入 150ms 后再调用 `updateResults`，也可以立即调用并依赖取消。后端只需要保证：观察到 signal 后尽快停止读取，并且不要把取消当成“没有命中”。
+
+### Default implementations：扫描路径
+
+扫描实现接收 session-like readable，并将它投影成 `SessionSearchCandidate`：
+
+```ts
+export interface SessionSearchCandidate {
+  readonly entryId: string;
+  readonly seq: number;
+  readonly type: Entry["type"];
+  readonly timestamp: number;
+  readonly text: string;
+  readonly fields?: Record<string, unknown>;
+}
+
+export interface ScanningSessionSearchHit extends SessionSearchHit {
+  readonly timestamp: number;
+  readonly snippet: string;
+}
+```
+
+candidate 是内部匹配输入，不是最终 API。`seq` 用来保持 canonical 顺序，`type` 用来执行 `entryTypes`，`text` 是可搜索投影，`fields` 允许后端暴露标题、label 等额外字段。扫描器完成匹配后才生成 hit，并可以截断 text 成 snippet。
+
+```ts
+const search = createScanningSessionSearch(sessions);
+
+for await (const hit of search.search("authentication", { limit: 10 })) {
+  const session = sessionsById.get(hit.sessionId)!;
+  const entry = await session.getEntry(hit.entryId);
+  console.log(entry);
+}
+```
+
+上例把“搜索定位”和“读取详情”分开。`!` 只是告诉 TypeScript 作者确信 map 中存在 session，并不是运行时校验；生产代码应处理 session 被删除或权限变化的情况。搜索结果只含定位信息，读取完整 entry 可能失败，这两个错误要分别记录。
+
+JSONL 不需要另造一套公开 search interface。它可以使用只读 metadata/list/load helper，加载 storage 后复用扫描器：
+
+```ts
+async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, query: JsonlSessionListOptions = {}) {
+  for (const metadata of await listJsonlSessionMetadata(jsonl, query)) {
+    yield loadJsonlSessionStorage(jsonl, metadata);
+  }
+}
+
+const search = createScanningSessionSearch((query) => jsonlReadables(jsonl, query));
+```
+
+重要的并发边界是：不要对 Harness 已经拥有的 session 调用可能获取 writer lease 的 `SessionRepo.open()`。搜索是读操作，却可能因为错误的 open helper 与运行中的写操作竞争租约。已经打开的 session/storage 可以直接扫描；JSONL 应走只读加载。
+
+### SQLite FTS：索引与 canonical 数据
+
+SQLite 搜索扩展基础 hit：
+
+```ts
+export interface SqliteSessionSearchHit extends SessionSearchHit {
+  readonly metadata: SqliteSessionMetadata;
+  readonly timestamp: number;
+  readonly score: number;
+}
+```
+
+```ts
+const search = createSqliteSessionSearch({ env, sqlite, databasePath });
+
+for await (const hit of search.search("auth", {
+  entryTypes: ["message", "compaction"],
+  limit: 20,
+})) {
+  console.log(hit.sessionId, hit.entryId, hit.score);
+}
+```
+
+非空查询第一次运行时，FTS table 和 triggers 可以惰性创建。创建时先从 canonical `entries` 一次性 rebuild；以后 canonical entry 的 insert、delete 和 payload update 由 trigger 同步。于是 commit 后的 entry 可以立即被搜索，但 trigger 失败可能让同一个 SQLite transaction 回滚 canonical 写入。不要把 FTS 当成“只读旁路所以永远不会影响写入”的保证。
+
+空白 query 不应触发建表或全库扫描。`score` 的排序含义由 SQLite FTS 实现决定，不应在共享接口里声称它与 Elasticsearch score、余弦相似度或另一个数据库可比较。
+
+### Indexed backends：Elasticsearch 示例
+
+索引是 derived state，不是 session 的事实来源。应用可以从 JSONL 投影 entry，使用 upsert/delete feed 写 Elasticsearch，再 refresh 后查询；如果索引损坏，可以重试、rebuild 或标记 stale，而不能反过来用索引覆盖 canonical session。
+
+```ts
+interface SearchIndexWriter<TItem> {
+  apply(items: TItem[]): Promise<void>;
+  flush?(): Promise<void>;
+}
+
+type ElasticSessionFeedItem =
+  | { type: "upsert"; id: string; body: ElasticSessionDoc }
+  | { type: "delete"; id: string };
+
+interface ElasticSessionDoc {
+  sessionId: string;
+  entryId: string;
+  seq: number;
+  timestamp: number;
+  cwd: string;
+  text: string;
+  metadata: JsonlSessionMetadata;
+  fields?: Record<string, unknown>;
+}
+```
+
+`apply` 必须对同一 entry 使用稳定 document id；重复 upsert 应覆盖同一文档，delete 应可重复执行。bulk 返回错误时不能假装 feed 成功。`flush` 解决“写入成功但搜索副本尚未可见”的 refresh gap；它不是 transaction commit。
+
+查询时应检查 `_source` 是否存在，尊重 limit，在每个 yield 前检查 cancellation，并保留 session/entry identity。远程索引返回的 snippet 是展示数据，详情仍应从 session 读取并验证 entry 是否存在。
+
+### 正确性、排序与失败边界
+
+扫描 source 不应产生重复 `sessionId`；基础身份是 `(sessionId, entryId)`，重复 session id 会让调用者无法判断命中属于哪个 storage。索引后端通常在自己的唯一约束中保证这个身份。跨 session 排序应明确规则：canonical `seq` 只能在单个 session 内比较，不能拿来替代全局时间排序。
+
+搜索失败矩阵：
+
+| 场景 | 正确处理 |
+| --- | --- |
+| query 为空 | 返回空迭代或按后端约定拒绝，不触发全量 rebuild |
+| signal 已取消 | 尽早停止，向 UI 报 AbortError/取消，不写 session |
+| JSONL 损坏 | 报告文件和行号，不能跳过后声称结果完整 |
+| session 被删除 | 命中后读取详情失败，显示 stale hit 并可重建索引 |
+| SQLite trigger 失败 | 让写 transaction 失败，检查 canonical 数据是否回滚 |
+| Elastic bulk 失败 | 保留未成功 feed，重试或标记 stale |
+| 重复 sessionId | fail fast，避免生成不稳定身份 |
+
+Search opt-in 仍需要同步层。一个 no-op-by-default 的 `NOOP_SEARCH_INDEX_SINK` 可以让 canonical write sites 无条件发 indexing event；搜索未启用时 sink 丢弃，启用时再消费。这样主写入路径不需要到处写 `if searchEnabled`。
+
+> 译者注：搜索“结果正确”不等于“索引永远新鲜”。Session 是 canonical，索引是可重建投影；这和 Telemetry 的旁路属性类似，但 SQLite trigger 与 canonical write 共用 transaction 时例外，需要把回滚影响写进故障模型。
+
+### Go 与 Java 对照
+
+| 语义 | TypeScript/Pi | Go | Java |
+| --- | --- | --- | --- |
+| 结果流 | `AsyncIterable<T>` | channel 或 callback iterator | `Iterator`/`Flow.Publisher` |
+| 取消 | `AbortSignal` | `context.Context` | cancellation token/interrupt |
+| 稳定身份 | `sessionId + entryId` | struct 字段 | record 字段 |
+| 读写边界 | read-only storage vs writer lease | interface 分离 | read service vs writer service |
+| 索引刷新 | `flush()` | `Flush(ctx)` | `CompletableFuture` 或同步 flush |
+
+Java/Go 实现都不应把全文搜索直接放进 Agent Loop。Loop 如果需要知识检索，可以调用一个只读搜索 Tool；Session Search 本身仍是基础设施，负责查询和定位，不决定模型下一步行为。
+
+### 动手实验
+
+1. 准备两个内存 session：在不同 entry 中写入 `authentication`，记录每个 hit 的两个 id。
+2. 用 `limit: 1` 验证后端最多返回一条，而不是恰好一条。
+3. 连续输入两个 query，调用旧 controller 的 `abort()`，确认旧结果不再更新 UI。
+4. 构造重复 `sessionId` source，确认 scanner fail fast。
+5. 在 SQLite 中先搜索一次触发 FTS 初始化，再插入 entry，验证 trigger 是否使新内容可见。
+6. 模拟 Elastic bulk 失败，保留 feed 并执行 rebuild，而不是修改 canonical JSONL。
+
+观察点：query、index projection、canonical entry 和 UI state 是四种不同数据。思考：如果搜索结果只保存 snippet、不保存 entryId，用户点击结果后如何安全读取原文？
+
+### 小结
+
+Session Search 提供稳定身份和可取消的异步结果流；扫描器适合小型或已有 storage，SQLite FTS 和 Elasticsearch 适合索引查询。无论后端是什么，session canonical data、索引 derived data 和 UI 展示都必须分开。
 
 ## 章节对照
 

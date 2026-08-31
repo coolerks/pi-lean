@@ -5,10 +5,273 @@ description: "从 HTTP response body 和 SSE 行解析理解增量输出。"
 
 # Go 02：Streaming
 
-`HTTPModel.Stream` 用 `http.NewRequestWithContext`、`bufio.Scanner` 和 `io.Reader` 消费 `data:` 行；`delta` 是 Provider 的增量文本，不是完整 assistant message。收到 `[DONE]` 后才结束正常流。
+## 本阶段完成什么
 
-## 实验
+本阶段在 Go 01 的 HTTP 请求上打开 `stream: true`，逐行读取 Server-Sent Events（SSE），把多个文本 `delta` 拼成最终 assistant content，并把每个 delta 及时交给 callback。
 
-用 `httptest.Server` 将 JSON 分成多次 `Write`，测试断行、空 delta、未知事件、坏 JSON、HTTP 429/500 和 `context.Cancel`。检查 callback 顺序与最终拼接文本；不要把“网络 chunk”误当作“语义事件”。
+完成后你要能区分三件容易混淆的事：
 
-对应源码：`examples/go-agent/internal/agent/model.go` 的 `HTTPModel.Stream`、`StreamingModel`。
+1. 网络层的 TCP/HTTP chunk：可能在任意位置断开。
+2. SSE 的 `data:` event：由空行分隔，通常是一行 JSON。
+3. Provider 的语义 delta：这次响应新增的一小段文本或 Tool Call 参数。
+
+## 本阶段不完成什么
+
+这里不把 stream 直接接入 AgentLoop，也不在 delta 到达时执行 Tool。SSE 只产生一个最终 `Response` 和可选的 UI callback；Tool 仍然要等到完整响应和参数拼接后，再由后续 Loop 阶段验证。
+
+## 前置知识
+
+先完成 Go 01，理解 `http.NewRequestWithContext`、response body 和 JSON decoder。还要知道 `io.Reader` 是“从流中读取字节”的接口，`bufio.Scanner` 可以把 reader 切成行，但不会自动理解 JSON 或 SSE。
+
+## Provider 返回的 SSE
+
+当前示例使用 OpenAI-compatible 形状：
+
+```text
+data: {"choices":[{"delta":{"content":"hel"}}]}
+
+data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+空行是 SSE event 的边界。`data:` 后面是 JSON 文本；`[DONE]` 是协议哨兵，不是 JSON 对象，也不是 assistant 内容。
+
+一个网络写入可能刚好包含半行，也可能一次包含多行。正确代码只相信 Scanner 返回的完整行，不依赖 server 的 `Write` 次数。
+
+## StreamingModel 接口
+
+项目把流式能力作为可选接口：
+
+```go
+type StreamingModel interface {
+    Stream(context.Context, Request, func(string)) (Response, error)
+}
+```
+
+`AgentLoop` 只依赖 `Model.Complete`，因此可以在测试中先使用非流式模型。实现 `StreamingModel` 的对象同时实现 `HTTPModel`，但这两个接口表达不同能力：一个返回最终 response，一个还可以在过程中发送 delta。
+
+## 最小实现
+
+下面是当前 `HTTPModel.Stream` 的核心控制流，省略与 `Complete` 相同的 `payload`、header 和错误 body helper：
+
+```go
+func (m *HTTPModel) Stream(
+    ctx context.Context,
+    request Request,
+    onDelta func(string),
+) (Response, error) {
+    body, err := json.Marshal(m.payload(request, true))
+    if err != nil {
+        return Response{}, err
+    }
+    req, err := http.NewRequestWithContext(
+        ctx, http.MethodPost, m.URL, bytes.NewReader(body),
+    )
+    if err != nil {
+        return Response{}, err
+    }
+    m.addHeaders(req)
+
+    client := m.Client
+    if client == nil {
+        client = http.DefaultClient
+    }
+    response, err := client.Do(req)
+    if err != nil {
+        return Response{}, err
+    }
+    defer response.Body.Close()
+    if response.StatusCode < 200 || response.StatusCode >= 300 {
+        return Response{}, fmt.Errorf("stream request failed: %s", response.Status)
+    }
+
+    var content strings.Builder
+    var toolCalls []ToolCall
+    scanner := bufio.NewScanner(response.Body)
+    scanner.Buffer(make([]byte, 1024), 4<<20)
+    finishReason := "stop"
+    for scanner.Scan() {
+        line := scanner.Text()
+        if line == "" || !strings.HasPrefix(line, "data:") {
+            continue
+        }
+        data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+        if data == "[DONE]" {
+            break
+        }
+        var chunk chatChunk
+        if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+            return Response{}, fmt.Errorf("decode SSE data: %w", err)
+        }
+        if len(chunk.Choices) == 0 {
+            continue
+        }
+        choice := chunk.Choices[0]
+        if choice.Delta.Content != "" {
+            content.WriteString(choice.Delta.Content)
+            if onDelta != nil {
+                onDelta(choice.Delta.Content)
+            }
+        }
+        if choice.FinishReason != "" {
+            finishReason = choice.FinishReason
+        }
+        // Tool-call fragments are accumulated by call.Index.
+        for _, call := range choice.Delta.ToolCalls {
+            for len(toolCalls) <= call.Index {
+                toolCalls = append(toolCalls, ToolCall{})
+            }
+            toolCalls[call.Index].ID = firstNonEmpty(toolCalls[call.Index].ID, call.ID)
+            toolCalls[call.Index].Name = firstNonEmpty(toolCalls[call.Index].Name, call.Function.Name)
+            toolCalls[call.Index].Arguments = append(
+                toolCalls[call.Index].Arguments,
+                []byte(call.Function.Arguments)...,
+            )
+        }
+    }
+    if err := scanner.Err(); err != nil {
+        return Response{}, fmt.Errorf("read SSE stream: %w", err)
+    }
+    return Response{
+        Message: Message{Role: RoleAssistant, Content: content.String(), ToolCalls: toolCalls},
+        StopReason: finishReason,
+    }, nil
+}
+```
+
+### 这段代码改变了什么
+
+- `payload(request, true)` 让 provider 知道要流式返回。
+- `Scanner` 默认单行上限较小，因此当前代码显式设置 4 MiB；超长的一行会让 `scanner.Err()` 返回 `token too long`。
+- `content.WriteString` 保存完整文本；callback 只用于实时展示，不能作为唯一持久化来源。
+- Tool Call 的 name、id、arguments 可能分散在多个 delta；代码根据 `call.Index` 合并，不能只取第一块。
+- 空 `choices` 被跳过，因为一些 provider 会发只包含 usage 或 metadata 的 chunk。
+- `scanner.Err()` 非空时不能返回看似完整的 assistant。断流可能发生在参数中间。
+
+## 失败 trace
+
+### 坏 JSON
+
+```text
+data: {"choices":[...]
+ -> json.Unmarshal
+ -> decode SSE data: unexpected end of JSON input
+ -> 返回 error，不执行 Tool
+```
+
+### 连接在半个参数后断开
+
+```text
+data: tool arguments = "{\"path\":
+ -> scanner.Read
+ -> EOF 或 scanner.Err
+ -> Response 不应冒充完整 Tool Call
+```
+
+当前教学实现只在 Scanner error 时失败；生产 adapter 还应记录是否见到 `[DONE]`，把“正常结束”和“EOF 但没有 DONE”区分开。
+
+### callback panic
+
+`Stream` 不负责恢复调用方 callback 的 panic。UI callback 应该轻量、同步完成；如果要把数据送到另一个 goroutine，应由上层负责 channel 生命周期和 backpressure。
+
+## 工具调用 delta 的例子
+
+一次 Tool Call 可能是：
+
+```text
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\\"pa"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\"a.md\\"}"}}]}}]}
+data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}
+```
+
+最终的 arguments 才是 JSON `{"path":"a.md"}`。在参数完整前调用 `json.Unmarshal` 会失败；在参数完整后还要进入 Tool schema gate，不能因为 JSON 可解析就直接执行。
+
+## 测试设计
+
+`model_test.go` 的 `TestHTTPModelCompleteAndStream` 使用 `httptest.NewServer`，handler 分两次写文本 delta，再写 `[DONE]`。测试断言：
+
+1. callback 收到 `hello`，顺序没有变化。
+2. Response content 也是 `hello`。
+3. finish reason 是 `stop`。
+4. 请求带 `stream: true` 和 Bearer header。
+
+建议继续增加这些测试：
+
+| 情况 | 断言 |
+| --- | --- |
+| 空行和非 `data:` 行 | 被忽略，不影响 content |
+| 空 choices | 不 panic，不产生空 Tool |
+| 坏 JSON | 返回 `decode SSE data` |
+| 过长行 | 返回 Scanner 错误 |
+| 429/500 | 在解码前返回 status error |
+| Context cancel | `client.Do` 或 Scanner 返回取消错误 |
+| 多个 Tool Call index | 各自合并，不能串参数 |
+| 没有 `[DONE]` | 生产实现应标记为 incomplete |
+
+## 运行方式
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run TestHTTPModelCompleteAndStream
+go test ./... -run TestHTTPModel
+go vet ./...
+```
+
+如果只想观察 callback，可以在测试中用 `strings.Builder`；不要在 demo 中使用真实 provider 来验证 SSE 格式，因为 provider 可能改变事件字段。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/ai/src/utils/event-stream.ts` 的 `EventStream`/`AssistantMessageEventStream` 提供可中止的事件流抽象。
+- `packages/ai/src/types.ts` 的 `AssistantMessageEvent` 比这里的 `func(string)` 更丰富，能表达 start、text delta、tool-call delta、done 和 error。
+- `packages/ai/src/api/openai-completions.ts`、`anthropic-messages.ts` 和 Google adapter 各自处理 provider 的 stream 差异。
+- `packages/agent/src/agent-loop.ts` 消费 settled assistant message，不应在任意 text delta 到达时执行副作用。
+
+Go 示例故意只保留最小 callback；Pi 的 event stream 还需要处理 thinking、usage、tool call 参数和 provider-specific metadata。
+
+## Java 对照
+
+| Go | Java 21 | 说明 |
+| --- | --- | --- |
+| `bufio.Scanner` | `BufferedReader.lines()` | 按行消费 |
+| `strings.Builder` | `StringBuilder` | 拼接 delta |
+| callback | `Flow.Subscriber`/Listener | 实时通知 |
+| `context.Context` | `HttpRequest` timeout + cancellation | 取消意图 |
+
+Java `Flow` 有正式的 backpressure 协议；Go callback 没有内建 backpressure。若 callback 太慢，Go 读取循环会阻塞，这可能是可接受的简单策略，但要在生产中明确。
+
+## 实验：构造一个断流服务器
+
+### 目标
+
+观察正常 SSE、坏 JSON 和没有 `[DONE]` 时，最终 Response 是否可信。
+
+### 准备
+
+打开 `model_test.go`，复制 `httptest.NewServer`；把 handler 的第二次写入改成半个 JSON，然后关闭连接。
+
+### 步骤
+
+1. 先运行正常测试，记录 callback 和 Response。
+2. 删除 `[DONE]`，记录当前实现的行为。
+3. 写入 `data: {broken`，确认 `json.Unmarshal` 错误。
+4. 让 handler 延迟写入，使用 `context.WithTimeout` 取消请求。
+5. 增加一个 index=1 的 Tool Call，确认不会覆盖 index=0。
+
+### 观察点
+
+HTTP chunk 断点不等于 SSE event 边界；一个 delta 也不等于完整 Message。只有 adapter 收集到可解析的最终结构，Loop 才能继续。
+
+### 预期结果
+
+正常流得到 `hello`；坏 JSON 返回 error；取消不会调用后续 Tool。
+
+### 思考题
+
+如果 callback 已经把 `hello` 显示给用户，随后 stream 断开，UI 应该显示什么状态？如果模型返回了半个文件路径，为什么安全策略必须在完整参数之后再次检查？
+
+## 小结与下一阶段
+
+Go 02 建立了“实时展示”和“最终事实”两条路径：delta 可以立即显示，但最终 Response 才能进入 Loop。下一阶段实现 `ToolDefinition` 和 Registry，把模型输出的结构化数据挡在真正的 `Execute` 副作用之前。

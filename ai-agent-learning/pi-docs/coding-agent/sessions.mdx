@@ -35,6 +35,70 @@ Pi 把对话保存成 Session，因此可以继续工作、从旧 turn 分支，
 
 > 译者注：Session 是持久化结构，Context 是某一次请求的投影。Go/Java 实现不能只维护一个可变 `List<Message>`：至少要保存 parent/leaf、配置变化、摘要和恢复错误；Go 可用 JSONL + struct，Java 可用 Jackson + record，并为 branch 与 corrupted file 写测试。
 
+### Session 文件与工作目录
+
+Pi 按工作目录组织 Session，因此同一台机器上不同仓库的 `/resume` 列表通常不同。默认路径是 `~/.pi/agent/sessions/` 下按 cwd 派生的目录；`--session` 可以指定绝对路径、完整 id 或部分 id。`--no-session` 不是“清空已有 session”，而是让这次运行不保存。
+
+启动参数与交互命令的分工如下：
+
+| 入口 | 作用 | 是否创建新文件 |
+| --- | --- | --- |
+| `pi -c` | 继续最近 Session | 否，打开已有文件 |
+| `pi -r` / `/resume` | 搜索并选择已有 Session | 否 |
+| `--session` + `path|id` | 指定一个 Session | 视文件是否存在 |
+| `/new` | 在交互中开始新 Session | 是 |
+| `--fork` / `/fork` | 从旧路径建立独立 Session | 是 |
+| `--no-session` | 临时运行 | 否 |
+
+> 译者注：Session 是持久化模型，不是一次请求的 Context。Context 是从当前 leaf、历史 entry、compaction 和配置投影出的输入；Session 必须保留足够信息让下一次进程重建这个投影。Go/Java 教学实现至少要测试 JSONL 损坏、cwd 隔离和重复恢复。
+
+### JSONL 树的读取方式
+
+Session 文件不是简单的 `List<Message>`。每条 entry 有 `id` 和 `parentId`，当前 leaf 指向下一轮对话的父节点。向前导航时，程序从 leaf 沿 parent chain 回溯；分支只追加新 entry，不覆盖另一条路径。model change、thinking-level change、label、compaction、branch summary 和 extension entry 也属于树的一部分或其元数据。
+
+例如：
+
+```text
+user A (id=a)
+└─ assistant A (id=b)
+   ├─ user B (id=c) └─ assistant B (id=d)
+   └─ user C (id=e) └─ assistant C (id=f)
+```
+
+如果 leaf 从 `d` 移到 `b`，下一条 user message 会创建从 `b` 出发的新分支，而不是修改 `c` 或 `d`。这就是为什么 `/tree` 可以在同一文件中比较方案。导出或构建 context 时必须选择 branch path，不能把所有 sibling 都发送给模型。
+
+### 恢复、重命名和删除
+
+`/resume` 的搜索只改变选择器状态；确认后才打开文件。`Ctrl+P` 显示/隐藏路径，`Ctrl+S` 改变排序，`Ctrl+N` 过滤 named session，`Ctrl+R` 重命名，`Ctrl+D` 删除并确认。`trash` CLI 可用时，删除优先移入回收站，避免误删；没有它时才按平台实现永久删除。
+
+`/name` 写入人类可读 display name，不改变 session id 或 branch identity。启动时 `--name`/`-n` 可以在第一次响应前设置名字。名称会影响 picker 的检索和展示，不会自动进入模型 system prompt。
+
+> 译者注：删除 Session 与清理模型上下文不是同一件事。删除是文件生命周期操作，`/compact` 是 Context 投影操作，`/tree` 是 leaf 导航操作，`/fork`/`/clone` 是文件复制操作；它们产生的恢复和安全后果不同。
+
+### `/tree`、`/fork` 与 `/clone` 的选择
+
+用 `/tree` 是在同一文件内移动 leaf，适合保留多个尝试并比较；用 `/fork` 从选定 user message 创建新文件，适合把一个方向交给独立任务；用 `/clone` 复制当前活动 branch，适合在高风险修改前留一个工作副本。三者都不会把旧 branch 的 sibling 自动加入当前 prompt。
+
+切换 branch 时可生成 branch summary。summary 不是完整 transcript，它只保留被放弃路径中的决策背景，再挂到新的位置。若信息不可丢失，应把它写入 Session entry 或文件，而不是只依赖 summary 的自然语言压缩。
+
+### Session、Context 与外部副作用
+
+恢复 Session 能恢复“模型看到的历史和配置”，不一定能恢复已发生的外部副作用。比如前一次运行已经执行 `git push`，Session 只有 tool result 文本；重新运行不能凭文本判断远程仓库是否成功更新。成熟 Harness 需要 operation intent、结果记录和幂等键，这也是 Pi 的普通 coding-agent Session 与 durable Harness 设计之间的边界。
+
+### 可执行实验
+
+1. 在临时目录运行 `pi --name demo -p "hello"`，用 `/session` 记录文件路径、id 和计数。
+2. 对同一 user message 分别尝试两种回答，再用 `/tree` 在两个 leaf 间切换。
+3. 从旧消息使用 `/fork`，比较新旧文件、active branch 和名称。
+4. 用 `/clone` 复制当前 branch，再在副本中追加消息，确认原文件不变。
+5. 用 `/compact` 后检查 Session entry 类型；不要只比较最终文本。
+6. 在测试中写入坏 JSONL 行，断言错误包含行号；再测试缺少 parent 的数据。
+7. 测试 `/resume` 搜索、命名过滤、排序和删除确认，记录 `trash` 是否存在。
+
+观察点包括 path 解析、entry parent、leaf 移动、文件创建、summary 插入和恢复后的 context。预期是每个操作都可解释：你能说出它改变的是文件、树位置、Context 还是显示元数据。
+
+> 译者注：Java `record` 适合表示不可变 entry，Go struct + JSON tags 适合读取 JSONL；但两者都需要单独的 tree reducer。不要在 `LoadSession` 时把所有 branch 平铺后再让模型自行猜当前路径。
+
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

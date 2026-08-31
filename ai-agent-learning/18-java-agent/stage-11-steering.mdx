@@ -1,12 +1,138 @@
 ---
 title: "Java 11：Steering 与 Follow-up"
-description: "用线程安全队列在 turn 边界改变运行中的要求。"
+description: "队列、turn boundary、abort 和 nextRun 的并发语义。"
 ---
 
 # Java 11：Steering 与 Follow-up
 
-`Agent.steer`/`followUp` 在运行中入队，`QueueSource` 在边界排空；`abort` 清掉当前 run 的队列；`nextRun` 保存到下一次 prompt。同步块只保护队列和状态，不能在锁内等待模型。
+## 1. 学习目标与边界
 
-## 实验
+本阶段目标：队列、turn boundary、abort 和 nextRun 的并发语义。完成后，你要能从代码和测试两边解释 `Agent、QueueSource、steer、followUp、nextRun、abort` 的输入、输出、状态变化和失败语义。
 
-模型延迟时从另一个线程 steer，验证下一次 request 获得消息；再 abort，验证 steering/follow-up 不会在取消后执行。
+本阶段只修改 Java 示例，不把 Pi 的设计稿当成已经实现的代码。当前实现使用同步 `AgentLoop`、`ExecutorService` 和 `Future`；这里不虚构 `CompletableFuture` 已经存在。生产系统还需要 durable operation records、崩溃恢复和真实 sandbox。
+
+## 2. 前置 Java 知识
+
+需要掌握 `record` 的不可变值语义、`interface` 的能力边界、泛型集合、checked exception，以及 synchronized/volatile 的基本内存可见性。`ExecutorService` 提交任务后返回 `Future`；`Future.cancel(true)` 只是发送中断请求，不等于远端 HTTP 一定停止。
+
+## 3. 上一阶段输入与本阶段新增代码
+
+上一阶段产物通过 `Go mutex/channel` 的对应概念进入本阶段。本阶段主要阅读：`src/main/java/learning/agent/Agent、QueueSource、steer、followUp、nextRun、abort.java`（若符号属于组合类，则从 `AgentLoop.java` 或 `Harness.java` 进入），以及 `src/test/java/learning/agent/AgentTest.java`。
+
+新增/观察边界：Agent、QueueSource、steer、followUp、nextRun、abort。先画对象关系，再运行测试；不要先把所有类合并成一个 God object。
+
+## 4. 先看一个失败 trace
+
+```text
+输入进入 Java 对象
+ -> 边界没有校验或没有保存中间状态
+ -> provider/tool/文件操作失败
+ -> 如果吞掉异常，调用方会误以为成功
+ -> 下一轮收到错误或重复副作用
+```
+
+这个 trace 的教学重点是：错误必须在发生的边界被标记；成功消息、控制信号和诊断事件不是同一个值。
+
+## 5. 当前实现的最小代码
+
+```java
+agent.steer("不要修改数据库代码");
+agent.followUp("完成后给出测试命令");
+agent.nextRun("下一次先检查依赖");
+```
+
+代码块的输入是上一阶段的不可变对象和本阶段的策略；输出是 `Response`、事件、文件记录或异常。状态变化必须发生在明确的 owner 中：队列由 `Agent` 保护，循环由 `AgentLoop` 驱动，文件由 `Session` 写入。不要在 UI 或测试里偷偷执行副作用。
+
+逐行检查：第一行创建/读取边界对象；中间代码调用当前阶段能力；最后一行把结果交给上层。代码中的真实 API 名称不翻译，因为它们必须和编译器、Pi 源码及测试一致。
+
+## 6. 逐字段与逐步骤解释
+
+1. `Message.role` 区分 system/user/assistant/tool；role 错了，provider 可能把工具结果当用户输入。
+2. `content` 是展示文本，不等于结构化 tool call；调用 id 必须保持配对。
+3. `Request.messages` 是本次上下文快照；`tools` 是模型可见定义，不是已执行动作。
+4. `ToolResult.isError` 是工具结果状态，不能改写成 assistant 的成功回答。
+5. `step`、`attempt` 或 line number 让测试能定位循环边界和坏数据。
+6. `CancellationToken` 只表达取消意图，真正的 Model/Tool 必须主动检查。
+7. `Session` 的 snapshot 是副本，避免调用方修改内部列表。
+8. `Telemetry` 只观察，不应决定业务状态。
+
+## 7. 异常、取消与线程语义
+
+模型 timeout、429、5xx 和坏 JSON 属于 provider 边界错误；Tool 参数错误和 unknown tool 属于 registry 边界；文件坏行属于 storage 边界。每类错误都要保留上下文，但不要把 API key 写入异常。
+
+取消时先检查 token，再检查线程 interruption；catch `CancellationException` 后继续向上抛，不能当作普通 Tool Result。重试只对明确可重试的模型请求做有限次数；写文件、发消息等副作用不能因为重试而盲目重复。
+
+并行工具用 `ExecutorService`，Future 收集时按原始 tool call 顺序写回消息，即使完成顺序不同。不要在 synchronized 块内等待网络或 Future，否则 `steer`/`abort` 会被锁住。
+
+## 8. 测试设计：先写可证明的断言
+
+测试全部使用 `ScriptedModel`、localhost fake server 或临时目录，不使用真实收费 API。
+
+| 场景 | 测试断言 |
+| --- | --- |
+| 正常路径 | 输出、状态和下一轮输入明确 |
+| 缺字段/坏 JSON | 在正确边界抛出错误，副作用未发生 |
+| unknown tool | registry 不调用 execute |
+| 多次调用 | id、source order 和结果配对保持不变 |
+| cancellation | Future/token 后不隐藏取消异常 |
+| 重启/恢复 | 临时文件替换后 snapshot 一致 |
+| 失败重试 | attempts 有上限，错误不无限循环 |
+
+推荐先运行已有 `AgentTest`，再为本阶段增加一个最小测试。测试命名要说明行为，不要命名成 `works`。
+
+## 9. Maven 命令与预期输出
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest test
+mvn test
+```
+
+成功时命令返回 exit code 0；Maven 的 `-q` 可能没有详细 stdout，这不代表测试没有运行。若测试失败，先读第一条 assertion 和 cause，不要只重跑。
+
+## 10. Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。Pi 对应入口是 `packages/agent/src/agent.ts`，核心 symbol 见源码索引。先回答文件为什么存在、谁调用它、它调用谁、输入从哪来、输出去哪，再比较 Java 示例的简化边界。
+
+Pi 的 TypeScript Promise/AsyncIterable 不等于 Java Future；Pi 的 event callback 不等于 durable record；Pi 的 harness scaffold 也不能被 Java demo 冒充。源码事实与设计推断要分开写。
+
+## 11. Go 对照
+
+Go 版对应概念是 `Go mutex/channel`。Go 通过 `context.Context`、显式 interface、channel 或 mutex 表达取消和事件；Java 通过 token、Future、Listener、synchronized 和 ServiceLoader 表达同一边界。语言不同，但 tool call 必须先校验、结果必须可观察、状态必须有 owner。
+
+## 12. 动手实验
+
+### 目标
+
+用本阶段的 `Agent、QueueSource、steer、followUp、nextRun、abort` 做一次可重复实验，证明正常路径和一个失败路径的状态差异。
+
+### 准备
+
+准备 JDK 21、Maven 和临时目录；阅读对应 main/test 源码。不要配置真实 API key，不要让 shell 工具指向 home 目录。
+
+### 步骤
+
+1. 运行针对本阶段的测试并记录 exit code。
+2. 在边界入口加一条临时日志，只打印 type/id/数量，不打印凭据或完整内容。
+3. 使用 `ScriptedModel` 让第一轮返回工具调用，第二轮返回 final；或构造一个确定失败。
+4. 对照异常/事件/JSONL，确认谁修改了状态、谁只是观察。
+5. 删除临时日志，再把可复现断言写入 JUnit。
+
+### 观察点
+
+观察输入对象是否被复制、异常是否被重新抛出、取消是否穿过 Model 和 Tool、并行结果是否保持 source order，以及保存是否发生在明确边界。
+
+### 预期结果
+
+你能画出本阶段的一条调用链，指出每个对象的 owner，复述至少一个失败 trace，并让测试在无网络条件下稳定通过。
+
+### 思考题
+
+1. 如果把错误变成空字符串，下一轮模型还能知道发生了什么吗？
+2. 如果在锁内等待 Future，另一个线程还能 abort 吗？
+3. 如果同一个 operation 重试两次，怎样避免外部副作用重复？
+4. 哪些信息应进入 transcript，哪些只进入 telemetry？
+
+## 13. 小结与下一步
+
+本阶段建立了 `Steering 与 Follow-up` 的可测试边界：数据对象负责表达，运行时负责控制，存储负责恢复，事件负责观察。下一阶段继续沿着 `Request → AgentLoop → Tool/Session → Result` 追踪，不把新增能力堆在一个类里。

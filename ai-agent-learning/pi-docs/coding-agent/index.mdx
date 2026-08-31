@@ -13,31 +13,122 @@ Pi Coding Agent 的入口、定制、编程使用和开发索引。 本页先用
 
 ## 中文译文
 
-Pi 是一个保持核心精简的终端 Coding Agent。它不会把所有能力硬编码到核心，而是通过 TypeScript Extensions、Skills、Prompt Templates、Themes 和 Pi Packages 增加能力。下面的索引说明从安装到扩展、编程集成、平台设置和本地开发的完整路径。
+### 这份索引如何使用
 
-### 快速开始
+Pi 是一个保持核心精简的 terminal coding harness。核心不把所有能力硬编码进去，而是通过 TypeScript Extensions、Skills、Prompt Templates、Themes 和 Pi Packages 增加能力。读者可以把这页当作地图，但真正使用某个功能前仍要打开对应页面；索引中的链接不是 API 契约。
 
-使用 npm 全局安装 `@earendil-works/pi-coding-agent` 时，示例明确加上 `--ignore-scripts`；这会关闭依赖的 lifecycle scripts，而普通 npm 安装不依赖它们。在 Linux 或 macOS 上，也可以使用 `https://pi.dev/install.sh` installer。卸载时要使用实际安装 Pi 的包管理器：npm、pnpm、Yarn 和 Bun 的命令不同。卸载 Pi 不会删除 `~/.pi/agent/` 下的 settings、credentials、sessions 和已安装 packages。
+一次典型使用可以分成：
 
-进入目标项目目录后运行 `pi`。认证有两条路径：启动后执行 `/login` 选择 subscription provider，或在启动前设置例如 `ANTHROPIC_API_KEY` 的 API-key provider。详细的认证、第一次 session 和常见问题见 [快速开始](/pi-docs/coding-agent/quickstart)。
+```text
+安装 pi
+  -> 进入项目目录
+  -> /login 或环境变量认证
+  -> 选择 model
+  -> Agent Loop 调用 tools
+  -> Session 保存 JSONL
+  -> Extension/Skill/MCP 提供额外能力
+```
 
-### 从哪里开始
+### Quick start：先跑通最小 session
 
-[快速开始](/pi-docs/coding-agent/quickstart) 负责安装和认证；[使用 Pi](/pi-docs/coding-agent/usage) 解释交互模式、斜杠命令、context files 和 CLI；[Providers](/pi-docs/coding-agent/providers) 解释订阅和 API keys；`llama.cpp` 章节解释本地 router。安全、容器化、Settings、Keybindings、Sessions 和 Compaction 分别处理权限边界、隔离、配置、快捷键、会话树和上下文压缩。
+npm 安装：
 
-### 定制 Pi
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
 
-Extensions 是宿主内的 TypeScript 模块，可以增加 tools、commands、events 和自定义 UI。Skills 是按需加载的能力说明；Prompt Templates 是可由斜杠命令展开的重复提示；Themes 改变终端显示；Pi Packages 将这些资源打包分发。Models 和 Custom Providers 则分别扩展模型定义与 API/OAuth 适配。它们的权限、加载范围和生命周期不同，不能把 Skill、Extension 和 MCP 当成同一种插件。
+`--ignore-scripts` 关闭 dependency lifecycle scripts；普通 npm 安装不依赖 install scripts。Linux/macOS 也可以使用：
 
-### 编程使用
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+```
 
-SDK 让 Node.js 程序直接嵌入 Pi；RPC Mode 通过 stdin/stdout 的 JSONL 控制进程；JSON Event Stream Mode 输出机器可消费的结构化事件；TUI Components 提供 Extension 自定义终端 UI 的组件接口。RPC 是控制 Pi Agent 的协议，不能因为两者都使用 JSON 就把它和 MCP 混为一谈。
+卸载必须匹配安装器：
 
-### Reference、平台与开发
+```bash
+npm uninstall -g @earendil-works/pi-coding-agent
+pnpm remove -g @earendil-works/pi-coding-agent
+yarn global remove @earendil-works/pi-coding-agent
+bun uninstall -g @earendil-works/pi-coding-agent
+```
 
-Environment Variables 说明 Pi 进程配置以及 Bash Tool 可见的 session metadata；Session Format 说明 JSONL entries 和 `SessionManager` API。Windows、Termux、tmux、Terminal Setup 和 Shell Aliases 解决不同运行环境的终端边界。Development 章节最后说明本地 setup、项目结构、路径解析、调试命令和测试方式。
+进入项目目录后运行：
 
-> 译者注：这个索引把 Pi 分成“运行核心”和“资源/扩展表面”。在 Java 中可以把 SDK/RPC 看成宿主 API，把 Extension loader 看成 SPI；在 Go 中则通常由显式 registry 和进程协议承担同样的边界。
+```bash
+pi
+```
+
+`/login` 用于 subscription provider；API-key provider 可以在启动前设置 `ANTHROPIC_API_KEY` 等变量。卸载 package 不等于删除 `~/.pi/agent/` 的 credentials、sessions、settings 和 packages；删除前要先备份或确认 scope。
+
+初学者的检查顺序：先 `pi --help`，再在无敏感文件的临时目录启动，确认 `/login` 或 fake endpoint，最后才把它连接到真实仓库。不要把“能看到 prompt”误解为 Tool 已经执行；文件和 shell 仍受 runtime permission 影响。
+
+### Start here：按任务选入口
+
+- **Quickstart**：安装、认证、第一次 session。适合第一次运行。
+- **Using Pi**：interactive mode、slash commands、context files 与 CLI 参数。适合已经启动但不知道命令的人。
+- **Providers**：subscription、API key、auth file 与 provider-specific model。适合请求失败或切换模型。
+- **llama.cpp**：本地 router 与 `/llama` model 管理。适合不想把请求发给远端的开发者，但仍需检查本地服务权限。
+- **Security**：project trust、sandbox、漏洞报告。任何启用 shell 的环境都应先读。
+- **Containerization**：Gondolin、Docker、OpenShell 的隔离边界。适合把工具执行移出宿主。
+- **Settings/Keybindings**：配置与 TUI 操作。适合改变交互而不修改核心。
+- **Sessions/Compaction**：session 管理、branch/tree navigation 和 context 压缩。适合长时间工作。
+
+### Customization：不要混淆扩展类型
+
+Extensions 是宿主内 TypeScript module，可以添加 tools、commands、events 和 custom UI；它可以改变 runtime 行为，因而需要审查。Skills 是按需加载的指令、参考资料和脚本，重点是 progressive disclosure；它不天然是一个 RPC endpoint。Prompt Templates 是由 slash command 展开的可复用 prompt；Themes 改变 terminal presentation；Pi Packages 将这些资源打包分发。
+
+Models 只描述 model entry；Custom Providers 还要负责 API/OAuth/streaming adapter。一个 model entry 不能自动使某个 Provider 兼容。Extension、Skill 和 MCP 的区别可以用问题判断：谁执行副作用？谁提供指令？谁跨进程通信？不要把它们都叫 plugin 就跳过安全边界。
+
+### Programmatic usage：三种集成面
+
+- **SDK**：Node.js 程序直接嵌入 Pi，适合同进程控制和自定义宿主。
+- **RPC mode**：通过 stdin/stdout JSONL 控制 Pi，适合外部进程或语言无关集成。
+- **JSON event stream mode**：输出机器可消费的结构化事件，适合脚本和日志管线。
+- **TUI components**：给 Extension 使用的终端 UI 组件，负责展示和输入，不取代 Agent Loop。
+
+RPC 与 MCP 都可能使用 JSON，但职责不同：RPC 控制 Pi 这个 Agent 进程，MCP 让 Client 发现并调用外部 server 的 tools/resources/prompts。看到 JSON-RPC 不代表两者的 method、生命周期和权限模型相同。
+
+### Reference：运行时的事实来源
+
+Environment Variables 解释 Pi process markers、shell tool session metadata 和 runtime configuration；Session Format 解释 JSONL entry types 与 `SessionManager` API。需要调试持久化时先读它们，再结合当前源码。Reference 页面不应被当作“会自动升级的配置”；版本变化后要检查 source commit。
+
+### Platform setup
+
+Windows 页面处理平台差异；Termux 讲 Android shell；tmux 讲多窗格和长期运行；Terminal setup 讲 cursor、OSC 8、truecolor 和键盘协议；Shell aliases 讲将常用参数封装为命令。这些页面解决的是终端/进程环境，不会改变 Provider 的语义。
+
+### Development
+
+Development 页面说明本地 setup、`pi-test.sh`、package 结构、`src/config.ts` 的资源解析、隐藏 `/debug` 和测试命令。源码研究时按 `coding-agent -> agent -> ai` 追调用链；从 TUI 输出倒推模型行为会漏掉 session、provider 和 tool validation。
+
+### 学习路线与常见错误
+
+推荐顺序：
+
+1. Quickstart 在临时项目中完成一次纯聊天。
+2. Usage 与 Providers 解释命令、认证和 model resolution。
+3. Security 与 Containerization 建立 shell/filesystem/network trust boundary。
+4. Extensions、Skills、Prompt Templates 选择扩展方式。
+5. Sessions、Compaction、Session Format 理解恢复和 context。
+6. SDK、RPC、JSON、TUI Components 再做程序化集成。
+7. Development 进入源码、调试和 focused tests。
+
+常见错误包括：把 `pi` 的 config dir 当成项目 cwd；把 API key 写进 settings 或 prompt；把 Skill 全文塞进 system prompt；把 RPC 当 MCP；把 model id 当 Provider id；把 session JSONL 当成只含 `List<Message>` 的平面数组。
+
+> 译者注：这个索引真正区分的是“核心运行控制流”和“资源/集成表面”。Java 可以把 SDK/RPC 类比宿主 API 与 SPI；Go 通常用显式 registry 和 stdin/stdout protocol。两种语言都应在 runtime 层保留 Tool validation、permission、session 和 cancellation，不要把它们藏在字符串 prompt 中。
+
+### 可执行检查表
+
+- [ ] 在临时目录执行 `pi --help`，确认安装入口。
+- [ ] 用 `/login` 或受控环境变量完成认证，不把 key 写入仓库。
+- [ ] 运行一次只读 tool，观察 Tool Call、Tool Result 和 Session entry。
+- [ ] 打开对应的 Security 页面，明确 shell、filesystem、network 和 credential 边界。
+- [ ] 选择 Extension、Skill、MCP 或 Prompt Template 时写出它改变的是哪一层。
+- [ ] 需要嵌入时先比较 SDK、RPC、JSON event stream 和 TUI 的输入输出边界。
+- [ ] 源码行为与文档冲突时，记录当前 commit、file path 和 symbol。
+
+### 小结
+
+Pi 的入口页把安装、使用、定制、编程集成、平台和开发串成路线。它只负责导航，不替每个子系统提供完整规范；使用者应沿链接进入具体页面，并用当前源码验证行为。
 
 ## 章节对照
 

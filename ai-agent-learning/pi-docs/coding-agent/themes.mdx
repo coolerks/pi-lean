@@ -13,76 +13,435 @@ description: "主题位置、创建方式、颜色 token 和终端兼容性。"
 
 ## 中文译文
 
-### 主题从哪里来，如何选择
+### 这篇文档解决什么问题
 
-Theme 是定义 TUI 颜色的 JSON 文件。Pi 会读取内置 `dark`/`light`、全局 `~/.pi/agent/themes/*.json`、受信任项目的 `.pi/themes/*.json`、package 中的 `themes/` 或 `pi.themes`、Settings 的 `themes` 数组，以及可重复的 `--theme <path>`。`--no-themes` 关闭发现。项目 Theme 属于 project-local resource，只有通过 project trust 后才应加载；不要用主题文件绕开信任边界。
+Pi 的 TUI 不把颜色写死在组件里，而是从 JSON theme 文件读取颜色。这样同一套界面可以适配深色终端、浅色终端和个人调色板，而不必修改 `read`、`bash` 或渲染器代码。本页中的 Theme 指显示配置，不是模型能力、Tool 权限或 Session 数据。
 
-可以在 `/settings` 选择主题，也可以在 `settings.json` 写 `{ "theme": "my-theme" }`。首次运行会根据终端背景选择 `dark` 或 `light`。`pi --use-theme light` 只改变本次启动初始主题；`pi --use-theme light/dark` 根据终端外观选择初始值，之后在 `/settings` 选择的主题才会保存。编辑当前自定义主题文件时 Pi 支持 hot reload，适合边改边看，但正在加载的 JSON 仍可能影响 TUI 显示。
+> 译者注：Theme 是“如何显示状态”，不是“状态是什么”。例如 `toolErrorBg` 只能把错误工具结果显示成红色，不能把一个成功的 Tool Result 改成失败，也不能授予模型执行 shell 的权限。
 
-### 创建和格式
+原文开头的建议是“让 pi 为你的设置创建主题”。这句话适合当作入口，但实际使用仍应理解 JSON schema、发现路径和 fallback 规则；让模型生成颜色文件之后，必须由人检查 JSON、对比度和项目来源。
 
-创建 `~/.pi/agent/themes/my-theme.json`，填写唯一且不含 `/` 的 `name`。`vars` 可定义可复用的颜色，`colors` 再用变量名引用；主题必须提供 51 个 required token，`thinkingMax`、`scrollbarThumb`、`searchMatchBg`、`searchMatchText` 的兼容 fallback 按源文档规则处理。`$schema` 只提供编辑器补全和验证，不会替运行时补上错误的颜色。
+### 目录
 
-颜色值有四种：六位十六进制 RGB（例如 `"#ff0000"`）、0–255 的 xterm 256 色索引、`vars` 中的变量名，以及空字符串 `""`（使用终端默认色）。现代终端通常支持 24-bit RGB；旧终端会映射到最接近的 256 色。可以用 `echo $COLORTERM` 检查 `truecolor`/`24bit`。
+- [主题文件位置](#主题文件位置)
+- [选择主题](#选择主题)
+- [创建自定义主题](#创建自定义主题)
+- [主题格式](#主题格式)
+- [颜色 token](#颜色-token)
+- [颜色值](#颜色值)
+- [实践建议](#实践建议)
 
-### 全部颜色 token
+### 主题文件位置
 
-每组 token 的用途如下。名称必须原样填写；中文只解释它影响的 UI 部位。
+Pi 会从以下位置发现主题：
 
-**Core UI（11 个）**
+- **内置主题**：`dark`、`light`。它们不需要额外文件，适合先验证终端链路。
+- **全局主题**：`~/.pi/agent/themes/*.json`。这是个人主题的常用位置，多个项目都可以使用。
+- **项目主题**：`.pi/themes/*.json`。只有项目已被信任后才会加载，避免不可信仓库通过资源文件影响本地环境。
+- **Package 主题**：package 的 `themes/` 目录，或者 `package.json` 中的 `pi.themes` 条目。
+- **Settings 配置**：settings 中的 `themes` 数组可以列出文件或目录。
+- **CLI 参数**：`--theme <path>`，这个参数可以重复使用。
 
-| Token | 中文用途 |
+可以使用 `--no-themes` 关闭主题发现。关闭发现后仍可使用内置行为，但 Pi 不会继续扫描上述全局、项目和 package 位置。
+
+> 译者注：项目主题的“只有信任后加载”是安全边界，不是普通的路径优先级。项目目录中的 JSON 可能来自 Git；发现配置和执行 shell 一样，都不能绕过 project trust。
+
+发现顺序和同名冲突应以当前源码和启动日志为准，不要假设“项目主题一定覆盖全局主题”。如果需要稳定行为，给自定义主题使用唯一的 `name`，并在 settings 或 CLI 中明确选择文件。
+
+### 选择主题
+
+可以在 `/settings` 中选择主题，也可以在 `settings.json` 中保存选择：
+
+```json
+{
+  "theme": "my-theme"
+}
+```
+
+这里的 `my-theme` 应与主题注册后的名称对应，而不是随意写文件名。保存后，之后的交互式运行会继续使用它；编辑当前主题文件时，Pi 支持 hot reload，可以立即观察颜色变化。
+
+第一次运行时，Pi 会检测终端背景，并在 `dark` 与 `light` 之间选择默认主题。这个自动选择只回答“默认使用哪套内置主题”，不会替你设计一套新颜色。
+
+> 译者注：`/settings` 是持久化选择，和 `--use-theme` 的“一次运行初始值”不同。把两者混为一谈会导致你以为 CLI 参数已经改写 settings，实际下一次启动可能仍使用旧选择。
+
+#### 初始主题：`--use-theme`
+
+如果只想为本次 interactive run 指定主题，而不修改保存的设置，可以运行：
+
+```bash
+pi --use-theme light
+```
+
+如果希望根据终端外观在浅色和深色之间选择，使用 `lightTheme/darkTheme` 形式：
+
+```bash
+pi --use-theme light/dark
+```
+
+CLI 值只作为本次运行的 initial theme。用户随后在 `/settings` 中选择其他主题时，新选择会立刻作用于界面，并按正常规则保存。换句话说，`--use-theme` 是启动时的输入，不是永久配置文件的写入操作。
+
+### 创建自定义主题
+
+#### 第一步：创建文件
+
+个人主题可以放在全局目录：
+
+```bash
+mkdir -p ~/.pi/agent/themes
+vim ~/.pi/agent/themes/my-theme.json
+```
+
+项目主题可以放在 `.pi/themes/`，但只有在项目信任后才会发现。目录名和文件名可以按团队约定命名；真正显示在选择器中的身份来自 JSON 的 `name`。
+
+#### 第二步：填写颜色
+
+下面是源文档给出的完整配置骨架。不要翻译 key；`name`、`vars`、`colors` 和每一个颜色 token 都是运行时契约。复制后至少检查 `$schema` URL 是否与当前仓库版本一致、颜色值是否适合目标终端，以及所有 required token 是否存在。
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+  "name": "my-theme",
+  "vars": {
+    "primary": "#00aaff",
+    "secondary": 242
+  },
+  "colors": {
+    "accent": "primary",
+    "border": "primary",
+    "borderAccent": "#00ffff",
+    "borderMuted": "secondary",
+    "success": "#00ff00",
+    "error": "#ff0000",
+    "warning": "#ffff00",
+    "muted": "secondary",
+    "dim": 240,
+    "text": "",
+    "thinkingText": "secondary",
+    "selectedBg": "#2d2d30",
+    "scrollbarThumb": "#555566",
+    "searchMatchBg": "#2d2d30",
+    "searchMatchText": "",
+    "userMessageBg": "#2d2d30",
+    "userMessageText": "",
+    "customMessageBg": "#2d2d30",
+    "customMessageText": "",
+    "customMessageLabel": "primary",
+    "toolPendingBg": "#1e1e2e",
+    "toolSuccessBg": "#1e2e1e",
+    "toolErrorBg": "#2e1e1e",
+    "toolTitle": "primary",
+    "toolOutput": "",
+    "mdHeading": "#ffaa00",
+    "mdLink": "primary",
+    "mdLinkUrl": "secondary",
+    "mdCode": "#00ffff",
+    "mdCodeBlock": "",
+    "mdCodeBlockBorder": "secondary",
+    "mdQuote": "secondary",
+    "mdQuoteBorder": "secondary",
+    "mdHr": "secondary",
+    "mdListBullet": "#00ffff",
+    "toolDiffAdded": "#00ff00",
+    "toolDiffRemoved": "#ff0000",
+    "toolDiffContext": "secondary",
+    "syntaxComment": "secondary",
+    "syntaxKeyword": "primary",
+    "syntaxFunction": "#00aaff",
+    "syntaxVariable": "#ffaa00",
+    "syntaxString": "#00ff00",
+    "syntaxNumber": "#ff00ff",
+    "syntaxType": "#00aaff",
+    "syntaxOperator": "primary",
+    "syntaxPunctuation": "secondary",
+    "thinkingOff": "secondary",
+    "thinkingMinimal": "primary",
+    "thinkingLow": "#00aaff",
+    "thinkingMedium": "#00ffff",
+    "thinkingHigh": "#ff00ff",
+    "thinkingXhigh": "#ff0000",
+    "thinkingMax": "#ff0088",
+    "bashMode": "#ffaa00"
+  }
+}
+```
+
+代码块的输入是一份 JSON 文件；输出不是新的模型响应，而是 TUI 在下一次加载时使用的颜色配置。`vars.primary` 被 `accent`、`border` 等 token 引用；数字 `242` 是 xterm 256-color index；空字符串表示使用终端默认前景色或背景色。JSON 解析失败、缺少 required token、`name` 重复或名称包含 `/` 时，问题发生在配置加载阶段，不应等到工具执行时才排查。
+
+第三步是在 Pi 内选择主题：
+
+```text
+/settings
+```
+
+编辑当前激活的自定义主题文件时，Pi 会自动 hot reload。hot reload 让你不必重启进程就能调色，但它不意味着非法 JSON 会被安全忽略；保存一个不完整文件时，仍应观察加载错误和当前主题是否回退。
+
+> 译者注：颜色配置的热加载和 Session 热恢复是两类机制。前者改变下一次渲染使用的样式，后者涉及对话与运行状态；不要把“主题自动重载”理解成 Pi 会持久化或修复任意配置。
+
+### 主题格式
+
+最小格式可以写成：
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+  "name": "my-theme",
+  "vars": {
+    "blue": "#0066cc",
+    "gray": 242
+  },
+  "colors": {
+    "accent": "blue",
+    "muted": "gray",
+    "text": "",
+    "...": "..."
+  }
+}
+```
+
+- `name` 必填，必须唯一，且不能包含 `/`。
+- `vars` 可选。把可复用的色值放进去，然后在 `colors` 中写变量名，减少重复和改色遗漏。
+- `colors` 必须定义 51 个 required token。`thinkingMax`、`scrollbarThumb` 和两个搜索高亮 token 是可选兼容项，缺失时使用后文的 fallback。
+- `$schema` 让编辑器提供补全和校验。它不是运行时权限声明，也不会替你生成缺失字段。
+
+`colors` 中的字符串如果不是合法色值或已定义变量，不能假设会被当成普通文字；应让 schema/运行时尽早暴露错误。自定义主题的名字、目录和 `package.json` 条目也要避免冲突。
+
+### 颜色 token
+
+原文把 token 分组列出。下面保留每一个名称，并解释它影响的界面位置。颜色名称属于 API，不能为了中文化改成 `主色`、`成功色` 等自定义 key。
+
+#### Core UI：11 个核心颜色
+
+| Token | 作用 |
 | --- | --- |
-| `accent` | 主强调色：logo、选中项、光标 |
+| `accent` | 主强调色，例如 logo、选中项和光标 |
 | `border` | 普通边框 |
 | `borderAccent` | 高亮边框 |
-| `borderMuted` | 编辑器等处的弱边框 |
+| `borderMuted` | 编辑器等位置的弱边框 |
 | `success` | 成功状态 |
 | `error` | 错误状态 |
 | `warning` | 警告状态 |
 | `muted` | 次要文字 |
-| `dim` | 第三级/淡化文字 |
-| `text` | 默认文字，通常为终端默认色 |
-| `thinkingText` | thinking block 文字 |
+| `dim` | 第三级、淡化文字 |
+| `text` | 默认文字，通常写 `""` 使用终端默认色 |
+| `thinkingText` | thinking block 的文字 |
 
-**Backgrounds & Content（11 个 required，3 个 optional）**
+这些 token 通常决定界面骨架和状态反馈。比如 `error` 是错误文字/状态色，而工具框的错误背景单独由 `toolErrorBg` 决定；不要用一个 token 替代另一组 token。
 
-| Token | 中文用途 |
+#### Backgrounds & Content：11 个 required、3 个 optional
+
+| Token | 作用 |
 | --- | --- |
-| `selectedBg` | 选中行背景 |
-| `scrollbarThumb` | fullscreen 滚动条滑块背景；缺省回退到 `selectedBg` |
-| `searchMatchBg` | transcript 搜索匹配背景；缺省回退到 `selectedBg` |
-| `searchMatchText` | 搜索匹配文字；缺省回退到 `text` |
+| `selectedBg` | 选择器或列表的选中行背景 |
+| `scrollbarThumb` | fullscreen 滚动条滑块背景；可选，缺省回退到 `selectedBg` |
+| `searchMatchBg` | transcript 搜索匹配背景和当前匹配文字；可选，缺省回退到 `selectedBg` |
+| `searchMatchText` | transcript 搜索匹配文字和当前匹配背景；可选，缺省回退到 `text` |
 | `userMessageBg` | 用户消息背景 |
 | `userMessageText` | 用户消息文字 |
 | `customMessageBg` | Extension 消息背景 |
 | `customMessageText` | Extension 消息文字 |
 | `customMessageLabel` | Extension 消息标签 |
 | `toolPendingBg` | pending Tool 框背景 |
-| `toolSuccessBg` | 成功 Tool 框背景 |
-| `toolErrorBg` | 失败 Tool 框背景 |
+| `toolSuccessBg` | success Tool 框背景 |
+| `toolErrorBg` | error Tool 框背景 |
 | `toolTitle` | Tool 标题 |
 | `toolOutput` | Tool 输出文字 |
 
-**Markdown（10 个）**：`mdHeading`（标题）、`mdLink`（链接文字）、`mdLinkUrl`（链接 URL）、`mdCode`（行内代码）、`mdCodeBlock`（代码块内容）、`mdCodeBlockBorder`（代码块边框）、`mdQuote`（引用文字）、`mdQuoteBorder`（引用边框）、`mdHr`（水平线）、`mdListBullet`（列表符号）。
+搜索匹配默认在 `searchMatchBg` 上使用 `searchMatchText` 并加下划线；当前匹配会交换前景和背景，并使用粗体。这个交换规则说明 `searchMatchText` 不是“所有搜索状态的文字色”，它在当前匹配时会参与背景显示。
 
-**Tool Diffs（3 个）**：`toolDiffAdded`（新增行）、`toolDiffRemoved`（删除行）、`toolDiffContext`（上下文行）。
+> 译者注：optional 不是“随便写错也没关系”。它表示旧主题可以省略该字段，因为 loader 有兼容 fallback；如果你显式填写，就必须使用合法的颜色值，否则仍然会得到配置错误。
 
-**Syntax Highlighting（9 个）**：`syntaxComment`（注释）、`syntaxKeyword`（关键字）、`syntaxFunction`（函数名）、`syntaxVariable`（变量）、`syntaxString`（字符串）、`syntaxNumber`（数字）、`syntaxType`（类型）、`syntaxOperator`（操作符）、`syntaxPunctuation`（标点）。
+#### Markdown：10 个颜色
 
-**Thinking Level Borders（6 个 required，1 个 optional）**：`thinkingOff`、`thinkingMinimal`、`thinkingLow`、`thinkingMedium`、`thinkingHigh`、`thinkingXhigh` 分别表示关闭、minimal、low、medium、high、xhigh 的编辑器边框；`thinkingMax` 表示 max，缺省回退到 `thinkingXhigh`。
+| Token | 作用 |
+| --- | --- |
+| `mdHeading` | Markdown 标题 |
+| `mdLink` | 链接文字 |
+| `mdLinkUrl` | 链接 URL |
+| `mdCode` | 行内代码 |
+| `mdCodeBlock` | 代码块内容 |
+| `mdCodeBlockBorder` | 代码块边框或 fence |
+| `mdQuote` | block quote 文字 |
+| `mdQuoteBorder` | block quote 边框 |
+| `mdHr` | 水平分隔线 |
+| `mdListBullet` | 列表项目符号 |
 
-**Bash Mode（1 个）**：`bashMode` 是以 `!` 前缀进入 Shell 模式时的编辑器边框。
+Markdown 的文字和背景通常还会受 `text`、`muted` 等核心 token 影响。调试 Markdown 颜色时，应同时检查链接文字与 URL、行内代码与 fenced code block，而不是只看标题。
 
-**HTML Export（optional）**：`export.pageBg`、`export.cardBg`、`export.infoBg` 控制 `/export` HTML 的页面、卡片和信息背景；缺省时从 `userMessageBg` 推导。
+#### Tool Diffs：3 个颜色
 
-搜索匹配默认在 `searchMatchBg` 上使用 `searchMatchText` 并加下划线，当前匹配交换前景/背景并使用粗体。变量引用和默认色是配置抽象，不是额外 token。
+| Token | 作用 |
+| --- | --- |
+| `toolDiffAdded` | diff 中新增的行 |
+| `toolDiffRemoved` | diff 中删除的行 |
+| `toolDiffContext` | diff 中未改变的上下文行 |
 
-### 兼容性与调色实验
+Tool diff 的颜色只改变 diff 的可读性，不改变 patch 是否通过 `edit` 的校验。红色的 removed 行也不意味着某个操作一定失败，它可能只是成功 edit 的正常 diff。
 
-暗色终端用高对比度的亮色，浅色终端用较深的弱色；可以先把 Nord、Gruvbox 或 Tokyo Night 调色板放入 `vars`，再在 tokens 中统一引用。测试不应只看启动画面：要覆盖用户消息、Extension 消息、pending/success/error Tool、Markdown、diff、thinking level、换行和长文本。VS Code 用户如需准确观察颜色，可把 `terminal.integrated.minimumContrastRatio` 设为 `1`。
+#### Syntax Highlighting：9 个颜色
 
-**实验**：复制一个内置主题，故意删掉一个 token，用 `$schema` 和 `/settings` 观察验证错误；再用 24-bit 和 256-color 终端分别查看 `accent`、Tool 状态和 Markdown。主题只是显示配置，不改变 Tool 权限、Session 数据或模型能力。
+| Token | 作用 |
+| --- | --- |
+| `syntaxComment` | 注释 |
+| `syntaxKeyword` | 关键字 |
+| `syntaxFunction` | 函数名 |
+| `syntaxVariable` | 变量 |
+| `syntaxString` | 字符串 |
+| `syntaxNumber` | 数字 |
+| `syntaxType` | 类型 |
+| `syntaxOperator` | 运算符或操作符 |
+| `syntaxPunctuation` | 标点 |
+
+语法高亮和 Markdown 代码块是两个层次：`mdCodeBlock`/`mdCodeBlockBorder` 负责块整体样式，而 `syntax*` 负责代码内容中的词法类别。一个代码块能显示正确边框但语法颜色仍不理想，反之亦然。
+
+#### Thinking Level Borders：6 个 required、1 个 optional
+
+编辑器边框用 thinking level 表示视觉层级，从不启用到最突出：
+
+| Token | 作用 |
+| --- | --- |
+| `thinkingOff` | thinking 关闭 |
+| `thinkingMinimal` | minimal |
+| `thinkingLow` | low |
+| `thinkingMedium` | medium |
+| `thinkingHigh` | high |
+| `thinkingXhigh` | xhigh |
+| `thinkingMax` | max；可选，缺省回退到 `thinkingXhigh` |
+
+这里的边框只提示当前 thinking level，不会改变请求参数，也不会让模型“多思考”。如果不同 level 使用同一种颜色，功能仍然可用，只是视觉层级消失。
+
+#### Bash Mode：1 个颜色
+
+`bashMode` 是以 `!` 前缀进入 bash mode 时的编辑器边框颜色。它提示输入将按 shell 模式解释；颜色本身不执行命令，也不能替代权限确认和 sandbox。
+
+> 译者注：显示层经常被误认为控制层。`bashMode` 变成绿色不会使 shell 更安全；真正的安全检查必须发生在 Tool Runtime 的参数、路径、权限和进程执行边界。
+
+#### HTML Export：可选的 `export` 部分
+
+`export` 控制 `/export` 生成的 HTML 颜色。如果省略，颜色会从 `userMessageBg` 推导。可以显式配置：
+
+```json
+{
+  "export": {
+    "pageBg": "#18181e",
+    "cardBg": "#1e1e24",
+    "infoBg": "#3c3728"
+  }
+}
+```
+
+`pageBg` 是页面背景，`cardBg` 是内容卡片背景，`infoBg` 是信息区域背景。这个配置只影响导出的 HTML，不等于 TUI 的 `toolPendingBg` 或 Markdown 颜色。
+
+### 颜色值
+
+Pi 支持四种写法：
+
+| 格式 | 示例 | 含义 |
+| --- | --- | --- |
+| Hex | `"#ff0000"` | 6 位十六进制 RGB |
+| 256-color | `39` | xterm 256 色调色板索引，范围 0–255 |
+| Variable | `"primary"` | 引用 `vars` 中的变量 |
+| Default | `""` | 使用终端默认颜色 |
+
+Hex 必须表示 RGB 颜色；256-color 的整数不是 RGB 三元组，也不是 token 名。Variable 只能引用当前 `vars` 中已定义的名字。Default 让终端决定颜色，适合让文字适应用户自己的终端背景，但也可能降低跨终端的一致性。
+
+#### 256 色调色板
+
+- `0–15`：基本 ANSI 颜色，具体外观由终端配置决定。
+- `16–231`：6×6×6 RGB cube，索引公式为 `16 + 36×R + 6×G + B`，其中 `R`、`G`、`B` 都是 0–5。
+- `232–255`：灰度渐变。
+
+例如，写 `242` 得到的是调色板中的一个灰色索引；它不是“亮度 242”。同一个索引在不同终端主题下可能看起来不同。
+
+#### 终端兼容性
+
+Pi 使用 24-bit RGB。iTerm2、Kitty、WezTerm、Windows Terminal 和 VS Code 等现代终端通常支持它；只有 256-color 的旧终端会回退到最接近的颜色近似值。回退意味着视觉精度降低，不意味着 theme JSON 中的 Hex 被改写。
+
+可以检查 truecolor 支持：
+
+```bash
+echo $COLORTERM  # 应输出 "truecolor" 或 "24bit"
+```
+
+如果变量为空，不能只凭这一项断言终端不支持 truecolor；还要结合终端类型、远程连接、tmux 配置和实际显示结果。SSH、tmux、IDE 内置终端都可能改变颜色能力的传递。
+
+> 译者注：颜色问题要按链路排查：theme JSON → Pi 的颜色解析 → 终端协议 → tmux/SSH 转发 → 屏幕渲染。只改 Hex 值而不确认 `COLORTERM`，经常会把协议问题误判成调色问题。
+
+### 实践建议
+
+**暗色终端**：使用明亮、饱和且对比度较高的颜色，但不要让所有 token 都使用纯色，以免文本层级消失。
+
+**浅色终端**：使用更深、较柔和的颜色，重点检查 `muted`、`dim`、链接 URL 和 diff context 是否仍可读。
+
+**颜色协调**：可以从 Nord、Gruvbox、Tokyo Night 等基础调色板开始，把颜色定义在 `vars`，再让 tokens 统一引用。这样调色板变化只需要改一处。
+
+**测试**：用不同消息类型、Tool 状态、Markdown 内容和长文本测试主题。必须观察用户消息、Extension 消息、pending/success/error Tool、diff、搜索匹配、thinking level、换行和滚动条，而不是只打开选择器看一张色卡。
+
+**VS Code**：如果需要准确观察颜色，可以把 `terminal.integrated.minimumContrastRatio` 设为 `1`；这只是 VS Code 的显示设置，不是 Pi theme 的 token。
+
+> 译者注：对比度不是装饰性指标。`text`、`muted`、`toolOutput` 与背景之间缺乏对比时，用户可能看不到错误或工具结果，等价于可观测性下降。先保证信息可读，再追求配色风格。
+
+### 内置主题示例
+
+可以把内置主题当作可运行参考：
+
+- [dark.json（固定研究 commit）](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/interactive/theme/dark.json)
+- [light.json（固定研究 commit）](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/interactive/theme/light.json)
+
+建议先复制一份，再逐个 token 修改。不要直接在依赖包或 Pi 核心渲染器中改颜色；Theme 的价值就在于用资源文件扩展显示行为。
+
+### 可执行实验：从复制到排障
+
+#### 目标
+
+完成一个自定义主题，并能区分 JSON/schema 错误、发现路径错误、终端能力问题和对比度问题。
+
+#### 准备
+
+准备 Pi 当前研究版本、一个临时主题目录，以及可恢复的测试 session。不要把实验主题放进生产仓库，也不要在未信任的项目中测试项目主题发现。
+
+#### 步骤
+
+1. 复制内置 `dark` 主题，改名为 `my-theme`，只改变 `accent` 和 `toolErrorBg`。
+2. 把文件放在 `~/.pi/agent/themes/`，用 `/settings` 确认它出现在选择器中。
+3. 将 `accent` 改成 `vars.primary`，改变 `vars.primary`，观察引用它的多个位置是否一起变化。
+4. 暂时删掉 `thinkingMax`，观察兼容 fallback 是否使用 `thinkingXhigh`；再删掉一个 required token，记录加载错误。
+5. 用 `pi --use-theme light` 启动一次，退出后检查 saved setting 是否被意外改写。
+6. 用 `pi --use-theme light/dark` 在不同终端背景下启动，比较 initial theme。
+7. 打开一个包含 Markdown 标题、链接、代码、diff 和 Tool 输出的 session，逐项检查对应 token。
+8. 在 fullscreen transcript 中执行搜索，观察普通匹配和当前匹配的前景/背景交换。
+9. 在支持 truecolor 的终端、256-color 终端和 tmux 中分别执行 `echo $COLORTERM` 并比较结果。
+10. 设置 VS Code 的 `terminal.integrated.minimumContrastRatio` 为 `1`，确认观察到的是终端渲染而不是 Pi 逻辑变化。
+
+#### 观察点
+
+- `/settings` 选择会保存；`--use-theme` 只提供启动初值。
+- 变量是引用关系，改变一个 `vars` 值可能同时改变多个 token。
+- optional token 有明确 fallback；required token 缺失应尽早报错。
+- Tool 的错误颜色、Markdown 的代码颜色、thinking 边框和搜索高亮来自不同 token。
+- 同一个 Hex 在 truecolor 与 256-color 终端中可能有不同的最终视觉效果。
+
+#### 预期结果
+
+你能解释一个主题从发现到渲染的链路：Pi 找到 JSON → 校验 `name`/`colors` → 解析变量和色值 → 根据终端能力输出颜色 → TUI 在具体组件上使用 token。你也能根据现象定位问题，而不是盲目更换颜色。
+
+#### 思考题
+
+1. 为什么项目主题必须依赖 project trust？如果一个仓库提交了看似普通的 theme JSON，它能否影响工具权限？
+2. `searchMatchText` 缺失时为什么可以回退，而缺少 `toolErrorBg` 却不能简单假定？
+3. `--use-theme light` 与 `settings.json` 的职责有什么不同？
+4. 如果 `accent` 在 24-bit 终端正常、在 tmux 中变灰，应先查主题文件还是终端链路？
+5. 为什么 `toolDiffRemoved` 使用红色并不代表 `edit` 失败？
+6. Java 可以用 immutable record 表示 `Theme`，Go 可以用 struct 表示配置；变量解析和 fallback 应放在哪一层？
+
+### Java/Go 对照
+
+Java 中可以定义 `record Theme(String name, Map<String, ColorValue> colors)`，用 Jackson 校验 JSON，再用 enum 或常量集中管理 token 名；Go 中可以用 struct tags 解码固定字段，用 `map[string]ColorValue` 处理 `vars` 和颜色值。两种实现都应把 `ThemeLoader` 与 TUI renderer 分开。
+
+Java 的 enum/record 或 Go 的常量只能帮助防止拼写错误，不能解决终端 truecolor 回退；颜色解析器仍需把 Hex、整数、变量和默认值转换成 renderer 能消费的值。解析失败应该返回带路径的错误，例如 `colors.toolErrorBg`，而不是在渲染时静默使用黑色。
+
+## 译者注索引
+
+本页的译者注集中回答四类容易混淆的问题：Theme 与权限、optional 与错误配置、显示层与控制层、以及颜色值与终端协议。阅读源码时，可以把它们分别对应到资源加载、schema validation、TUI renderer 和 terminal capability 四个边界。
 
 ## 章节对照
 

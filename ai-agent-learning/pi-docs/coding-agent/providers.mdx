@@ -13,33 +13,432 @@ description: "订阅、API key、云 Provider、Custom Provider 和解析顺序�
 
 ## 源码级中文译文
 
-### 订阅、凭据与优先级
+### Provider 先解决什么问题
 
-交互模式中用 `/login` 选择 ChatGPT Plus/Pro（Codex）、Claude Pro/Max、GitHub Copilot、xAI、OpenRouter 或 Radius；用 `/logout` 清理凭据。OAuth token 写入 `~/.pi/agent/auth.json`，过期后自动刷新。OpenRouter 的登录流程得到一个由用户的 credits 计费的 API key，不按普通 OAuth token 自动过期。远程机器没有浏览器回调时，OpenRouter 支持粘贴最终 redirect URL 或 authorization code。
+Pi 把 Provider 分成两类：需要登录订阅的 Provider，以及使用 API key 的 Provider。订阅通常通过 OAuth 产生可刷新 token；API key 则可能来自环境变量、`auth.json`、CLI 参数或 `models.json`。这不是四种不同的模型类型，而是**同一个模型请求在认证和协议适配层的不同入口**。
 
-API key 可以在启动前设置，例如 `ANTHROPIC_API_KEY`，也可以通过 `/login` 保存。auth file 采用 `0600` 权限，并且优先于进程环境变量；credential 的 `env` 对象可以给某个 Provider 提供独立的 account、region、proxy 等配置。不要把 key 写进 `AGENTS.md`、Skill、源码或提交记录。
+Pi 随发行包提供 built-in model catalog。配置过的 Provider 可能从远端刷新更近的目录，并把目录缓存到 `~/.pi/agent/models-store.json`，供离线时使用。因此要区分三个状态：
 
-### Key Resolution 的实际规则
+1. **目录里有模型**：Pi 知道模型的 id、API、输入类型和上下文窗口。
+2. **凭据存在**：Pi 能解析 token 或 API key。
+3. **请求可用**：endpoint、权限、配额、模型能力和请求格式都通过了。
 
-`key` 和 header 值有四种形式：以 `!` 开头的整段 shell command、`$ENV_VAR`/`${ENV_VAR}` 环境插值、`$$`/`$!` 转义，以及直接使用的 literal。命令的 stdout 会作为值；`/model` 的可用性检查不会执行 shell command，但真正请求时可能执行。Pi 不会替任意命令推断 TTL、缓存或失败回退策略；慢或昂贵的命令应由调用者自己封装。
+只满足第一项不能保证请求成功。比如模型仍在缓存目录里，但 OAuth 已过期、账号没有该模型权限，最终请求依然会失败。
 
-凭据解析顺序是：CLI `--api-key` → `auth.json` → 环境变量 → `models.json` 中的 custom provider key。这里的“优先级”只决定使用哪个凭据，不代表模型自动获得访问权限。
+> 译者注：初学者很容易把 model picker 当成“可用模型列表”。实际上 picker 更接近静态/缓存的元数据索引；凭据解析和真正的 HTTP 请求是后续步骤。Java 中可把 catalog 类比为 `Map<ProviderId, List<ModelDefinition>>`，把认证解析单独放在 `CredentialResolver`，不要在模型下拉框里顺便发真实请求。
 
-### Cloud Provider、llama.cpp 与 Custom Provider
+### Subscriptions：订阅登录
 
-Azure OpenAI 需要 `AZURE_OPENAI_API_KEY` 及 base URL/resource name，可选 API version 和 deployment map。Bedrock 可以用 `/login amazon-bedrock`、AWS profile、IAM key、bearer token、task role 或 IRSA，并可设置 region、proxy 和 HTTP/1.1；应用 inference profile 的 ARN 不含模型名时，要用 `AWS_BEDROCK_FORCE_CACHE=1` 才启用 cache point。Cloudflare AI Gateway/Workers AI 需要 account/gateway 配置，且要区分 Workers、统一计费、stored BYOK 和 inline BYOK。Vertex AI 使用 Application Default Credentials 或 `GOOGLE_APPLICATION_CREDENTIALS`。
+交互模式中执行 `/login`，再选择 Provider。当前文档列出的订阅入口包括：
 
-llama.cpp 通过 `/login llama.cpp` 连接 router，用 `/llama` 管理已加载模型、`/model` 选择模型。说“自定义 Provider”有两条路：`models.json` 可以复用已有 API 适配器；需要自定义 OAuth、过滤、stream 或非标准协议时，使用 Extension 的 `pi.registerProvider()`。解析完成后，model 仍受 API 类型、凭据、输入能力和 compatibility 配置约束。
+- ChatGPT Plus/Pro（Codex）。
+- Claude Pro/Max。
+- GitHub Copilot。
+- xAI（Grok/X subscription）。
+- OpenRouter（OAuth 只负责产生用户控制的 API key，费用从 OpenRouter credits 扣除）。
+- Radius。
 
-> 译者注：Provider 是认证和协议适配的边界，Model 是这个 Provider 下的一条模型元数据。Java 可以把 Provider 类比为 HTTP client factory，把 `auth.json` 类比为 credential store；Go 中则通常是 `Provider` interface 加显式配置。两者都不应让 Agent Loop 直接读取环境变量。
+用 `/logout` 清除凭据。OAuth token 写入 `~/.pi/agent/auth.json`，过期时自动刷新。OpenRouter 是一个需要特别注意的例外：登录流程产生用户控制的 OpenRouter API key，这个 key 不像普通 OAuth access token 那样自动过期。
 
-### 可执行步骤与安全检查
+#### OpenAI Codex
 
-1. 先用 `--list-models` 或 `/model` 确认模型目录和认证是否同时可用。
-2. 本地/代理 Provider 先用 `models.json` 指定 `baseUrl`、`api`、`apiKey` 和 `models`。
-3. 对 `!command`、环境插值和 `headers` 做最小权限审查，确认命令不会把 secret 打到 stdout/stderr。
-4. 通过 `--provider`、`--model` 运行一次受限请求；遇到 401、429、5xx 或模型不支持时，分别检查 credential、限流、重试和 compatibility，而不是盲目换模型。
+Codex 订阅需要 ChatGPT Plus 或 Pro。官方还提供 [Codex for OSS](https://developers.openai.com/community/codex-for-oss) 说明。Pi 的 `/login` 只是取得可用于 Provider adapter 的凭据，并不会让 Agent Loop 直接调用一个“Codex 方法”。
 
+#### Claude Pro/Max
+
+Anthropic 的订阅认证适用于 Claude Pro/Max 账号。第三方 harness 使用的是 [extra usage](https://claude.ai/settings/usage)，按 token 计费，不从 Claude 计划本身的限额中扣除。排障时要同时看 Pi 的认证状态和 Anthropic 账号的 extra usage 状态。
+
+#### GitHub Copilot
+
+登录时按 Enter 使用 `github.com`，也可以输入 GitHub Enterprise Server 的域名。如果出现 `model not supported`，需要在 VS Code 的 Copilot Chat model selector 中选中模型并点击 `Enable`。这条提示说明认证成功和模型授权是两件事。
+
+#### xAI（Grok/X subscription）
+
+执行 `/login xai` 后选择 **Use a subscription**。API key 入口仍然可用：选择 **Use an API key**，Pi 会使用 `XAI_API_KEY`。不要把订阅 token 和 API key 写成同一种 credential 结构后再猜测其刷新行为。
+
+#### OpenRouter
+
+执行 `/login openrouter`，选择 **Sign in with OpenRouter**，Pi 会打开 OpenRouter 的 PKCE authorization flow。授权结果是一个由用户控制、从 OpenRouter credits 计费的 API key。
+
+在 SSH 或其他 headless 机器上，浏览器无法访问运行在远端的 loopback callback。此时把最终 redirect URL，或者授权 code，粘贴回登录提示中。`OPENROUTER_API_KEY` 仍可通过 **Use an API key** 使用。
+
+> 译者注：PKCE 是 OAuth 授权码流程中防止拦截 code 的机制，不等于“Pi 在服务器上启动了浏览器”。当终端没有图形环境时，应该把 callback 的结果安全地从本地浏览器传回远端，不能把 access token 随意贴到聊天、日志或 issue。
+
+#### Radius
+
+Radius 是动态的 `pi-messages` gateway。`/login radius` 把 OAuth token 存进 `auth.json`；gateway catalog 独立刷新并缓存到 `models-store.json`。如果要配置自定义 Radius gateway，可以在 `models.json` 使用：
+
+```json
+{
+  "providers": {
+    "my-radius": {
+      "oauth": "radius",
+      "baseUrl": "https://radius.example.com"
+    }
+  }
+}
+```
+
+这段配置表达的是 gateway 地址和 OAuth 类型，不是把 token 写入文件。解析时仍由 credential store 负责取得凭据。
+
+### API Keys：环境变量与 auth file
+
+可以在交互模式中执行 `/login`，选择 Provider 并把 API key 保存到 `auth.json`；也可以在进程启动前设置环境变量：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+pi
+```
+
+这条命令的输入是 shell 环境变量，Pi 的输入是进程环境；`pi` 启动时才会根据 Provider id 读取它。不要把真实 key 放在 shell history、README、错误日志或测试 fixture 中。
+
+下面是源文档列出的环境变量与 `auth.json` key 对照。左列是进程环境变量，右列是 credential 在 JSON 顶层使用的 Provider key；两列名字不一定相同。
+
+| Provider | 环境变量 | `auth.json` key |
+| --- | --- | --- |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic` |
+| Ant Ling | `ANT_LING_API_KEY` | `ant-ling` |
+| Azure OpenAI Responses | `AZURE_OPENAI_API_KEY` | `azure-openai-responses` |
+| OpenAI | `OPENAI_API_KEY` | `openai` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek` |
+| NVIDIA NIM | `NVIDIA_API_KEY` | `nvidia` |
+| Google Gemini | `GEMINI_API_KEY` | `google` |
+| Amazon Bedrock | `AWS_BEARER_TOKEN_BEDROCK` | `amazon-bedrock` |
+| Mistral | `MISTRAL_API_KEY` | `mistral` |
+| Groq | `GROQ_API_KEY` | `groq` |
+| Cerebras | `CEREBRAS_API_KEY` | `cerebras` |
+| Cloudflare AI Gateway | `CLOUDFLARE_API_KEY` + account/gateway | `cloudflare-ai-gateway` |
+| Cloudflare Workers AI | `CLOUDFLARE_API_KEY` + account | `cloudflare-workers-ai` |
+| xAI | `XAI_API_KEY` | `xai` |
+| OpenRouter | `OPENROUTER_API_KEY` | `openrouter` |
+| Vercel AI Gateway | `AI_GATEWAY_API_KEY` | `vercel-ai-gateway` |
+| ZAI Coding Plan Global | `ZAI_API_KEY` | `zai` |
+| ZAI Coding Plan China | `ZAI_CODING_CN_API_KEY` | `zai-coding-cn` |
+| OpenCode Zen | `OPENCODE_API_KEY` | `opencode` |
+| OpenCode Go | `OPENCODE_API_KEY` | `opencode-go` |
+| Radius | `RADIUS_API_KEY` | `radius` |
+| Hugging Face | `HF_TOKEN` | `huggingface` |
+| Fireworks | `FIREWORKS_API_KEY` | `fireworks` |
+| Together AI | `TOGETHER_API_KEY` | `together` |
+| Baseten | `BASETEN_API_KEY` | `baseten` |
+| Kimi For Coding | `KIMI_API_KEY` | `kimi-coding` |
+| MiniMax | `MINIMAX_API_KEY` | `minimax` |
+| MiniMax China | `MINIMAX_CN_API_KEY` | `minimax-cn` |
+| Qwen Token Plan | `QWEN_TOKEN_PLAN_API_KEY` | `qwen-token-plan` |
+| Qwen Token Plan Individual | `QWEN_TOKEN_PLAN_API_KEY` | `qwen-token-plan-individual` |
+| Qwen Token Plan China | `QWEN_TOKEN_PLAN_CN_API_KEY` | `qwen-token-plan-cn` |
+| Xiaomi MiMo | `XIAOMI_API_KEY` | `xiaomi` |
+| Xiaomi MiMo China | `XIAOMI_TOKEN_PLAN_CN_API_KEY` | `xiaomi-token-plan-cn` |
+| Xiaomi MiMo Amsterdam | `XIAOMI_TOKEN_PLAN_AMS_API_KEY` | `xiaomi-token-plan-ams` |
+| Xiaomi MiMo Singapore | `XIAOMI_TOKEN_PLAN_SGP_API_KEY` | `xiaomi-token-plan-sgp` |
+
+完整的变量映射以 [Pi `envMap`](https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/env-api-keys.ts) 和 `packages/ai/src/env-api-keys.ts` 为准。该文件是源码证据；文档表格是使用入口，不应该在变量改名后继续凭记忆维护。
+
+> 译者注：`GEMINI_API_KEY` 在 Pi 的 provider key 是 `google`，这不是笔误，而是“环境变量名”和“内部 Provider id”两个命名空间。Go/Java 实现也应该允许外部变量名与内部 id 分离，否则新增 provider 时会被迫把内部名称暴露给部署配置。
+
+### Auth File：凭据文件
+
+凭据保存在 `~/.pi/agent/auth.json`。下面是一个结构示例，值使用占位符：
+
+```json
+{
+  "anthropic": { "type": "api_key", "key": "sk-ant-..." },
+  "ant-ling": { "type": "api_key", "key": "..." },
+  "openai": { "type": "api_key", "key": "sk-..." },
+  "deepseek": { "type": "api_key", "key": "sk-..." },
+  "nvidia": { "type": "api_key", "key": "nvapi-..." },
+  "google": { "type": "api_key", "key": "..." },
+  "opencode": { "type": "api_key", "key": "..." },
+  "opencode-go": { "type": "api_key", "key": "..." },
+  "together": { "type": "api_key", "key": "..." },
+  "qwen-token-plan": { "type": "api_key", "key": "sk-sp-..." },
+  "qwen-token-plan-individual": { "type": "api_key", "key": "sk-sp-..." },
+  "qwen-token-plan-cn": { "type": "api_key", "key": "sk-sp-..." },
+  "xiaomi": { "type": "api_key", "key": "..." },
+  "xiaomi-token-plan-cn": { "type": "api_key", "key": "..." },
+  "xiaomi-token-plan-ams": { "type": "api_key", "key": "..." },
+  "xiaomi-token-plan-sgp": { "type": "api_key", "key": "..." }
+}
+```
+
+代码块展示的是文件形状，输入是 Provider id 到 credential object 的映射，输出是 credential resolver 能读取的 key；它不是让读者把示例 token 原样复制。
+
+`qwen-token-plan-individual` 与 `qwen-token-plan` 使用同一个国际 endpoint 和 `QWEN_TOKEN_PLAN_API_KEY`，但 picker 只展示 Individual 订阅对应模型。普通 `qwen-token-plan` 保留更宽的目录以兼容已有配置。使用 `auth.json` 时，把 credential 放在当前选择的 Provider key 下；两个国际 Provider 可以共享同一个环境变量。
+
+文件创建权限为 `0600`，只有当前用户可读写；`auth.json` 凭据优先于环境变量。API-key credential 还可以携带 Provider 作用域的 `env`，用于覆盖进程环境中的 credential key、model/provider headers、Cloudflare account id、Azure 设置、Vertex project/location、Bedrock 设置、`PI_CACHE_RETENTION` 和 `HTTP_PROXY`/`HTTPS_PROXY`。
+
+```json
+{
+  "cloudflare-ai-gateway": {
+    "type": "api_key",
+    "key": "$CLOUDFLARE_API_KEY",
+    "env": {
+      "CLOUDFLARE_API_KEY": "...",
+      "CLOUDFLARE_ACCOUNT_ID": "account-id",
+      "CLOUDFLARE_GATEWAY_ID": "gateway-id"
+    }
+  }
+}
+```
+
+第一段 `key` 是引用环境变量，`env` 是这个 credential 自带的作用域环境。当 Pi 使用该 Provider 时，作用域值先于进程环境值解析。适合同一台机器上不同项目使用不同账号或 gateway；它仍然不是操作系统级隔离。
+
+> 译者注：`0600` 只解决“其他本地用户能否直接读文件”的问题，不解决恶意 Extension、被污染的进程、shell history 或日志泄漏。生产部署还需要 secret manager、短期 token、审计和最小权限。
+
+#### Key Resolution：key 字段如何解析
+
+`key` 支持四种输入形态。
+
+**1. Shell command。** 值以 `!` 开头时，整段值作为命令执行，并使用 stdout；同一进程生命周期内会缓存结果：
+
+```json
+{ "type": "api_key", "key": "!security find-generic-password -ws 'anthropic'" }
+{ "type": "api_key", "key": "!op read 'op://vault/item/credential'" }
+```
+
+输入是命令字符串，输出是标准输出中的 credential。命令的退出码、stderr、超时和权限都可能使解析失败；不要使用会打印额外说明的命令，否则 stdout 可能不是合法 key。`/model` 的可用性检查不会执行 shell command，但真实请求解析时可能执行。
+
+**2. 环境插值。** `$ENV_VAR` 或 `${ENV_VAR}` 读取命名变量，也支持嵌在更长的 literal 中：
+
+```json
+{ "type": "api_key", "key": "$MY_ANTHROPIC_KEY" }
+{ "type": "api_key", "key": "${KEY_PREFIX}_${KEY_SUFFIX}" }
+```
+
+`$FOO_BAR` 表示变量 `FOO_BAR`；如果 `BAR` 是普通文本，写 `${FOO}_BAR`。变量缺失时值保持 unresolved，不应悄悄当成空字符串成功发送。
+
+**3. 转义。** `$$` 产生字面 `$`，`$!` 产生字面 `!` 且不触发命令执行：
+
+```json
+{ "type": "api_key", "key": "$$literal-dollar-prefix" }
+{ "type": "api_key", "key": "$!literal-bang-prefix" }
+```
+
+这两个输入用于 key 本身以 `$` 或 `!` 开头的场景。不要把它们误当作安全编码：最终值仍可能是敏感数据。
+
+**4. Literal。** 其他值直接使用。普通的 `MY_API_KEY` 是 literal，不会自动查找同名环境变量；需要写 `$MY_API_KEY` 才是变量引用：
+
+```json
+{ "type": "api_key", "key": "sk-ant-..." }
+{ "type": "api_key", "key": "public" }
+```
+
+OAuth credential 也在 `/login` 后保存到同一个文件，并由 Pi 自动管理。
+
+> 译者注：不要只凭字符串首字母判断“这像环境变量”。Pi 的规则是显式 `$` 才引用环境，显式 `!` 才执行命令；这让 `MY_API_KEY` 可以作为真正的 literal。Go/Java 的 `CredentialResolver` 应测试 literal、missing variable、escaped prefix 和 command failure 四条分支。
+
+### Resolution Order：认证优先级
+
+解析一个 Provider 的 credential 时，优先级是：
+
+1. CLI `--api-key` flag。
+2. `auth.json` 中的 API key 或 OAuth token。
+3. Provider 对应的环境变量。
+4. `models.json` 中 custom provider 的 key。
+
+这是“选择 credential 来源”的顺序，不是权限授予顺序。最终仍要检查 API endpoint、model id、账号权限、配额和网络策略。尤其要注意：一个 `models.json` 的 custom provider 如果同时配置了 `apiKey`，它可能绕过你以为会生效的全局环境变量。
+
+> 译者注：解析优先级要在日志中可观察，但日志只能记录来源名称（例如 `auth.json` 或 `environment`），不能记录 key 的内容。Java 可以返回 `ResolvedCredential(value, source)` 后在 telemetry 中只使用 `source`；Go 可以使用不可导出的 credential value，减少误打日志的机会。
+
+### Cloud Providers：云 Provider 的额外配置
+
+云 Provider 通常不只需要一枚 API key，还需要 region、resource、account 或认证链。下面按源文档逐项保留命令和配置名。
+
+#### Azure OpenAI
+
+```bash
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_BASE_URL=https://your-resource.ai.azure.com
+# also supported: https://your-resource.cognitiveservices.azure.com
+# also supported: https://your-resource.openai.azure.com
+# root endpoints are auto-normalized to /openai/v1
+# or use resource name instead of base URL
+export AZURE_OPENAI_RESOURCE_NAME=your-resource
+
+# Optional
+export AZURE_OPENAI_API_VERSION=2024-02-01
+export AZURE_OPENAI_DEPLOYMENT_NAME_MAP=gpt-4=my-gpt4,gpt-4o=my-gpt4o
+```
+
+输入是 Azure key 加 endpoint 或 resource name。root endpoint 会自动规范化到 `/openai/v1`；如果同时给了 base URL 与 resource name，应以当前 Provider 配置和版本行为为准，不要把两套地址拼接两次。`API_VERSION` 与 deployment map 是可选覆盖，不是每个 endpoint 都需要。
+
+#### Amazon Bedrock
+
+可以用 `/login amazon-bedrock` 保存 Bedrock API key，也可以使用 AWS ambient credential chain：
+
+```bash
+# Option 1: AWS Profile
+export AWS_PROFILE=your-profile
+
+# Option 2: IAM Keys
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=...
+
+# Option 3: Bearer Token
+export AWS_BEARER_TOKEN_BEDROCK=...
+
+# Optional region (defaults to us-east-1)
+export AWS_REGION=us-west-2
+```
+
+还支持 ECS task role（`AWS_CONTAINER_CREDENTIALS_*`）和 IRSA（`AWS_WEB_IDENTITY_TOKEN_FILE`）。调用例子：
+
+```bash
+pi --provider amazon-bedrock --model us.anthropic.claude-sonnet-4-20250514-v1:0
+```
+
+命令把 provider 和 model 显式传入 CLI；真正的认证可能来自 profile、IAM、bearer token 或 workload identity。不要在命令行参数中写真实 secret，因为 shell history 和进程列表可能暴露它。
+
+Claude model id 能识别模型名，或使用 system-defined inference profile 时，Pi 会自动启用 prompt caching。application inference profile 的 ARN 通常不包含模型名，这时显式设置：
+
+```bash
+export AWS_BEDROCK_FORCE_CACHE=1
+pi --provider amazon-bedrock --model arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123
+```
+
+这个开关只是在模型 id 无法推断时强制启用 cache point，不会修复权限、region 或模型不存在错误。
+
+连接 Bedrock proxy 时还可以设置：
+
+```bash
+# Set the URL for the Bedrock proxy (standard AWS SDK env var)
+export AWS_ENDPOINT_URL_BEDROCK_RUNTIME=https://my.corp.proxy/bedrock
+
+# Set if your proxy does not require authentication
+export AWS_BEDROCK_SKIP_AUTH=1
+
+# Set if your proxy only supports HTTP/1.1
+export AWS_BEDROCK_FORCE_HTTP1=1
+```
+
+这些变量改变 endpoint、认证开关和 HTTP 版本。`AWS_BEDROCK_SKIP_AUTH=1` 只能在受信任的内部 proxy 中使用；它不会给上游 AWS 授权。
+
+#### Cloudflare AI Gateway
+
+`CLOUDFLARE_API_KEY` 可以由 `/login` 设置。account id 和 gateway slug 可以来自环境变量，或来自 `auth.json` credential 的 `env`：
+
+```bash
+export CLOUDFLARE_API_KEY=...           # or use /login
+export CLOUDFLARE_ACCOUNT_ID=...
+export CLOUDFLARE_GATEWAY_ID=...        # create at dash.cloudflare.com → AI → AI Gateway
+pi --provider cloudflare-ai-gateway --model "claude-sonnet-4-5"
+```
+
+该命令输入 provider/model，输出是通过 Cloudflare gateway 的模型响应。Workers AI 走 Unified API `/compat`，模型 id 使用 `workers-ai/@cf/...` 前缀；OpenAI 走 `/openai` passthrough，使用原生 id 如 `gpt-5.1`；Anthropic 走 `/anthropic` passthrough，使用原生 id 如 `claude-sonnet-4-5`。
+
+认证模式要区分：
+
+| 模式 | 发给 Cloudflare 的认证 | 上游认证 |
+| --- | --- | --- |
+| Workers AI | Cloudflare token | Cloudflare-native |
+| Unified billing | Cloudflare token | Cloudflare 代处理并扣 credits |
+| Stored BYOK | Cloudflare token | gateway dashboard 保存的 provider key |
+| Inline BYOK | Cloudflare token + upstream `Authorization` | 请求携带上游 provider key |
+
+普通 Pi 使用优先选 unified billing 或 stored BYOK。Inline BYOK 需要额外的 upstream `Authorization` header，通常通过 `models.json` 的 Provider/model override 配置。不要把上游 key 误放进 `CLOUDFLARE_API_KEY`，两者信任边界不同。
+
+#### Cloudflare Workers AI
+
+```bash
+export CLOUDFLARE_API_KEY=...           # or use /login
+export CLOUDFLARE_ACCOUNT_ID=...
+pi --provider cloudflare-workers-ai --model "@cf/moonshotai/kimi-k2.6"
+```
+
+Pi 会自动设置 `x-session-affinity`，用于 [prefix caching](https://developers.cloudflare.com/workers-ai/features/prompt-caching/) 折扣。`CLOUDFLARE_ACCOUNT_ID` 也可以放进 credential 的 `env`。如果模型 id 不带 `@cf/` 或使用了另一个 Provider 的 id，常见结果是 model not found，而不是认证错误。
+
+#### Google Vertex AI
+
+Vertex AI 使用 Application Default Credentials：
+
+```bash
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=your-project
+export GOOGLE_CLOUD_LOCATION=us-central1
+```
+
+也可以把 `GOOGLE_APPLICATION_CREDENTIALS` 指向 service account key file。命令的输入是本机 Google credential chain 和 project/location，输出是可供 Provider adapter 使用的 token；key file 路径本身不是 API key，仍应限制文件权限和运行用户。
+
+> 译者注：Cloud Provider 排障应先把错误分层：credential chain、endpoint/region、model id、上游 provider 和配额。不要看到 401 就只更换模型，也不要看到 model not found 就把 key 复制到更多环境变量。
+
+### llama.cpp
+
+Pi 支持 llama.cpp router server。使用 `/login llama.cpp` 配置连接，使用 `/llama` 管理已加载模型，使用 `/model` 选择当前模型。
+
+```text
+/login llama.cpp
+/llama
+/model
+```
+
+这三个命令的作用分别是认证/连接配置、查看或管理 router 中已加载的模型、选择一个模型供后续请求使用。服务器目录、环境变量和启动参数见 [llama.cpp 中文参考](/pi-docs/coding-agent/llama-cpp)。
+
+### Custom Providers：自定义 Provider
+
+有两条路径。
+
+**通过 `models.json`。** Ollama、LM Studio、vLLM，或任何说支持 API 的服务都可以复用已有 adapter：OpenAI Completions、OpenAI Responses、Anthropic Messages 或 Google Generative AI。相关字段和模型定义见 [models.md](/pi-docs/coding-agent/models)。这条路径适合“协议已经兼容，只需要换 endpoint、headers、模型元数据”的服务。
+
+**通过 Extension。** 如果需要自定义 API 实现、OAuth flow、streaming、过滤或 credential refresh，就创建 Extension，并使用 `pi.registerProvider()`。相关说明见 [custom-provider.md](/pi-docs/coding-agent/custom-provider) 和 custom provider 示例。Extension 的注册层不应把 raw provider response 泄漏给 Agent Loop，仍要返回 Pi 统一的 Model/stream/message 形状。
+
+> 译者注：`models.json` 是配置扩展，Extension 是行为扩展。前者不能凭配置创造一个不存在的流式协议；后者也不能绕过权限和 secret 管理。Go 可以先实现 `models.json` 到 `HTTPModel` 的映射，Java 可以先用 `ProviderConfig` record，再在需要 OAuth 时增加 SPI。
+
+### 故障排查练习
+
+先在隔离的临时目录运行，不使用真实生产 key。按以下顺序记录：
+
+1. `pi --list-models` 是否能看到目标 Provider/model。
+2. `/model` 选择后，Provider id、model id 和 api 类型是否正确。
+3. 认证来源是 CLI、`auth.json`、环境还是 `models.json`；日志只记录来源，不记录值。
+4. 发送一个最小 prompt，分别观察 401/403、404、429、5xx、timeout、context limit 和 stream decode error。
+5. 删除或暂时改名 `auth.json` 中的错误 credential，确认优先级是否符合预期。
+6. 对 `!command` credential 使用会打印固定测试值的命令，确认 stdout、退出码和缓存生命周期。
+7. 对 Cloud Provider 逐项检查 account、region、endpoint、model id 和上游权限。
+
+| 现象 | 优先检查 | 不要先做的事 |
+| --- | --- | --- |
+| picker 没有模型 | catalog、`models-store.json`、models.json | 反复换 API key |
+| 401/403 | credential 来源、权限、endpoint | 把 key 写入更多文件 |
+| 404/model not found | provider/model id、deployment map、region | 关闭 schema 或权限检查 |
+| 429 | 配额、rate limit、retry/backoff | 并发重试轰炸 endpoint |
+| 5xx/timeout | proxy、region、服务状态、请求体 | 把服务端错误改写成 final answer |
+| 流能启动但解析失败 | API 类型、SSE/JSON shape、adapter | 让 Agent Loop 猜 raw response |
+| `/model` 能选但请求失败 | catalog 与凭据/权限分离 | 认为 picker 已验证可用 |
+
+> 译者注：这张表把 Provider 故障和 Agent Loop 故障分开。模型请求尚未得到合法 assistant message 前，Loop 不应执行工具；Provider adapter 应将错误变成可观察的 request failure，而不是伪造一个“模型说了某句话”。
+
+### Go/Java 对照与实践验收
+
+| 能力 | Pi/TypeScript | Go 教学实现 | Java 教学实现 |
+| --- | --- | --- | --- |
+| Provider contract | `Provider` + `Model` | `Model`/`HTTPModel` interface | `Model` + `HttpModel` |
+| credential source | `auth.json`、env、CLI、models.json | 显式配置 + `AGENT_API_KEY` | 构造函数 + `AGENT_API_KEY` |
+| cancellation | `AbortSignal` | `context.Context` | `CancellationToken` + interruption |
+| streaming | `AssistantMessageEventStream` | SSE callback | `HttpClient` 行流 callback |
+| dynamic provider | Extension `registerProvider` | explicit registry/factory | SPI `ServiceLoader` |
+
+Go 的最小 Provider adapter 可以是：
+
+```go
+model := &agent.HTTPModel{
+    URL: os.Getenv("AGENT_MODEL_URL"),
+    ModelID: os.Getenv("AGENT_MODEL"),
+    APIKey: os.Getenv("AGENT_API_KEY"),
+}
+```
+
+输入是受控环境变量，输出是 provider-neutral `Model`；真正的 `AgentLoop` 不读取 key。Java 同样由 `Main` 读取环境变量，构造 `HttpModel`，并把异常和 cancellation 交给 Loop。
+
+实践验收：
+
+1. 用 fake server/fake model 证明 key 没有进入普通事件或 session transcript。
+2. 为 401、429、5xx、空 choices、坏 JSON、SSE 断流分别写测试。
+3. 测试同一 Provider 下不同 model id 的 resolution，不要只测试默认模型。
+4. 测试 auth file 优先于环境变量；测试 missing variable 不会发送空 Authorization。
+5. 测试 Provider 被禁用或注销后，旧 model picker 与真实请求都会给出明确错误。
+6. 对任意 custom provider 记录它复用了哪个 API adapter，避免把 OpenAI-compatible 当作“所有 OpenAI 行为完全相同”。
+
+> 译者注：Provider 适配层的价值不是把所有厂商差异抹平，而是把差异集中在一个可测试边界。统一的 `Message`、`ToolCall`、`Usage` 和 `StopReason` 让 Loop 保持稳定；Provider-specific header、OAuth refresh、SSE 解析和错误分类留在 adapter 内。
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

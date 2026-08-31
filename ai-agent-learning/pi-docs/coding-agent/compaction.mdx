@@ -9,49 +9,434 @@ description: "上下文压缩、分支摘要、扩展钩子和相关设置。"
 
 ## 中文导读
 
-上下文压缩、分支摘要、扩展钩子和相关设置。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+这篇文档解决一个很具体的问题：对话历史越长，下一次 LLM 请求就越容易超过 Context Window。Pi 不会简单删除最早的消息，而是把较早工作压缩成结构化摘要，同时保留最近消息和文件操作线索。读者需要区分两件事：Session 仍保存完整历史，Provider 请求只投影摘要与保留区。
+
+本页同时介绍两种摘要机制。`Compaction` 处理当前分支的上下文过长或用户执行 `/compact`；`Branch Summarization` 处理 `/tree` 导航时离开旧分支。两者都使用摘要模型，但切入点、保存的 entry 和恢复语义不同。
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- 自动压缩入口：`packages/coding-agent/src/core/compaction/compaction.ts`。
+- 分支摘要入口：`packages/coding-agent/src/core/compaction/branch-summarization.ts`。
+- 共享序列化和文件追踪：`packages/coding-agent/src/core/compaction/utils.ts`。
+- `CompactionEntry` 与 `BranchSummaryEntry`：`packages/coding-agent/src/core/session-manager.ts`。
+- 扩展事件类型：`packages/coding-agent/src/core/extensions/types.ts`。
 
 ## 中文译文
 
-### 概览与触发时机
+### 一、先建立上下文预算模型
 
-Pi 有两种摘要操作：**Compaction** 在 Context 超过阈值或用户执行 `/compact` 时压缩较早消息；**Branch Summarization** 在 `/tree` 切换分支时保存正在离开的分支工作。两者使用同一种结构化摘要格式，也会累计记录读过和改过的文件。一次性摘要请求使用新的 routing session id；支持该能力的 Provider 会关闭 prompt-cache 写入，因为这类请求通常不会重复使用。
+把 Context 想成一次请求的账单，而不是一个无限增长的聊天数组。请求中可能同时有 system prompt、项目指令、工具定义、用户消息、assistant 历史、Tool Result 和本轮输入。每一项都会占用 token，Provider 还可能为输出预留容量。
 
-自动压缩条件是 `contextTokens > contextWindow - reserveTokens`。默认 `reserveTokens` 为 16384，可在 `~/.pi/agent/settings.json` 或项目 `.pi/settings.json` 配置，用来给模型输出留空间。工具完成、结果加入 Context 后，下一次 assistant 请求前会检查；若已达到阈值，Pi 在同一个 Agent run 中压缩并继续。若工具批次已声明终止且没有排队消息，则不会为了再做一轮而压缩；新用户 prompt 前和低层 Agent run 结束后也会检查。`/compact [instructions]` 可以手动指定摘要重点。
+Pi 使用下面的判断式：
 
-### Compaction 的步骤与边界
+```text
+contextTokens > contextWindow - reserveTokens
+```
 
-Pi 从最新消息向前累计 token 估算，直到达到默认 20000 的 `keepRecentTokens`，把这条边界作为 `firstKeptEntryId`。边界之前的消息送给摘要模型，已有摘要会作为迭代上下文；然后追加 `CompactionEntry`，下次 Context 从“summary + firstKeptEntryId 之后的消息”重建。`tokensBefore` 在写 entry 前从重建的实际 Session Context 重新计算，不能把过时估算当成事实。
+这表示“输入已经接近窗口上限”，而不是“已经没有任何 token”。例如窗口是 100000，`reserveTokens` 是 16384，那么输入超过 83616 时就需要压缩。预留区用于让模型仍能生成下一条 assistant 响应；它不是 compaction 会删除的消息。
 
-合法 cut point 可以是 user、assistant、BashExecution 或 custom message（包括 branch summary），不能落在 tool result 上，否则 tool call 和 result 会失配。若一个超长 turn 自身超过保留预算，边界可能落在 assistant 消息中间，形成 split turn：Pi 分别总结旧 history 和该 turn 的前缀，再合并两个摘要。重复压缩从上一个 compaction 的保留边界开始，而不是从 compaction entry 本身开始；找不到原边界时才退到它之后的 entry。
+> 译者注：初学者常把 `contextWindow` 当成“历史消息最大长度”。实际上它约束一次完整 provider request，工具定义、系统提示词和输出预算也在里面。只看 `messages.length` 会漏掉最容易造成 overflow 的长 Tool Result。
 
-`CompactionEntry` 的稳定字段是 `summary`、`firstKeptEntryId`、`tokensBefore`；还可有生成摘要的 `usage`、表示 Extension 提供内容的 `fromHook` 和 JSON 可序列化的 `details`。默认 `details` 包含 `readFiles`、`modifiedFiles`，但扩展可以替换成自己的结构。摘要不是简单删除历史：Session 仍保存原 entry，Context 只投影摘要和保留区。
+默认值是：
 
-### 分支摘要与文件追踪
+| 设置 | 默认值 | 意义 |
+| --- | ---: | --- |
+| `enabled` | `true` | 是否允许自动压缩 |
+| `reserveTokens` | `16384` | 给下一次模型输出预留的 token |
+| `keepRecentTokens` | `20000` | 尽量原样保留的最近上下文 |
 
-导航到另一个 leaf 时，Pi 找旧 leaf 与目标 leaf 的最深公共祖先，收集旧分支上离开的 entries，按预算从较新内容开始生成摘要，并在目标位置追加 `BranchSummaryEntry`。该 entry 记录 `fromId`、`summary`、可选 `usage`、`fromHook` 和 `details`。它让新分支知道被放弃方案做过什么，而不是复制整棵树。
+`reserveTokens` 和 `keepRecentTokens` 解决不同问题。前者保护“这一次请求还能得到输出”，后者控制“摘要模型需要总结多少旧内容”。把二者混为一个参数，会导致压缩过早或保留区过大。
 
-Compaction 和 branch summary 都会从待总结消息中的 Tool Call 以及已有 summary 的 `details` 累计提取文件操作。因此多次压缩或嵌套分支摘要仍保留完整的读/改文件轨迹。摘要格式包含 Goal、Constraints & Preferences、Progress（Done/In Progress/Blocked）、Key Decisions、Next Steps、Critical Context，以及 `<read-files>` 和 `<modified-files>` 清单。
+### 二、Pi 何时触发 Compaction
 
-### 序列化、Extension 与设置
+自动压缩并不是每次追加消息都立即发生。一个典型的多轮运行顺序是：
 
-调用摘要模型前，`serializeConversation()` 将消息转成 `[User]`、`[Assistant thinking]`、`[Assistant]`、`[Assistant tool calls]`、`[Tool result]` 等文本，明确告诉模型这是历史记录而不是需要继续扮演的对话。工具结果序列化时最多保留 2000 个字符，超出部分替换为带截断数量的标记。`generateSummary()` 返回文本，`generateSummaryWithUsage()` 还返回生成摘要的 usage。
+```text
+用户 prompt
+  -> assistant response
+  -> Tool Call
+  -> Tool 执行
+  -> Tool Result 追加到 Context
+  -> 检查 contextTokens
+  -> 未超阈值：继续请求 assistant
+  -> 超阈值：先 compaction，再继续同一个 run
+```
 
-Extension 可监听 `session_before_compact`，通过 `cancel: true` 取消，或返回带 `summary`、`firstKeptEntryId`、`tokensBefore`、`usage`、`details` 的自定义结果；事件同时提供 `reason`（`manual`、`threshold`、`overflow`）、split-turn preparation、此前摘要、文件操作和 `AbortSignal`。`session_compact_failed` 报告错误或 abort，`session_before_tree` 可取消导航或在用户选择摘要时提供自定义 branch summary。Hook 结果进入 Session 前应视为未持久化，不能当作恢复凭据。
+Pi 在工具完成且结果已经追加后、开始下一次 assistant 请求前检查阈值。这样工具结果本身也会被计入预算。若一个已完成的工具批次已经终止运行，并且没有排队消息要求下一轮响应，则不会为了压缩而凭空启动新一轮。
 
-默认设置如下，`enabled: false` 只关闭自动压缩，仍可执行 `/compact`：
+另外两个检查点是：新用户 prompt 开始前，以及底层 agent run 结束后。前一个检查点防止新输入直接撞上窗口上限，后一个检查点处理低层运行结束时才暴露出来的上下文压力。
 
-```json
-{
-  "compaction": {
-    "enabled": true,
-    "reserveTokens": 16384,
-    "keepRecentTokens": 20000
-  }
+手动命令是：
+
+```text
+/compact
+/compact 保留当前 API 迁移的决策和未完成测试
+```
+
+无参数时使用默认摘要指令；后面的文本会作为 `customInstructions` 影响摘要重点。它不是对历史进行文本替换，也不会让模型获得额外权限。
+
+> 译者注：`/compact` 的“手动”只表示触发来源，不表示它跳过安全检查。摘要仍然由 Session/Context 的规则生成，扩展仍可能取消，LLM 请求仍可能失败或被 abort。
+
+### 三、自动 Compaction 的完整步骤
+
+源文档给出的五步可以展开成下面的实际流程：
+
+#### 1. 找到 cut point
+
+Pi 从最新消息向前走，累计 token estimate，直到接近 `keepRecentTokens`。目标不是切出一个固定条数，而是找到一个能让保留区落在预算内的消息边界。消息长度不同，所以同样是十条消息，可能有完全不同的 token 成本。
+
+#### 2. 划分待总结区和保留区
+
+从 Session branch path 上得到两段：`messagesToSummarize` 和从 `firstKeptEntryId` 开始的保留消息。被总结的消息不会从磁盘删除；它们只是本次 provider context 的旧投影。
+
+#### 3. 调用摘要模型
+
+摘要模型收到结构化的序列化历史。若此前已经发生过 compaction，上一份 summary 会作为迭代上下文，避免每次都从最原始的历史重新总结。摘要请求使用独立 routing session id；在 Provider 支持时会关闭 prompt-cache write，因为这种一次性请求通常不会复用。
+
+#### 4. 追加 `CompactionEntry`
+
+生成成功后，Pi 向 Session 追加 entry。entry 至少需要 `summary`、`firstKeptEntryId` 和 `tokensBefore`。如果摘要模型返回 usage，也会保存 usage，供 Session 总量统计。
+
+#### 5. 从 entry 重建下一次 Context
+
+下一次请求不再把旧消息全部送给 Provider，而是使用：
+
+```text
+system prompt
++ compaction summary
++ firstKeptEntryId 之后的保留消息
+```
+
+输入变短了，但 Session tree 仍能用于搜索、branch、导出和后续恢复。
+
+> 译者注：这就是为什么 Compaction 不是“删除聊天记录”。如果把旧 entries 真删掉，用户无法导航到旧分支，审计也无法说明摘要来自哪些事实。Pi 选择保留原始 entry、只改变 Context projection。
+
+### 四、`firstKeptEntryId` 为什么重要
+
+`firstKeptEntryId` 是一个稳定锚点，不是“第 N 条消息”的临时索引。它告诉 Context builder：摘要覆盖到哪里，保留内容从哪里开始。Session tree 有新增 entry、分支和 navigation 后，数组下标会变化，ID 才能保持含义。
+
+重复压缩时，新的总结区从上一次 compaction 的保留边界开始，而不是把上一条 compaction entry 当成普通对话消息。如果该保留 entry 不在当前 path，Pi 才退到上一条 compaction 之后的 entry。这样早先保留下来的消息可能在下一次摘要中再次被纳入，避免摘要之间出现断层。
+
+Pi 在写入新的 `CompactionEntry` 前会重新从 rebuilt session context 计算 `tokensBefore`。这一步防止“预估 token”和实际要被替换的上下文不一致。
+
+### 五、Split Turn：一个 turn 自身就超预算
+
+正常情况下，压缩尽量在完整 turn 之间切割。一个 turn 从用户消息开始，包含 assistant 响应和该响应产生的 Tool Call/Tool Result，直到下一条用户消息。
+
+但如果一次任务非常大，即使只保留最近 `keepRecentTokens` 也无法放下完整 turn，切点可能落在 assistant 消息位置。此时称为 split turn：
+
+```text
+turn = user -> assistant -> tool -> assistant -> tool -> tool -> assistant -> tool
+                              ^
+                    cut point 落在中间
+```
+
+Pi 会把 split turn 拆成：
+
+- `turnPrefixMessages`：这个 turn 在切点之前的前缀。
+- `firstKeptEntryId` 之后的消息：可以原样继续放进请求。
+- `messagesToSummarize`：此前已经完成的历史 turn；split 场景下可能为空。
+
+摘要模型需要生成两个逻辑部分：旧历史摘要，以及 split turn 前缀摘要，最后合并。这样不会把前缀中的“已经做过什么”误当成当前未执行动作。
+
+> 译者注：切在 Tool Result 上会制造不合法上下文：Provider 看到一个没有对应 assistant tool call 的结果，或者看到 tool call 却没有结果。Pi 的 cut point 因此宁可切在 assistant/user/BashExecution/custom message，也绝不切在 tool result。
+
+合法 cut point 包括：
+
+1. user message。
+2. assistant message。
+3. `BashExecution` message。
+4. `custom_message` 或 `branch_summary`。
+
+禁止切在 Tool Result 上。这个规则是消息配对约束，不是排版偏好。
+
+### 六、数据结构：`CompactionEntry`
+
+核心字段如下：
+
+```typescript
+interface CompactionEntry<T = unknown> {
+  type: "compaction";
+  id: string;
+  parentId: string;
+  timestamp: number;
+  summary: string;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  usage?: Usage;
+  fromHook?: boolean;
+  details?: T;
 }
 ```
 
-> 译者注：`transformContext` 只是一次请求前的内存投影；Compaction 会把摘要写入 Session。前者可撤销，后者改变重启后的 Context 起点。
+逐字段解释：
+
+| 字段 | 写入者 | 作用 |
+| --- | --- | --- |
+| `type` | Session | 让 tree/context builder 识别 entry 类型 |
+| `id` | Session | 当前 entry 的稳定身份 |
+| `parentId` | Session | 把 entry 接到当时的 branch leaf |
+| `timestamp` | Session | 显示与排序，不负责恢复语义 |
+| `summary` | 摘要模型或 Extension | 下一次 Context 的压缩表示 |
+| `firstKeptEntryId` | compaction logic | 保留消息的起点 |
+| `tokensBefore` | compaction logic | 写 entry 前实际 context 的 token estimate |
+| `usage` | Provider adapter | 摘要请求本身的计费/用量 |
+| `fromHook` | Extension bridge | 是否由扩展提供摘要 |
+| `details` | 默认逻辑或 Extension | JSON 可序列化的额外状态 |
+
+默认 `details` 是：
+
+```typescript
+interface CompactionDetails {
+  readFiles: string[];
+  modifiedFiles: string[];
+}
+```
+
+文件清单不会替代完整历史。它是给下一次工作摘要和 UI 的快速事实；扩展可以使用自己的 JSON 结构，但必须保持可序列化。
+
+### 七、Branch Summarization 与 Compaction 的区别
+
+`/tree` 导航时，用户正在从旧 leaf 走向目标 leaf。Pi 找到两个 leaf 的最深公共祖先，然后从旧 leaf 回溯到公共祖先，收集即将离开的 entries。摘要写在目标分支的导航位置，使新分支知道旧分支已经尝试过什么。
+
+流程是：
+
+```text
+旧 leaf D                     目标 leaf F
+    \                          /
+     B <- C <- D    A    E <- F
+                      ^
+                common ancestor
+
+收集 B/C/D -> 按预算准备 -> 生成摘要 -> 目标位置追加 branch summary
+```
+
+Branch summary 不复制旧分支的所有上下文，也不等同于 compaction。它的关键字段是：
+
+```typescript
+interface BranchSummaryEntry<T = unknown> {
+  type: "branch_summary";
+  id: string;
+  parentId: string;
+  timestamp: number;
+  summary: string;
+  fromId: string;
+  usage?: Usage;
+  fromHook?: boolean;
+  details?: T;
+}
+```
+
+`fromId` 表示从哪个旧 entry 导航离开；`firstKeptEntryId` 不属于 branch summary。两种 summary 都累计 `readFiles` 与 `modifiedFiles`：当前待总结 Tool Call 提供文件操作，较早 summary 的 `details` 提供累计历史。
+
+> 译者注：Branch Summary 解决的是“换分支后仍记得另一条路做过什么”；Compaction 解决的是“同一条路的请求放不下了”。前者与 tree navigation 绑定，后者与 context budget 绑定。两者都叫 summary，但恢复和触发条件不同。
+
+### 八、摘要格式不是普通聊天
+
+摘要使用固定结构，方便下一轮模型和人类同时阅读：
+
+```markdown
+## Goal
+[用户想完成什么]
+
+## Constraints & Preferences
+- [明确要求和偏好]
+
+## Progress
+### Done
+- [x] [已完成]
+
+### In Progress
+- [ ] [进行中]
+
+### Blocked
+- [阻塞]
+
+## Key Decisions
+- **[决定]**： [理由]
+
+## Next Steps
+1. [下一步]
+
+## Critical Context
+- [继续工作所需事实]
+
+<read-files>
+path/to/file.ts
+</read-files>
+
+<modified-files>
+path/to/changed.ts
+</modified-files>
+```
+
+每个区块的用途不同：Goal 防止摘要失去任务目标；Constraints 防止压缩后违反用户偏好；Progress 防止重复劳动；Key Decisions 保存架构选择；Critical Context 保存下一步必需的路径、接口和失败原因；文件清单提供可验证线索。
+
+> 译者注：不要把 summary 写成“用户要求完成任务，已经处理部分内容”这种空话。它必须包含可操作的状态，例如“已修改 `src/agent.ts`，测试因 `429` 失败，下一步重试并检查 backoff”。
+
+### 九、消息序列化与截断
+
+摘要前，`serializeConversation()` 将内部 messages 变成文本：
+
+```text
+[User]: 用户说了什么
+[Assistant thinking]: 推理内容
+[Assistant]: 回复内容
+[Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
+[Tool result]: 工具输出
+```
+
+这一步有两个目的：统一不同 Provider 的消息形状；明确告知摘要模型“这是历史记录”，不要把历史中的 `[Assistant]` 当成当前角色继续对话。
+
+Tool Result 只保留最多 2000 个字符；超出的部分替换为带截断数量的标记。因为 `read` 和 `bash` 经常产生最大输出，如果不截断，摘要请求本身可能再次超出 Context。
+
+> 译者注：截断不是删除事实的许可。摘要模型看不到的尾部可能包含失败信息或路径，因此生产实现应让 Tool 结果本身有摘要/分页能力，或把关键事实写入结构化 details；不能假设“最后 2000 字符一定最重要”。
+
+### 十、Extension 如何定制压缩
+
+`session_before_compact` 在自动压缩和 `/compact` 前触发。Extension 可以返回 `{ cancel: true }`，也可以返回自定义 compaction。事件中的关键输入包括：
+
+| 输入 | 用途 |
+| --- | --- |
+| `preparation.messagesToSummarize` | 完整 turn 的历史消息 |
+| `preparation.turnPrefixMessages` | split turn 的前缀 |
+| `preparation.previousSummary` | 上一次压缩摘要 |
+| `preparation.fileOps` | 已提取的读/改文件 |
+| `preparation.tokensBefore` | 压缩前估算 |
+| `preparation.firstKeptEntryId` | 保留区锚点 |
+| `reason` | `manual`、`threshold` 或 `overflow` |
+| `willRetry` | overflow 后是否重试被中断 turn |
+| `signal` | 传给摘要模型的 `AbortSignal` |
+
+返回自定义摘要时，至少保持锚点和 token 计数：
+
+```typescript
+return {
+  compaction: {
+    summary: "Your summary...",
+    firstKeptEntryId: preparation.firstKeptEntryId,
+    tokensBefore: preparation.tokensBefore,
+    usage: summaryResponse.usage,
+    details: { readFiles, modifiedFiles }
+  }
+};
+```
+
+输入是 Extension event，输出是 compaction payload；它还没有自动成为 durable entry，只有宿主真正 append 后才可恢复。`cancel: true` 的输出表示本次压缩被拒绝，不是压缩成功。
+
+`session_compact_failed` 在手动/自动压缩失败或 abort 时触发，适合做 Telemetry 配对。它含 `reason`、`errorMessage`、`aborted`、`willRetry` 和 `fromExtension`。
+
+`session_before_tree` 在 `/tree` 导航前总会触发，即便用户不想生成摘要。它可以取消导航；只有 `userWantsSummary` 为 true 时返回的自定义 summary 才会使用。
+
+> 译者注：`AbortSignal` 只表达取消，不会撤销已经发送给远端 Provider 的请求，也不保证费用归零。摘要 Extension 必须把 signal 传给自己的 HTTP 调用，并在副作用边界自行设计清理。
+
+### 十一、用自己的模型生成摘要
+
+自定义摘要需要先把 AgentMessage 转成 LLM 消息，再调用 `serializeConversation`：
+
+```typescript
+const conversationText = serializeConversation(
+  convertToLlm(preparation.messagesToSummarize)
+);
+const { summary, usage } = await myModel.summarize(conversationText);
+```
+
+输入是待总结消息，输出是纯 summary 和可选 usage。不要把未序列化的对象直接插入 prompt；不同 Provider 可能对 thinking、tool call 和 result 有不同表示。
+
+建议测试以下情况：
+
+1. 一般完整 turn。
+2. split turn，确认 `turnPrefixMessages` 不丢失。
+3. Tool Result 超过 2000 字符。
+4. 摘要模型返回坏 JSON 或空 summary。
+5. `AbortSignal` 在调用中触发。
+6. `usage` 存在和缺失两种结果。
+
+### 十二、恢复、工具配对与失败路径
+
+Compaction 成功前，原始 Session 不应被截断；摘要请求失败时，用户仍应能看到旧历史。成功后恢复 Context 时必须保留 assistant tool call 与对应 Tool Result 的配对关系。
+
+典型错误路径如下：
+
+```text
+Tool Call 已写入，Tool Result 很长
+  -> context overflow
+  -> compaction 请求失败
+  -> 不写 CompactionEntry
+  -> 原 Session 仍可恢复
+```
+
+如果把“开始摘要”误当成“摘要已经写入”，重启后会得到不存在的 summary。只有 `CompactionEntry` 成功 append 后，新的 projection 才能引用它。
+
+Context overflow recovery 还要区分 `length` 的含义：如果 Provider 因输出上限返回 `length`，Pi 根据 intended output cap 判断是否需要 compaction；不能看到任意错误就压缩。每次输入的 overflow recovery 应有上限，避免“压缩失败—再请求—再次压缩”的无限循环。
+
+> 译者注：恢复测试的重点不是“summary 文本看起来不错”，而是 crash 后状态可判定。至少要测试摘要请求前、entry append 前、entry append 后、下一次请求前四个断点。
+
+### 十三、源码阅读与测试实验
+
+推荐从以下符号进入：
+
+- `prepareCompaction()`：计算 cut point、消息准备和 file operations。
+- `compact()`：生成摘要并追加 compaction entry。
+- `generateSummary()` / `generateSummaryWithUsage()`：摘要模型边界。
+- `collectEntriesForBranchSummary()`：收集旧分支 entries。
+- `prepareBranchEntries()`：按预算准备分支消息。
+- `generateBranchSummary()`：生成 branch summary。
+- `serializeConversation()`：把消息转为摘要输入。
+
+观察实验：
+
+1. 设置较小的 `keepRecentTokens`，构造包含 user、assistant、tool call、tool result 的 Session。
+2. 在 `prepareCompaction` 返回后打印 `firstKeptEntryId` 与 `messagesToSummarize`。
+3. 比较 compaction 前后的 provider messages，而不是只比较 Session 文件。
+4. 从 `/tree` 切换到另一 leaf，记录 common ancestor、`fromId` 和 branch summary entry。
+5. 用一个 3000 字符 Tool Result，确认序列化输出出现截断标记。
+6. 让摘要 Provider 返回错误，确认没有伪造成功 entry。
+
+实现实验：
+
+- 修改摘要格式，新增 `Verification` 区块，并写测试确认旧字段仍存在。
+- 为 `details` 增加一个可序列化的 `testCommands`，检查多次 compaction 是否累计。
+- 为 Go/Java FakeModel 增加 summary 请求，断言摘要请求不会进入普通 Agent Loop。
+
+思考题：
+
+1. 为什么不能按固定消息数而不是 token 预算切割？
+2. 如果 Tool Call 没有 Tool Result，是否应该执行它、补空结果，还是标记错误？
+3. `firstKeptEntryId` 丢失时为什么不能静默从 session 开头继续？
+4. 手动 `/compact` 是否应该允许用户指定保留文件清单？权限边界在哪里？
+5. Branch Summary 是否应该进入下一次 compaction 的 file tracking？为什么？
+6. 如果摘要模型比主模型更便宜，如何记录两者的 usage 和 cost？
+
+### 十四、Go 与 Java 对照
+
+| Pi/TypeScript | Go | Java | 关键差异 |
+| --- | --- | --- | --- |
+| `AbortSignal` | `context.Context` | `CancellationToken` + interruption | 都是取消意图，不等于远端回滚 |
+| Session entry | struct + JSONL | record + Jackson JSONL | ID/parent 必须稳定 |
+| `serializeConversation` | `strings.Builder` | `StringBuilder` | 结果截断规则要一致 |
+| summary hook | callback | listener/interface | 宿主决定是否 append |
+| token estimate | helper function | helper method | estimate 不是 Provider 精确计费 |
+
+Go 中可把摘要过程建模成返回 `(Summary, error)` 的函数，并让 `context.Context` 贯穿模型调用；Java 中可用 checked exception 与 `CancellationToken`，再用 `ExecutorService` 管理异步请求。两者都不要在测试里访问真实收费 API。
+
+### 十五、译者注：最容易错的五件事
+
+> 译者注：Context 被压缩不代表 Session 被删除。前者是一次请求的投影，后者是可恢复的历史。
+
+> 译者注：`summary` 不是 Tool Result。它只能描述已发生事实，不能凭空制造“命令已经成功”。
+
+> 译者注：`firstKeptEntryId` 不是数组下标。分支和 append 会改变数组位置，恢复必须使用 entry identity。
+
+> 译者注：`fromHook` 说明摘要来源，不代表 Extension 的副作用已经被 Harness 事务保护。
+
+> 译者注：压缩和 RAG 不是一回事。Compaction 减少已有 context，RAG 从外部知识库选择新片段；两者可以组合但不能互相替代。
+
+### 十六、小结
+
+读完后应能回答：何时触发自动压缩？`reserveTokens` 与 `keepRecentTokens` 如何区分？为什么不能切在 Tool Result？`CompactionEntry` 如何让 Context 从 summary 加保留区重建？`BranchSummaryEntry` 与它有什么不同？Extension 如何取消或提供自定义摘要？失败和恢复时哪些内容是事实？
+
+如果这些问题还答不上来，先运行上面的观察实验，再阅读源码中的 `prepareCompaction` 和 `collectEntriesForBranchSummary`，最后对照 Go/Java 的 Session 测试。
 
 ## 章节对照
 

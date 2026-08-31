@@ -9,7 +9,529 @@ description: "以 lanes、operation log、意图/结果和恢复为核心的 Har
 
 ## 中文导读
 
-以 lanes、operation log、意图/结果和恢复为核心的 Harness 设计稿。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+这份文档不是一个已经完成的运行时 API 说明，而是一份 Durable `AgentHarness` 设计稿。它要解决的问题是：一次 prompt 已经被系统接受、工具可能已经产生副作用、进程却在任意时刻崩溃时，新进程怎样判断“哪些事情已经发生、哪些事情必须继续、哪些事情绝不能重复”。
+
+读者可以把它和普通 Agent Loop 区分开：普通 Loop 关心下一次向模型发送什么；本设计还要记录一次操作的意图、每个可重试 step、工具执行边界、队列输入、延迟写入、成本和恢复状态。记录不是为了打印日志，而是为了让 reducer 在重启后得到和运行中相同的状态。
+
+本页的核心阅读问题有四个：
+
+1. 一个 session 为什么同时需要 conversation tree、lane、operation log 和 global facts？
+2. 为什么 effect 前要写 intent，effect 后还要用 provisioned id 写 result？
+3. 为什么 `steer`、`followUp`、`nextRun` 和 deferred write 必须在 checkpoint 处理，而不能直接插进当前 request？
+4. 为什么 manual drive、reduction 和 race catalog 是生产正确性的一部分，而不只是测试工具？
+
+> 译者注：这里的 durable 可译成“可恢复持久化”，不是“调用 `fsync` 就万事大吉”。真正的语义是：任何允许进程崩溃的边界，都能从已经提交的数据推导出下一步；外部 HTTP 或 shell 副作用是否已经发生，仍可能需要 replay policy 和幂等键来处理。
+
+### 如何阅读本页
+
+先读 Part I 建立对象模型，再读 Part II 的记录和 crash trace，最后读 Part III 的 API、reducer、effects、telemetry 和测试策略。代码片段是接口契约或伪代码，不表示当前 scaffold 已经实现了这些方法。
+
+文中有三种证据必须分开：
+
+- **设计稿事实**：本文件规定的 record、lane、recovery 和测试语义。
+- **源码事实**：当前 `packages/agent/src/harness` 实际已经实现的部分。
+- **教学推断**：为了理解为什么要这样划分而做的解释。
+
+当前工作区的 `packages/agent/docs/harness.v2.md` 是未跟踪设计稿。它描述了未来的 durable 目标，不能把它误报成研究 commit 中已经提交的完成实现；当前公共 `AgentHarness` 仍有 scaffold 方法返回 `HarnessNotImplemented`。
+
+## 使用建议
+
+1. 先读本页的 Part I–III 和章节对照，不要从英文附录第一行开始抄代码。
+2. 每读完一个 record，回到 Part II 的 crash trace，问“如果进程在这两行之间退出，reducer 读到什么”。
+3. 再阅读 `packages/agent/src/harness/` 中同名类型，确认设计稿和当前实现的差距。
+4. Go/Java 示例只实现教学级组合 Harness；它们帮助理解接口边界，不宣称实现本页全部 operation ledger 和 crash recovery。
+5. 运行测试时优先使用 fake provider、临时目录和手工 drive，不要把真实凭据或生产 shell 接到实验中。
+
+> 译者注：Java 读者可以把 lane mutation line 类比为每个 aggregate 的单线程 command queue，把 record 看作事件/意图日志；Go 读者可以把它类比为 `context.Context` 加 channel，但 channel 本身不是 durable storage。两种语言都必须把“排队成功”和“操作成功”分开。
+
+## 源码级中文译文
+
+### Part I：概念
+
+#### 1. Goals：设计目标
+
+**Durable runs。** prompt 一旦被接受，就成为一个 durable operation。进程崩溃后，新进程打开同一个 session，从最后一个安全边界继续。重点不是“尽量恢复”，而是 crash 能产生的每一种中间状态都必须有定义的恢复路径。
+
+**Lanes。** 一个 session 可以有多个 lane。lane 是 conversation tree 中一个命名的位置，也就是未来消息要接上的 leaf。每个 lane 同一时间最多运行一个 operation，但不同 lane 可以并行。Slack channel 可以是 session，thread 可以是 lane；subagent 也可以使用父 session 的另一个 lane。
+
+交互式 Pi 的 UI 通常只显示一个 lane，但扩展 API 仍然需要完整 lane 能力。lane 不是复制一份历史：两个 lane 可以共享同一个 prefix，在各自下一次 append 时自然分叉。
+
+**No partial outcomes。** run、compaction、navigation 之类的操作不能留下“看不出来到底完成没有”的状态。崩溃后只能看到未发生，或者看到足够的记录让 recovery 完成它。
+
+**Harness API。** event 只观察执行，不能改变执行；hook 可以拦截并改变 context、request、tool 和 run boundary。Extensions 建立在 events 和 hooks 之上，而不是直接改写 reducer。
+
+**Deterministic stepping。** durable write、provider request、tool、hook 和 timer 都经过注入的 effect boundary。`drive: "manual"` 在每个 boundary 前暂停，让测试逐个释放 effect、注入输入，或关闭并重新打开来模拟 crash。automatic 和 manual 使用同一套 procedure，差别只是 effect 何时释放。
+
+**Observability。** provider request/response、tool duration、retry 和 recovery 都应可观测，但 telemetry 是 diagnostics，不应反过来决定业务状态。
+
+**UI model。** 客户端先拿一个原子 snapshot，再订阅实时事件。事件不是 replay log；断线重连应重新取 snapshot，而不是假设遗漏事件可以补齐。
+
+**Single writer。** 一个 session 同时只有一个 harness 写入。多个 lane 可以并行，但它们通过同一个 writer 和共享单调 `seq` 线性化。两个进程写同一 session 不属于本设计。
+
+**v3 sessions load。** 唯一必须向后兼容的是旧 coding-agent v3 JSONL：它能打开并恢复成 idle。其他新格式和 API 可以破坏式演进。
+
+> 译者注：这些目标共同约束了架构。若只实现“崩溃后重新 prompt”，就会丢失 accepted prompt、重复收费或重复写文件；若只实现 append-only transcript，又无法知道 operation 是否正在 tool 中间暂停。
+
+#### Non-goals：明确不解决的事
+
+本设计不承诺 hook 自己发出的 HTTP 或文件写入 exactly-once。hook 的结果在 harness 记录提交后才 durable；提交前崩溃，hook 可能再次执行。需要安全恢复的 hook 必须使用 operation id 做幂等键，或者自行拥有事务。
+
+不承诺 partial provider stream 的断点续传。中断中的 stream 不是 durable message；它只能 retry 或 abandon。Deferred request 不同：provider 立即返回 handle，handle 被保存，之后用 `fetchDeferred` 兑换结果。
+
+不支持多个进程同时写一个 session，也不处理多个副本的无协调同步。lane 解决的是同一 session 内的并行 thread，不是分布式冲突合并。
+
+不把 coding-agent 迁移到 `AgentHarness`。v3 兼容只表示新的 JSONL repository 能读取支持的旧文件，不表示所有旧 API 都有迁移路径。
+
+#### 2. What a session is：session 的四部分
+
+Session 是 durable state，不只是 `List<Message>`。它包含四个互相分工的部分：
+
+1. **Tree**：conversation entries，通过 `parentId` 串成树。它包含 message、model/thinking/tool activation、compaction summary、branch summary 和 custom entry。tree 共享、被动、只追加，不属于任何 lane。
+2. **Lanes**：工作位置。lane 是名称加 leaf 指针；leaf 是未来 append 的父节点。每个 session 永远有 `main`，应用也可以用 Slack thread id、email thread id 等外部稳定键创建 lane。
+3. **Lane operation logs**：执行记录。它按时间记录 operation start、step attempt、tool start、queued message 和 operation finish。正常 context 构建不读取它，recovery 才读取它。
+4. **Global facts**：session name、entry label 等 latest-wins 值。它们不进入 conversation tree，但仍以 append-only 历史保存。
+
+四部分共用一个单调递增的 `seq`。seq 把 global fact、tree append 和 lane log 放进同一个可排序的时间线，但不能把它误解为跨进程分布式事务。
+
+```text
+树：共享、只追加                 lane
+ a ── b ── c ── d                main       → d
+       └── e ── f                slack:...  → f
+事实：name = "Refactor auth"
+```
+
+这张图的输入是 entry 和 lane leaf，输出是“未来工作从哪里继续”。operation record 不画在树上，因为它描述执行而不是对话；删除 records 后，tree 仍然应该是完整有效的 conversation。
+
+##### Active and passive
+
+Tree 和 global facts 是 passive：任何读者都可以读取，它们没有“正在执行”的生命周期。lane 是 active：它拥有 leaf、operation log、queues 和 pending writes。两个 lane 不共享这些 active state。
+
+一个 lane 的动作要么沿 leaf append 新 entry，要么 navigation 跳到已有 entry，要么向自己 operation log 写 record。这样，recovery 可以只读某个 lane 的 bounded slice，不必扫描整个 session。
+
+##### Invariants
+
+- tree 只表示 conversation，不保存 orchestration pointer、running state 或 queue。
+- entry 的 parent chain 永远不变；branch 共享 prefix，而不是复制 prefix。
+- lane leaf 只有两种移动方式：append 后变成新 entry，或 navigation 跳到已有 entry。
+- operation record 不进入 model context、transcript、branch query 或 fork。
+- 每个 lane 至多一个 open operation；一个 lane 出现两个 open operation 就是 corruption。
+- entry 可以被多个 lane 共享，record 只属于一个 lane。
+
+> 译者注：把 record 混进 message tree 是最常见的错误之一。模型不应该看到“tool_started”这种内部协调信息；fork 也不应把父 session 尚未完成的 queue 和 operation 一起复制，否则 child 会凭空恢复出父进程的副作用。
+
+#### 3. Lanes：并行工作的隔离单位
+
+Lane 可以类比“绑定到某个 commit 的命名工作位置”，但它比 git branch 更自由：navigation 可以跳到任意 entry，不要求向前移动，也不重写历史。
+
+lane 永久拥有四类状态：leaf、operation log、三种 queue，以及从 branch path 推导的 model/thinking/active tools。tool implementation、resources 和 stream options 通常是 harness-global；激活哪些 tool 可以按 lane 持久化。
+
+不同 lane 的 operation 可以并行，所有写入仍由同一 session writer 通过 `seq` 交错。一个 lane 上的 validation、最多一次 durable write 和内存更新构成 mutation line 上的一个 job；provider、tool、hook、retry 等慢操作不能占用这条线。
+
+创建 lane 不复制 tree，也不删除或重命名 lane。两个 lane 在同一 leaf 上时，下一次 append 让它们形成两个 child。某个 lane crash 后成为 suspended，不应阻塞兄弟 lane。
+
+> 译者注：lane 解决“共享历史但独立推进”，fork 解决“复制历史后独立隔离”。Slack thread 更像 lane；导出一个实验 session 或运行隔离 subagent 更像 fork。
+
+#### 4. How work executes：操作如何运行
+
+##### Operations
+
+Operation 是 lane 上需要 durable 解释的工作单位，共三类：
+
+- `run`：从 accepted prompt 开始，包含 tool call、steering、follow-up 和 auto-compaction，直到没有 pending work。
+- `compaction`：用 summary entry 替换旧 context；手动 compaction 是独立 operation。
+- `navigation`：把 lane leaf 移到已有 entry，可选生成 branch summary。
+
+acceptance 先于执行。accepted operation 必须有 `operation_started`，崩溃后要么 recovery 完成，要么写明确的 terminal outcome。run 的 outcome 是 `completed`、`failed` 或 `aborted`；compaction/navigation 还可因 decision hook 拒绝而 `declined`。
+
+##### Runs, turns, and steps
+
+run 由 turns 组成；turn 是一次 assistant step 加上该 assistant 要求的完整 tool batch。step 是可 retry 的工作单位，可以产生 assistant message、compaction summary 或 branch summary。
+
+一次 step 可能发零个、一个或多个 provider request。attempt number 必须 durable，重启不能把 retry count 清零。deferred provider request 会先写一个携带 handle 的 assistant entry，关闭当前 step，随后 operation suspended，直到下一次 resume 兑换 handle。
+
+每个真正启动 effect 的 tool call 也视作 step：`tool_started` 打开 step，tool-result entry 关闭 step。并行 batch 可以有多个 open tool step，但最终结果按原始 tool index finalize。
+
+##### Queues and deferred writes
+
+队列保存 conversational intent：
+
+- `steer` 修正正在进行的工作，只有 active run 才能接受。
+- `followUp` 在模型本来要停止时追加输入。
+- `nextRun` 为下一次 run 预置输入，当前 run abort 后仍保留。
+
+deferred write 保存 step 正在运行期间收到的 tree/config fact。它不是 conversational queue，abort 后仍要应用。
+
+两者在 acceptance 时都写完整 payload 的 record，但 entry 在 consumption/checkpoint 才写入 tree。这样模型看到的 entry 位置与 provider context 的尾部一致。若 acceptance 和 tree append 之间 crash，recovery 通过 provisioned id 补齐。
+
+##### Checkpoints
+
+每个 turn 之间先应用 deferred writes，再消费 steering，最后检查下一次 request 是否超出 context；必要时 auto-compaction。tool result 要让模型看到，所以通常开启下一 turn；只有 batch 中所有 result 都持久化 `terminate: true` 时才抑制自动 continuation。
+
+follow-up 只有在 tool continuation 和 steering 都耗尽后消费。finish boundary 必须重新检查 pending work；如果并发 steer 先在线程上排队，它会继续 run，如果 finish 先提交，steer 得到 `NoActiveRun`。
+
+##### Append-only context
+
+同一个 lane 的 provider context 在普通 turn 之间只能向尾部增长。中途追加 `[... U, M, A]` 会让当前请求中的 assistant `A` 看不到 `M`，并且破坏从 `M` 开始的 provider KV cache。deferred write 因此要等 checkpoint；compaction 是唯一有意的 cache invalidation。
+
+##### Lane lifecycle
+
+lane 的基本状态是 `Idle → Running → Idle`。abort 经过 `Cancelling`；deferred handle 或 crash 后是 `Suspended`，resume 继续同一个 operation，不新建 operation。
+
+storage write 失败是 harness-global fault，不只是某个 lane 失败。faulted harness 停止 effect 并拒绝调用；修复后重新打开，reducer 再分别恢复每个 lane。
+
+abort 要先 durable 写 cancellation marker，再 signal 正在运行的 effect，最后 reconciliation：未完成 tool 得到真实或 synthetic result，transcript 得到 closing assistant message。manual drive 会把 reconciliation 停在下一个 gate。
+
+##### Resume
+
+resume 永远继续 open operation，不启动新 operation。recovery 根据 records 末端选择路径：补 initial message、retry unfinished step、兑换 deferred handle、处理未完成 tool batch，或进入下一个 checkpoint。
+
+> 译者注：`resume()` 不是“再 prompt 一次”。它必须保留原 operation id、attempt count、provisioned ids 和已接受的 queue；否则恢复会重新产生一笔 operation，导致重复 assistant、重复工具或重复收费。
+
+### Part II：如何记录执行
+
+#### 5. Records：durability 的事实载体
+
+##### The durability rule
+
+每个 effect 遵守同一条规则：effect 前写 intent record，声明动作和将产生的 id；effect 后用同一个 id 写 result entry。没有多记录原子事务，系统依靠 provisioned id 判断 intent 是否 fulfilled。
+
+如果 intent 存在而 result 不存在，reducer 按类型决定 retry、complete 或 synthetic result。如果 result id 已存在但 payload 不同，这是 corruption，而不是“以最后一次为准”。
+
+> 译者注：这和普通 access log 不同。日志只说“我打算做什么”，不能证明副作用完成；result entry 也不能证明 intent 早已 durable。两者配对，recovery 才能处理两者之间的 crash window。
+
+##### Provisioned ids
+
+`ProvisionedEntry` 先分配 id，但把 `parentId`、`seq` 和 `timestamp` 留给 storage append。append 时它会连接到 lane 当时的 leaf。这样，接受阶段可以把“将来的 entry id”写进 operation intent，即使 entry 尚未进入 tree。
+
+代码语义是：输入是一个要保存的 entry payload；输出是去掉 storage-owned 字段后的 payload；storage 最终补齐 parent/seq/time。调用者不能自行伪造这些字段来跳过 lane mutation line。
+
+##### Record catalog
+
+所有 record 都属于一个 lane operation log。operation record 带 `runId`，而 next-run queue 和 standalone usage adjustment 可以没有 `runId`。基础字段 `id`、共享 `seq`、lane 和 Unix milliseconds timestamp 用于排序、查找和 corruption 诊断。
+
+`operation_started` 是 acceptance boundary，保存 source leaf、normalized prompt、captured initial messages、system prompt override 和 hook `resumeData`。run、compaction、navigation 的 intent 字段不同，不能用一个模糊 JSON 字段替代。
+
+`abort_requested` 只是请求标记，不是终态；后面必须 reconciliation，再写 `operation_finished(outcome: "aborted")`。`operation_finished` 说明 completed/failed/aborted/declined，并携带可诊断的 tagged error。
+
+`step_attempt` 为每个 retryable step 编号。assistant attempt 每次可有新的 result id；compaction 和 branch summary 的同一 structural step 复用约定的 result id。attempt 计数必须跨 restart 保留。
+
+`tool_started` 只有在 before_tool 和 validation 通过后才写。它保存 assistant entry、tool index、call id/name、经过 hook 后的 effective args、result id 和 `replay: "never" | "safe"`。
+
+`queue_enqueued` 保存完整 payload，`queue_cancelled` 通过 entry id 撤回尚未消费的 item，`write_deferred` 保存 checkpoint 要应用的 entry/config。usage record 独立于 message result，确保失败 request、discarded overflow 和 retry 的费用不消失。
+
+##### Cost ledger
+
+usage 是账务 ledger，而不是 orchestration state。每个 provider request settle 后先写 usage，再做 overflow 分类或 retry 决策。tool/hook 报告的 usage 也分别记录；应用可写 adjustment 修正估算。
+
+entry 的 `usage` 是 append 时写入的 immutable snapshot；entry effective cost 是读取时把绑定 records 相加；session cost 是所有 usage records 的总和。retry 或 safe replay 产生两条成本记录是有意的，因为它们确实可能向 provider 付了两次钱。
+
+##### Validity
+
+recovery 必须拒绝：一个 lane 有多个 open operation；record 引用不存在或已结束 operation；attempt 不连续；compaction reason 放错 step；abort 后又接受 steer/followUp；cancel 没有对应 enqueue 或 entry 已存在；structural step 的 result id 不一致；tool ordinal 与原 assistant call 不匹配；同一 invocation 有两个 `tool_started`；同一 provisioned id 绑定不同内容。
+
+这些检查的输入是 bounded record slice 加 point lookup，不是“相信最后一条日志”。输出要么是可 reduction 的有效前缀，要么是 faulted/corrupt 状态。
+
+#### 6. What each action writes：逐动作 crash trace
+
+本节的符号：`E` 是 tree entry，`R` 是 operation record，`L` 是 lane move，`G` 是 global fact，`H` 是 awaited hook，`X` 是 crash site。每两行之间都可以退出，恢复规则必须能解释每个位置。
+
+##### Run with one tool call
+
+标准顺序是：`before_run` → `operation_started` → user entry → assistant `step_attempt` → assistant tool-call entry → `before_tool` → `tool_started` → `after_tool` → tool result → 下一 assistant attempt → final assistant → `before_run_end` → `operation_finished(completed)`。
+
+如果 crash 在 `tool_started` 前，没有 effect intent；恢复可以重新验证/阻止该 call。如果 crash 在 `tool_started` 后而 result 不在，replay policy 决定重新执行还是写 synthetic interrupted。若 result 已经存在，则跳过该 call，继续 batch 的下一个 ordinal。
+
+##### Retry
+
+每次 attempt 都写 `step_attempt`；request 失败后 usage 先记账，再决定是否 backoff。backoff 中 crash 不会让下一次恢复重新从 attempt 1 开始。上限耗尽时写一个 terminal assistant error entry，再写 failed outcome。
+
+失败 attempt 通常不写 assistant message；否则下一次 retry 会把失败响应错误地当成上下文。恢复看到 terminal failure marker 后，只 drain 已接受 input；除非 steer/followUp 真正启动新工作，否则不能把失败改写成 completed。
+
+##### Context overflow at an assistant step
+
+`stopReason: "length"` 不能直接等同于 context overflow。必须把实际 output usage 和调用者/模型原始 intended output cap 比较：低于 intended cap 可能是 context 被 clamp 或 provider window，才允许 discard、compaction、retry；达到 intended cap 是真实截断，应进入 transcript。
+
+overflow-form provider error 也走相同分类。discarded response 不进入 tree，但它已经发生的 usage 仍写 ledger。一次 conversational input 最多进行一次 overflow recovery；第二次同一输入仍 overflow，就写 bounded failure，不能无限 compact/retry。
+
+> 译者注：这里的 intended cap 很容易被实现成“实际发送给 provider 的 cap”。但 context clamp 可能把发送值缩小，Codex-style provider 也可能拒绝某个参数。若用 clamp 后的值判断，就会把真正的 context overflow 错误当作用户要求的输出上限。
+
+##### Steering while a tool runs
+
+tool 执行中收到 `steer` 时，调用方先拿到 queue acceptance 结果；`queue_enqueued` durable 后才表示输入已被接受。tool result 仍按原计划写入。下一 checkpoint 消费 queue item，把它 append 到 tree，下一 request 才看到它。
+
+若 crash 在 enqueue 前，steer 从未被接受；若 crash 在 enqueue 后，recovery 补 provisioned entry。`cancelQueued` 和 consumption 都在 mutation line 上，所以只有 cancel-first 或 consume-first 两种历史。
+
+##### Input at the finish boundary
+
+finish 不是“检查一下然后返回”这么简单。`tryFinishRun` 把 pending-work check 和 terminal append 放在同一 mutation job。steer 先排队就会让 run continue；finish 先提交则 steer 看到 `NoActiveRun`。不存在第三种半接受状态。
+
+deferred write 和 abort 使用同一排序规则：finish 前接受的 write 必须在关闭前应用，finish 后接受的 write 看到 idle lane，走普通 idle append；abort 先赢则进入 reconciliation。
+
+##### Deferred write mid-turn
+
+如果当前 provider request 的 context 是 `[..., U]`，调用方 append `M` 必须写 `write_deferred`，等 assistant `A` commit 后再把 `M` 接到尾部。直接 append 会形成 tree `[... U, M, A]`，却无法声称 A 看过 M；同时破坏 provider cache。
+
+##### Abort during a tool
+
+abort 调用返回表示 abort request 已 durable，不表示 tool 线程已经停止。随后写 `abort_requested`、清掉 steer/followUp、signal effect，真实完成的 tool 保留真实结果，未知的 tool 写 synthetic `interrupted`，再写 closing assistant 和 aborted finish。
+
+`nextRun` 和 deferred writes 不被 abort 丢弃。suspended lane 的 abort 也要关闭 open operation；manual drive 会把关闭流程暴露为可释放 action。
+
+##### Tool execution crash sites
+
+X1/X2：before_tool 前没有记录，恢复重新走 validation/hook。X3/X4：`tool_started` 已写而结果未知，只有 persisted replay 与当前 declaration 都是 safe 才能重放 effective args；否则 synthetic result，不再运行 hook。X5：result entry 已存在，跳过调用。
+
+并行 batch 仍按原始 tool index 对账。截断的 assistant batch 永不执行任何 tool，只为未完成 call 写 truncated result。这样“模型要求执行”不会被错误地解释为“所有副作用都已执行”。
+
+##### Auto-compaction at a checkpoint
+
+auto-compaction 属于当前 run，不新建 operation。checkpoint 调用 `before_compaction`；hook 可以 decline 或直接提供 summary。没有 hook summary 时，compaction step 自己写 attempt、usage 和 result entry，随后新的 assistant step 使用 compacted context。
+
+manual `compact()` 则是独立 operation，有自己的 operation_started、structural step 和 operation_finished。两者共享 summary contract，但 recovery 查询路径不同。
+
+##### Navigation
+
+navigation 采用 move-first。接受时记录 target、summary id 和 label；hook/summary 在内存中准备；lane move 是 commit point；move 后 summary entry 沿 target leaf append，label 作为 global fact 写入，最后 finish。
+
+move 后 crash 并不回滚：recovery 看到 leaf 已经等于 target，就只补 summary、label 和 finish。move 前 crash 则重新执行 decision/summary。禁止 `targetId === sourceLeafId`，因为必须让“move 是否已发生”可判定。
+
+##### Deferred provider request
+
+deferred assistant entry 保存完整 handle，不保存虚假的 content。该 entry 使 operation suspended；每次 `resume()` 最多 fetch 一次。provider 返回 pending 且 handle 相同，就重新 suspended；ready 追加普通 assistant；terminal/rejected fetch 转成 error entry 并 failed。
+
+recovery 不应自动发一个新的付费 request。`cancelDeferred` 是 best effort；suspended entry 仍留在 transcript。handle 的 provider/model/api/id 必须与持久化值完全匹配，不匹配是 defect。
+
+#### 7. Recovery：从 bounded state 继续
+
+##### Restore
+
+打开 session 时 restore 只读，不 append、不调用 provider、不执行 tool。首先通过 `findOpenOperations(lane, { limit: 2 })` 区分零个、一个和多个 open operation；两个就是 corruption。
+
+idle lane 只需要查最近 run-kind operation 后的 nextRun queue。suspended lane 只读取 open operation 的 record slice、从 leaf 回溯到 source leaf 的 own entries，以及 provisioned ids 和配置的 point lookups。不能因为 session 很大而扫描全部历史。
+
+##### The reduction
+
+reducer 把 bounded reads 变成 `LaneState`：aborting、unfinished attempt、overflow guard、tool batch、deferred handle、pending queue、pending write、missing initial messages 和 structural target。它同时推导 effective model/thinking/active tools 和 terminal failure provenance。
+
+live execution 和 restore 必须使用同一语义。运行中是每次 commit 更新 state，重启后是从 record/entry reduction；两者不应各自维护一套“差不多”的判断。usage 不进入 state，因为账务不应该改变 orchestration。
+
+##### Resume
+
+resume 顺序很重要：先补 accepted initial messages；aborting 就 reconciliation；有 unresolved tool batch 就按 crash site 处理；有 deferred handle 就兑换；terminal failure 只 drain accepted input；有 unfinished step 就按 durable attempt 继续；否则进入 checkpoint。
+
+所有 recovery append 都是 `appendIfMissing`：id 已存在且内容一致就跳过，id 存在但内容不同就 corruption。重复运行 recovery 应得到 fixed point，而不是再产生第二份 entry。
+
+> 译者注：reducer 是 Harness 的“可解释状态机”。如果状态只能从内存 flag 得到，进程退出后就无法恢复；如果每次 resume 都重新猜测上下文，又会重复 side effect。把 reduction 设计成纯函数，才能为 crash matrix 写确定性测试。
+
+### Part III：API 与实现
+
+#### 8. Public API
+
+##### The lane surface
+
+`AgentLane` 是单个 lane 的异步操作面：`prompt`、`skill`、`promptFromTemplate`、`compact`、`navigateTree`、`resume`、`abort`，以及 `steer`、`followUp`、`nextRun`、`cancelQueued`。getter 也返回 Promise，是为了让同一 interface 可由远程 proxy 实现；`name` 和 listener registration 是少数同步例外。
+
+公共 operation 不应把正常业务失败作为 throw。调用返回 `Result<T, E>`：`Ok` 表示请求已接受，不保证最终 completed；`Err` 表示 lane busy、invalid input、unknown target、closed 或其他预期拒绝。storage fault 和 invariant defect 才会 fault harness。
+
+`prompt` 的签名可以接 text、images 或 `AgentMessage[]`；skill/template 在 acceptance 前展开。`compact` 和 `navigateTree` 是 structural operation；`resume` 继续原 operation；`abort` 在返回后可能继续 background reconciliation。
+
+##### The harness
+
+`AgentHarness.create(options)` 打开 session、恢复 lanes，并返回 suspended inventory，但 restore 不能启动 effect。`lane(name)` 只查找，`createLane` 创建永久键，`lanes()` 至少包含 main。harness-global 的 tools/resources/stream policy 与 lane-specific model/thinking/active tools 要分开。
+
+`systemPrompt` callback 默认每 request 运行；hook override 可以固定整次 run。`toProviderMessages` 和 `entryProjectors` 负责把 tree entry 投影到 provider context，避免让 operation record 泄漏给模型。
+
+##### Options
+
+options 要覆盖 model、tools、retry、compaction、stream、telemetry、hooks、events、drive mode、storage 和 permission。`telemetryContext` 默认 no-op；它应显式传递，不依赖 `AsyncLocalStorage` 或 global current span。
+
+automatic drive 用真实 provider/tool；manual drive 使用相同 procedure，只是把 effects 包在 gate 中。权限策略必须在 tool effect 前执行，不能把模型生成的 name/args 当作授权。
+
+##### Results and tagged errors
+
+`RunResult` 要同时提供 outcome、final message、final entry id、leaf id、operation id 和 error。completed、aborted、failed、suspended 都是可解释状态；suspended 要携带 `DeferredHandle`。
+
+`LaneBusy`、`InvalidMessage`、`NoActiveRun`、`NothingToResume`、`UnknownTarget` 和 `Closed` 是预期 tagged errors。`HarnessFault` 表示 storage/不变量错误，不能静默转换成空结果。
+
+##### Suspended operations
+
+`suspended` 表示 operation 仍 open，但当前没有 effect 运行。原因可以是 crash，也可以是 deferred handle。恢复信息应包含 lane、operation kind/id、startedAt、reason、normalized prompt、handle、被 abort 清掉的 queue payload 和缺失 identity。
+
+##### Examples
+
+示例的重点不是 API 的每个 overload，而是生命周期：创建 harness → 接受 prompt → append operation intent → stream assistant → 写 usage → 执行/记录 tool → commit message → finish。每个步骤都应有对应的 crash prefix 和 resume 测试。
+
+#### 9. Snapshots and subscription
+
+客户端先捕获 `LaneSnapshot`，再调用 `start(listener)`。两步之间到达的事件要 buffer，start 时先 flush，再转 live，保证没有 gap。snapshot 至少包含 transcript、leaf、operation status、streaming assistant、running tools、retry、三种 queue 和 pending writes。
+
+`watchSession()` 只提供 lane inventory 和全局事件；`events.on` 是 live-only。事件不是恢复事实，重连必须重新取 snapshot。configuration 通过 getter 读取，不把一份可能过期的配置复制进 snapshot。
+
+#### 10. Events
+
+事件是有序、被动、非持久、非 replay 的 live stream。run、turn、step、message、tool、queue、entry、fact、config、compaction、navigation 和 usage 都可以有明确 event discriminant。
+
+`message_end` 必须在 entry commit 后发送；`run_start` 到 `run_end` 可以驱动 UI busy indicator。listener 抛错由事件系统捕获并报告为 `handler_error`，不能改变 operation state，也不能让 handler_error 无限递归。
+
+恢复时可以以 `recovery: true` 重发新的 start bracket，但不能把旧事件逐条 replay。这样 UI 得到当前状态，而不是把旧的执行过程误认为正在重新执行。
+
+#### 11. Hooks
+
+hook 是 awaited interception point，注册是 harness-global，但 event 带 lane，handler 可以自行过滤。`before_run` 和 `before_resume` 使用稳定 registration id；resumeData 按 id 保存，不能按数组位置恢复。
+
+`transform_context`、`before_request`、`before_payload`、`after_response` 可能在 retry/resume 重跑；`before_tool` 在没有 `tool_started` 时重跑；`after_tool` 只有 safe replay 才重跑。进入 durable state 的 hook 输出必须在 effect 前落盘。
+
+`before_tool` fail-closed：抛错就阻止 tool。其他 handler 可以隔离错误并发 `handler_error`，但错误处理规则要稳定。hook 自己的副作用不受 harness exactly-once 保护，必须由扩展作者负责幂等。
+
+> 译者注：hook 和 event 的边界是“能否改变流程”。event 是观测，hook 是控制；不要为了方便让 event listener 修改全局 state，也不要把权限审批做成事后 event。
+
+#### 12. Session and SessionTree
+
+entry 的 storage 字段有 type、id、seq、parentId、timestamp。v4 tree 类型包括 message、model change、thinking level、active tools、compaction、branch summary 和 custom。tool result 的 `terminate` 属于 reduction 控制，不应泄漏成模型自然语言。
+
+`SessionTree` 提供 leaf、entry、stats、facts、全树查询和 bounded branch query。context build 从最近 compaction summary、retained tail 和之后 entries 构建，不读取已被压缩的旧 history。SessionTree 不负责 navigation 的业务流程。
+
+`Session` 绑定 main，提供 view、lane create/move、append entry/record、record query、open-operation query 和合并 seq 的 log。应用只能通过 Session 写 usage adjustment，不能绕过 Session storage。
+
+#### 13. Storage
+
+backend-neutral `SessionStorage` contract 要求一个 session、一条全局 seq、atomic append、immutable read、JSON payload、single-writer claim 和 open-operation projection。Memory 是参考实现，JSONL 是一 session 一文件，SQLite 用表和 writer lease 实现同样查询语义。
+
+JSONL 要处理 format-4 header、entries、records、lanes、facts、statistics、fork、坏尾行和坏中间行。v3 read-only open 不改物理文件；首次 v4 write 才通过 temp+rename 转换。坏尾可以按设计截断，坏中间数据必须拒绝。
+
+SQLite 的 branch cache 只是私有读缓存，不是恢复的唯一事实；cache repair 要显式进行。不同 backend 必须共享 query bounds、seq 顺序、JSON validation 和 recovery 行为。
+
+fork 只复制允许的 tree/facts/lane pointer，不复制 operation logs、queues 或 open operation。fork 的成本从零开始，entry usage snapshot 仍可显示历史；subagent id 要由 parent session 和 tool call 稳定推导，safe replay 才不会产生 child twin。
+
+#### 14. Agent-loop building blocks
+
+`streamAssistant` 负责一次 provider request：context transform、message projection、authenticated model dispatch 和 settled assistant result。`prepareToolCall` 负责 lookup、参数准备、validation、before_tool 和 abort 检查；`executeToolCall` 执行 effect；`finalizeToolCall` 运行 after_tool patch；`createToolResultMessage` 统一结果。
+
+`executeToolBatch` 把 phase 1（准备）和 phase 3（finalize）按 source order 串行化，只有 phase 2 的 tool effect 可以并行。`length` 截断的 batch 不执行。旧 `agentLoop`/`runAgentLoop` 是无 durable state 的 compatibility wrapper。
+
+> 译者注：这个拆分让 durable Harness 可以在 tool effect 前写 `tool_started`，在 effect 后写 result，而不必把整个旧 loop 改造成一个巨型事务。
+
+#### 15. Harness internals
+
+##### The effects boundary
+
+所有副作用都经过 `Effects`：append entry/record、move lane、set fact、conditional commit、provider stream/fetch/cancel、tool、hook 和 sleep。procedure 不直接持有 session、model、tools 或 hook runner；read 可以不 gate，effect 必须 gate。
+
+##### The lane mutation line
+
+每个 lane 有 FIFO promise chain。一个 mutation job 只做读取 live state、验证、至多一次 durable write 和内存更新；provider/tool/hook/backoff 在 job 外执行。这样慢 effect 不会阻塞同 lane 的 queue acceptance，也让 finish 和 steer 有明确定序。
+
+##### Race catalog
+
+必须覆盖 prompt/prompt、queue/finish、deferred write/finish、abort/finish、abort/queue consumption、abort/before_run_end follow-up、nextRun/acceptance、deferred write/abort close、config/acceptance snapshot、abort/in-flight effect、cross-lane writes 和 cancel/consume。
+
+其中 abort 与 in-flight external effect 无法靠排序消除：effect 可能已发生但结果未到达。只能依靠 intent、replay declaration、synthetic result 和外部幂等。
+
+##### Drive modes
+
+automatic drive 直接执行 `fx`；manual drive 在每个 effect 前创建 JSON-safe `ActionInfo`。`peekAction()` 无副作用且稳定；`executeAction()` 只释放它描述的一个 action；`runToCompletion()` 释放到 operation settled。
+
+manual gate 必须可重入。stream 内的 hook 可能产生 nested action，driver 要看到并释放 nested action，不能等待外层 action 而隐藏它。parallel tool 在 manual 下逐一释放，但 durable log 与 automatic mode 相同。
+
+close parked operation 时，parked promise 拒绝为 `HarnessClosed`，已释放的 durable prefix 保留；重开后走普通 recovery。两个并发 driver 属于 programmer defect。
+
+##### Live lane state
+
+`LaneState` 是 records 和 own entries 的 reduction 结果，包含 lane/leaf、operation、aborting、unfinished step、tool batch、pending queues/writes、deferred、overflow guard、newest own entry 和 structural targets。
+
+`RunFailed`、`Park`、`Aborted`、`Overflow` 是 procedure 内部控制信号。它们不能逃逸为混乱的 caller exception：RunFailed 进入 failure drain，Park 进入 suspended，Aborted 进入 abort path，Overflow 丢弃响应并触发 bounded compaction。
+
+每次 resume/close/finish 后做 fixed-point self-check：从 storage 重新 reduction，必须和 live LaneState 相等。这样 reducer/writer drift 会在刚发生时暴露，而不是等到下一次 crash。
+
+##### Dispatch and the loop
+
+`resume()` 先检查 missing tools/models，再运行 `before_resume`，发 `run_resume`，按 operation kind dispatch 到 run、compaction 或 navigation procedure。run procedure 先补 initial messages，再处理 abort/deferred/tool batch/unfinished step，最后进入 driver loop。
+
+driver loop 的 checkpoint 顺序是 apply pending writes → consume steering → abort check → context compaction → assistant step → tool continuation → follow-up → finish boundary。每个 effect 都通过 `fx`，所以 automatic/manual 看到同一条 durable trace。
+
+assistant step 在 request 前写 step attempt，response settle 后写 usage；recoverable overflow 直接 discard；deferred 写 assistant handle 并 Park；retryable error sleep 后继续；terminal error 写 error entry 并进入 RunFailed。
+
+##### Steps, tools and abort
+
+tool batch 为每个 call 保留 source ordinal。live path 在 `before_tool` 与 validation 后写 `tool_started`，phase-2 execute，after_tool finalize，再 append result。recovery path 对每个 call 单独选择 skip/replay/synthetic，不能因为 batch 中另一个 call 成功就忽略当前 call 的 crash site。
+
+abort path 可以 best-effort cancel deferred，给未完成 call 补 synthetic result，应用 deferred writes，写 closing assistant，再 finish aborted。structural compaction/navigation 没有 tool batch，但也必须通过同一 finish/abort boundary。
+
+compaction 的 hook summary 要标记 `fromHook` 并记录 hook usage；navigation 先 move 再 summary/label。两者都要按 attempt cap 恢复，不能把生成 summary 的内存文本当作 durable fact。
+
+### 16. pi-ai：deferred requests
+
+deferred 是 per-request capability。`SimpleStreamOptions.deferred` 表达是否请求 deferred execution；settled assistant message 的 `stopReason` 可以是 `stop`、`length`、`toolUse`、`error`、`aborted` 或 `deferred`，而 `pending` 只允许存在于 mutable live stream。
+
+`DeferredHandle` 至少包含 provider、modelId、api 和 provider id，可选 expiresAt、pollAfterMs 和 conversion data。handle 是 recovery 所需的事实，不是给用户展示的普通文本。
+
+`ProviderStreams.fetchDeferred` 和 `cancelDeferred` 的存在就是 capability signal。Models 层负责 credential store、header merge、timeout 和 telemetry context；provider adapter 把 native reason 归一化为 core stop reason。fetch pending 必须返回同一个完整 handle，ready 才追加 successor entry。
+
+> 译者注：deferred 和 retry 不等价。retry 会重新产生 provider request，可能再次收费；deferred redemption 是取回已经提交的同一请求。两者在 telemetry、成本和幂等语义上都必须分开。
+
+### 17. Forks and subagents
+
+fork 有 branch scope 和 tree scope。branch 只复制 root 到 fork point 的一条路径，tree 复制所有 entries、lanes 和 facts；两者都不复制 records、queues 或 open operations，因此 fork 从 idle 开始。
+
+fork point 即便在 tool batch 中间也可以 prompt；message transform 可以为 orphaned tool call 插入 synthetic empty result。source 不变，`parentSessionId` 记录父子关系。subagent 的 child session id 要由 parent session 和 tool call id 确定性推导，safe replay 重连原 child，而不是创建 twin。
+
+### 18. Telemetry
+
+telemetry 使用显式 context，不依赖 Node/Bun/browser 某个 runtime 的 ambient current span。`TelemetryContext.startSpan` 用 callback 创建 child，保留同步 throw、异步 reject 和返回值；默认成功，显式 error status 不会被自动成功覆盖。
+
+通用 contract、no-op 和 in-memory adapter 属于 `packages/telemetry`；AI request schema 和 Harness schema 属于 agent package。Pi 不内置 exporter，应用可以把显式 context 接到 OTel、Sentry 或日志系统。
+
+schema 要限制 span name、parent、required start attributes、closed values 和 optional end attributes。`pi.ai.request` 记录 provider/model/api、streaming、stop reason、usage、chunk count 和 TTFC，但默认不记录 prompt、completion、tool args/output、payload、headers 或 credentials。
+
+Harness spans 可以覆盖 operation、checkpoint、turn、step、tool、hook、sleep、event handler 和 session write。tool span 只描述 phase-2 raw execution；blocked/invalid tool 没有 tool intent，也不应产生虚假的 tool span。
+
+span lifetime 跟普通执行 scope 一致：operation acceptance 成功后才开始 operation span；failed result 可以正常 resolve 但显式 error；close/fault/defect reject callback；进程死亡不执行 cleanup，下一进程创建新的 recovery span。telemetry 不写入 record、entry、snapshot 或 deferred handle。
+
+> 译者注：日志回答“发生了什么”，trace 回答“这件事属于哪次 request/step”，durable record 回答“重启后下一步是什么”。三者都可以有 operation id，但不能相互替代。
+
+### 19. Testing strategy
+
+Tier A 是纯 reduction/resume：预填每一个 section 6 crash prefix，打开 harness，resume 并断言最终 durable state。Memory、JSONL、SQLite 必须跑 parity；还要覆盖 v3 normalization 和 malformed payload。
+
+Tier B 是 writer conformance：instrument Session，精确断言 E/R/L/G/H 顺序。重点回归“effect 是否在 intent record 前启动”，以及 provider request 是否只在 tail 追加，compaction 才允许 cache invalidation。
+
+Tier C 使用真实 harness、faux provider、真实 backend 和 manual drive。每次 `executeAction()` 后 snapshot，按每个 prefix close/reopen/resume，并把 recovery 重复两次。需要覆盖 race catalog 两种顺序、park/abort、automatic/manual 相同 durable log、fixed-point live/reduced state、peek 无副作用、恰好一个 finish 和 fault prefix。
+
+额外 suite 还应验证 telemetry adapter contract、event ordering、hook registration id/resumeData、fail-closed before_tool、usage ledger、overflow classification、deferred pending/ready/terminal、fork cost/messageCount 和 v3 fixtures。
+
+> 译者注：happy path 只能证明“代码能跑”，不能证明“代码崩了能恢复”。Tier A 测 reducer，Tier B 测 writer 顺序，Tier C 测真实 API 与任意 interleaving；三层缺一不可。
+
+### 20. Implementation status and work packages
+
+实现范围只包括 `packages/agent`、`packages/session-backends/sqlite-node`、`packages/telemetry` 和 `packages/ai` 的 telemetry request options；不迁移 `packages/coding-agent`。没有完成的 public operation 必须继续返回 `HarnessNotImplemented`，不能返回看似合理的 idle/no-op。
+
+一个 package 的工作流程是：确认 dependency 与 reservation → 读取设计和 primary files → 在 primary files 实现行为 → 写覆盖 invariant 的 focused tests → 跑 `npm run check` → 合并后移除 reservation、勾选 package。设计与实现不一致时，先更新设计再继续，不要偷偷改语义。
+
+Track F 负责 scaffold truth 和 public ownership。F0 已要求每个未完成 public method 明确 reject，record-free create 才可安全打开；R track 负责 indexed recovery query、validity 和 pure lane reduction；R3 才拥有 restore inventory。
+
+Track J 负责 format-4 JSONL storage、repository lifecycle、fork、crash/corruption、v3 read-only normalization、first-write conversion 和 schema validation。J4/J5/J6 尚未完成时，不能声称 v3 转换和完整 durable payload 已交付。
+
+Track I 负责 telemetry、hooks、passive events、mutation line、automatic effects 和 manual gate。I5 的 gate 仍是 primitive；只有 H/C/N/O tracks 才把它接入完整 public harness。
+
+Track L 把 `agent-loop.ts` 拆成 streaming、tool-call phases、batch composition 和 compatibility wrapper。它必须保持已有 loop/agent suite 不变，并为 settled-result narrowing、abort、source order、truncation 加 focused tests。
+
+Track H 按 H0–H8 逐步实现 lane facade、successful run、retry/resume、queues/checkpoints、deferred writes/config、abort/wait/close、live tool batch、tool recovery 和 deferred provider redemption。每一步都要加 Tier A/B/C 对应测试。
+
+Track C/N 负责 manual compaction、threshold auto-compaction、overflow recovery 和 move-first navigation。overflow 要按 intended cap 分类、usage 先入 ledger，并按 conversational input bounded 到一次 recovery。
+
+Track O 负责 snapshots、event completeness、runtime telemetry、QA salvage 和 core completion。QA3 不能恢复旧 API，只能把仍然成立的 invariant 映射到当前 public surface。
+
+public method ownership 表的意义是防止“一个方法有很多看起来能工作的 placeholder”。`AgentHarness.create()`、lane facade、prompt、resume、queues、abort、tool recovery、deferred redemption、compaction、navigation、manual drive、watch 和 telemetry 各自有 owner 与 acceptance criteria；未由 owner 实现的方法必须保持显式未实现。
+
+> 译者注：work package 不是项目管理装饰。它把“谁能改哪个文件、哪个测试证明完成、哪个依赖先落地”写成约束，避免多个人同时扩展 `agent-harness.ts`，最后无法判断哪一个状态语义是真实的。
+
+### 21. Required reading
+
+推荐顺序是：先读 `session/types.ts` 的 v4 contract，再读 `session/session.ts` 和 Memory backend；然后读 SQLite repository、`agent-harness.ts`、telemetry schema、`agent-loop.ts`、旧 `agent.ts` 的 queue/abort、messages/compaction/transform，最后读 coding-agent v3 session format 和 extension runner。
+
+阅读每个文件时固定回答：文件为什么存在？入口 symbol 是什么？输入从哪里来？输出交给谁？哪一行产生 durable write？如果这一行之后 crash，reducer 会得到什么？
+
+本页是设计稿参考译本，不是当前 scaffold 已完成的承诺。结合 `reference/source-map` 的固定 commit 路径和当前工作区源码阅读，才能区分目标架构与现状。
 
 ## 章节对照
 

@@ -1,12 +1,267 @@
 ---
-title: "Go 11：Steering 与 Follow-up"
-description: "在 turn 边界注入用户新指令，并区分中止与排队。"
+title: "Go 11：Steering、Follow-up 与 NextRun 队列"
+description: "在安全边界处理运行中输入，理解队列消费时机、Abort 清理和并发状态。"
 ---
 
-# Go 11：Steering 与 Follow-up
+# Go 11：Steering、Follow-up 与 NextRun 队列
 
-`Steer` 和 `FollowUp` 只在运行中入队，由 loop 在工具批次或模型响应边界读取；`Abort` 取消当前 run 并清空这两类队列；`NextRun` 留给下一次 `Prompt`。这是状态语义，不是普通字符串数组。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-让工具阻塞时调用 `Steer`，断言下一次请求包含新消息；再调用 `Abort`，确认它不会偷偷在取消后执行；单独测试 `NextRun`。
+- 区分 steering、follow-up、next run、interrupt 和 abort。
+- 说明为什么运行中的第二个 Prompt 不能直接启动第二个 Loop。
+- 读懂 `Agent` 的 mutex、running、cancel 和三类队列。
+- 观察队列只在 turn boundary 消费的效果。
+- 为并发输入和取消设计测试。
+
+## 输入、增加的能力与明确不做什么
+
+输入是已有的 `AgentLoop`、`context.Context` 和 `Agent` 生命周期。本阶段增加三个意图队列：当前运行的 steering、当前运行结束边界的 follow-up、下一次运行才消费的 nextRun。
+
+本阶段不实现可抢占的 goroutine，不保证正在执行的文件写入可以回滚，也不把 channel 当成持久队列。队列都在内存中；进程崩溃会丢失它们。durable Harness 必须把队列接受和消费写成可恢复 record。
+
+## 前置 Go 知识
+
+需要掌握：
+
+- mutex 保护共享状态；
+- 一个 goroutine 负责运行，其他 goroutine 可以调用控制方法；
+- slice 追加和复制；
+- context cancellation；
+- “边界”是控制流状态，而不是任意时间点。
+
+## 问题场景：用户中途说“不要改数据库”
+
+假设当前步骤：
+
+```text
+assistant -> read -> grep -> edit -> test
+```
+
+用户在 `grep` 运行时发送新 prompt。错误做法是立刻把新文本插入正在发送的 Request：
+
+```text
+Request 已发给 Provider
+-> 直接修改同一个 messages slice
+-> Provider 看到的内容不可预测
+-> Session 记录顺序与 UI 顺序不同
+```
+
+正确做法是接受一个 steering 意图，在工具结果或下一次模型请求之间的边界消费。这样已经发出的 Request 保持不变。
+
+## 三个队列的语义
+
+| 方法 | 队列 | 什么时候消费 | 典型意思 |
+| --- | --- | --- | --- |
+| `Steer` | `steering` | 当前 run 下一次 step 开始 | 改变当前方向 |
+| `FollowUp` | `followUp` | 模型本来要停止的边界 | 当前任务完成后追加输入 |
+| `NextRun` | `nextRun` | 下一次 `Prompt` 开始前 | 预置下一次运行 |
+
+这三者不是三种字符串格式，而是三种生命周期。把所有输入都放一个 slice 会丢失“谁有权消费”和“abort 后是否保留”的语义。
+
+## Agent 的共享状态
+
+```go
+type Agent struct {
+    Loop AgentLoop
+    mu       sync.Mutex
+    steering []Message
+    followUp []Message
+    nextRun  []Message
+    running  bool
+    cancel   context.CancelFunc
+}
+```
+
+输入是 Prompt、Steer、FollowUp、NextRun、Abort 的并发调用；输出是 RunResult、error 或队列状态；状态变化由 mutex 原子保护；失败点是绕过锁访问 slice、重复启动 run、清错队列。
+
+`running` 与 `cancel` 必须一起更新。只有 `running=true` 且 `cancel != nil` 时，Abort 才能真正向当前 run 发信号。
+
+## Prompt 如何原子启动
+
+```go
+func (a *Agent) Prompt(ctx context.Context, text string) (RunResult, error) {
+    a.mu.Lock()
+    if a.running {
+        a.mu.Unlock()
+        return RunResult{}, errors.New("agent is already running; use Steer or FollowUp")
+    }
+    initial := append([]Message(nil), a.nextRun...)
+    a.nextRun = nil
+    initial = append(initial, Message{Role: RoleUser, Content: text})
+    runContext, cancel := a.beginRunLocked(ctx)
+    a.mu.Unlock()
+    return a.execute(runContext, cancel, initial)
+}
+```
+
+输入是外部 context 和 user text；输出是运行结果或已运行错误；状态变化是原子地捕获并清空 nextRun、设置 running；失败点是 unlock 前调用慢函数或先清空 nextRun 再启动造成竞态。
+
+先捕获 nextRun、再 `beginRunLocked`，保证两个并发 Prompt 不会同时拿到同一条预置消息。当前实现还保证一个 run 未结束时第二个 Prompt 明确失败。
+
+## Steer 与 FollowUp 的入队边界
+
+```go
+func (a *Agent) Steer(text string) error {
+    return a.enqueue(&a.steering, Message{Role: RoleUser, Content: text}, true)
+}
+
+func (a *Agent) FollowUp(text string) error {
+    return a.enqueue(&a.followUp, Message{Role: RoleUser, Content: text}, true)
+}
+
+func (a *Agent) NextRun(text string) error {
+    return a.enqueue(&a.nextRun, Message{Role: RoleUser, Content: text}, false)
+}
+```
+
+输入是文本和 activeOnly；输出是成功或队列错误；状态变化是对应 slice 追加；失败点是没有 active run 时错误调用 steering/follow-up，或把 nextRun 错误地限制为 active run。
+
+`Agent.execute` 将 queue callbacks 注入 Loop：
+
+```go
+options.Steering = a.drainSteering
+options.FollowUps = a.drainFollowUps
+```
+
+Loop 在每次 step 开始消费 steering，在没有 Tool Call 的响应边界消费 follow-up。它不会在已发出的 HTTP Request 中间修改 history。
+
+## Abort 的队列规则
+
+```go
+func (a *Agent) Abort() error {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    if !a.running || a.cancel == nil {
+        return errors.New("no active run")
+    }
+    a.steering = nil
+    a.followUp = nil
+    a.cancel()
+    return nil
+}
+```
+
+输入是用户取消；输出是 nil 或 no active run；状态变化是取消当前 context、丢弃只服务于当前 run 的 steering/follow-up；失败点是工具不能合作取消、远端副作用已经发生。`nextRun` 特意保留，供下一次 Prompt 使用。
+
+这解释了一个容易误解的行为：Abort 不是“清空所有用户输入”。它清掉当前操作的未消费意图，但不清掉提前为下一次 run 准备的 nextRun。
+
+## 失败 trace：错误的消费时机
+
+```text
+Steer 入队
+-> 当前工具仍在执行
+-> 立即写当前 Request
+-> Request 与 Provider stream 不一致
+```
+
+正确 trace：
+
+```text
+Steer 入队
+-> 当前 Tool 返回
+-> Loop 下一 step 开始 drainSteering
+-> history append user steering
+-> 发下一次 Request
+```
+
+输入是 queue message；输出是下一轮可见消息；状态变化是 queue 从 pending 变为空；失败点是执行前丢失、消费两次或在 abort 后复活。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestAbortStopsInFlightModel|TestToolCallIsExecutedAndReturnedToModel'
+go test -race ./...
+```
+
+当前测试重点验证 abort 最终返回 cancellation 和普通 loop 仍能完成。完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+预期 calculator 和 final 输出；demo 本身不展示 steering。要观察队列，应在测试里使用阻塞 Tool 或带 callback 的 Fake Model。
+
+## 测试设计
+
+### 未运行时入队
+
+`Steer` 和 `FollowUp` 在 idle 时应返回 `queue requires an active run`；`NextRun` 在 idle 时应成功。然后 Prompt，断言 nextRun 出现在 initial history。
+
+### 运行中 steering
+
+让 ScriptedModel 或 Tool 通过 latch 暂停，另一个 goroutine 调用 Steer。释放 latch，断言下一次 Request 包含 steering Message，而当前 Request 没有被并发修改。
+
+### Follow-up
+
+让第一轮 assistant 没有 Tool Call，同时在结束边界前加入 FollowUp。断言 Loop 继续下一次 Model request，而不是立即 run_end。
+
+### Abort
+
+Abort 后断言 steering/follow-up 不会在取消后被消费，nextRun 仍能被下一次 Prompt 捕获。重复 Abort 应返回 no active run。
+
+### race
+
+运行 `go test -race ./...`。它只能发现内存数据竞争，不能证明 Session 或远端服务具有 exactly-once。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent.ts`：`Agent`、`PendingMessageQueue`、`steer`、`followUp`、`abort` 和 run lifecycle。
+- `packages/agent/src/agent-loop.ts`：在 step/turn 边界消费 steering 与 follow-up。
+- `packages/coding-agent/src/core/agent-session.ts`：把用户输入、事件和 Session 行为连接起来。
+
+Pi 的队列语义更完整，Go 版本用三个 slice 和 mutex 展示相同的生命周期问题。不要把示例的内存队列描述成 durable queue。
+
+## Java 对照
+
+| 语义 | Go | Java |
+| --- | --- | --- |
+| 互斥 | `sync.Mutex` | `synchronized` |
+| 当前运行 | `running bool` | `boolean running` |
+| 取消 | `context.CancelFunc` | `CancellationToken` |
+| steering | `[]Message` | `List<Message>` |
+| 并发输入 | goroutine | executor/thread |
+
+Java `Agent` 同样在 synchronized block 中捕获 nextRun 和开始运行；Go 不需要一个专门的 queue class，但必须保护 slice。两种实现都只能在边界修改 history。
+
+## 实验：禁止数据库修改
+
+### 目标
+
+模拟 Agent 执行中途收到 steering，并证明新要求不会插入已发送的 Request。
+
+### 准备
+
+打开 `agent.go`、`loop.go` 和 `agent_test.go`。准备一个会等待 channel 的 fake Tool 或延迟 Model。
+
+### 步骤
+
+1. 启动一个会产生 Tool Call 的 Prompt。
+2. 等待 Tool 开始后调用 `Steer("不要修改数据库代码")`。
+3. 在 Tool 返回前检查第一轮 Request，确认没有 steering。
+4. 释放 Tool。
+5. 检查下一轮 Request，确认出现 steering message。
+6. 在下一次 run 前调用 `NextRun`，确认它不出现在当前 run。
+7. 调用 Abort，确认当前队列清掉而 nextRun 保留。
+
+### 观察点
+
+“接受输入”和“让模型看到输入”是两个时刻。队列是意图暂存，不是对已发请求的修改。
+
+### 预期结果
+
+当前 Request 不变化；下一边界消费 steering；Abort 返回 cancellation；nextRun 在之后的 Prompt 才出现。
+
+### 思考题
+
+如果 steering 本身要求停止当前工具，是否需要 cooperative cancellation？如果 finish 与 steering 同时到达，哪个顺序应写入 durable log？为什么不能仅靠 UI 时间戳决定？
+
+## 小结与下一阶段
+
+Steering、follow-up 和 nextRun 的差异来自生命周期。`Agent` 用 mutex 原子管理 running、cancel 和队列，`AgentLoop` 只在边界消费，Abort 清理当前意图但保留下一次输入。
+
+下一阶段用 interface 和显式 registry 设计 Go 插件系统，把可扩展行为从核心 Loop 分离出去。

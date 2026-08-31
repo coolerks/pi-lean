@@ -1,12 +1,313 @@
 ---
-title: "Go 08：Events"
-description: "让 Agent Run 可观察，而不把日志硬编码进业务分支。"
+title: "Go 08：Event、EventSink 与 Telemetry"
+description: "把运行事实、UI 观察和诊断指标分开，建立可测试的事件时间线。"
 ---
 
-# Go 08：Events
+# Go 08：Event、EventSink 与 Telemetry
 
-`Event` 描述 `model_attempt`、`tool_start`、`tool_end`、`tool_error` 和 `run_end`；`OnEvent` 是 callback。业务结果走返回值，诊断和 telemetry 走事件，二者不要混淆。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-记录一次 run 的 event 时间线和 step，验证 Tool error 仍有 end/error 事件，Provider retry 能看到多个 attempt。事件 handler 自己失败时不能让核心循环静默丢结果。
+- 区分返回值、领域事件、日志和 telemetry span。
+- 读懂 `Event` 的字段如何指向 assistant、Tool Call 和 Tool Result。
+- 解释 `EventSink` 为什么是 callback，而不是第二个状态机。
+- 用事件重建一次 Agent step 的时间线。
+- 处理 retry、Tool error、abort 和 listener 失败。
+
+## 输入、增加的能力与明确不做什么
+
+输入是上一阶段已经具有 retry、Tool dispatch 和 cancellation 的 `AgentLoop`。本阶段把 `OnEvent EventSink` 接到模型尝试、工具执行、结果回传和运行结束位置，并用 `Recorder` 记录轻量 Span。
+
+本阶段不实现 OpenTelemetry exporter、不把完整 prompt 写入日志，也不让事件决定业务状态。Event 只是观察接口；真正的 transcript 和最终 RunResult 仍由 Loop 返回，Telemetry 只是诊断数据。
+
+## 前置 Go 知识
+
+需要理解：
+
+- function value 可以作为 callback 传递；
+- 指针用于表达“这个事件携带一条消息”；
+- `time.Time` 可以记录发生时间；
+- callback 中的错误必须显式处理；
+- mutex 保护跨 goroutine 的 slice。
+
+`EventSink` 的调用者是 Loop，所有权很重要：Loop 触发事件，调用方决定收集、打印或丢弃；sink 不应该反过来调用 `AgentLoop.Run`。
+
+## 问题场景：只打印最终文本
+
+如果 CLI 只打印最终回答，用户看不到：
+
+```text
+模型尝试了几次？
+哪个工具失败？
+当前是不是在等待 backoff？
+abort 是在模型请求前还是工具执行中发生？
+```
+
+失败 trace：
+
+```text
+model request -> tool call -> tool error -> retry -> final text
+```
+
+最终只显示“已完成”，无法判断工具是否真的成功。更糟的是，把日志字符串当作状态，后续改日志格式就会破坏监控。
+
+解决办法是让运行过程产生结构化 Event，同时让业务结果保持独立。
+
+## Event 的领域模型
+
+`loop.go` 定义：
+
+```go
+type Event struct {
+    Type       string
+    Step       int
+    Message    *Message
+    ToolCall   *ToolCall
+    ToolResult *ToolResult
+    Error      error
+    At         time.Time
+}
+
+type EventSink func(Event)
+```
+
+输入是 Loop 某个状态边界；输出是一个不可变意义上的事件值；状态变化通常发生在 sink 的收集器；失败点是调用方读取了 nil 指针、event type 拼错或 sink 阻塞。
+
+`Message`、`ToolCall` 和 `ToolResult` 使用指针是为了表达“该事件可能携带该对象”。事件本身按值传递，Loop 不会把同一个事件对象交给多个消费者共享修改。
+
+当前代码的 `Type` 是 string，不是 enum；因此生产系统可以进一步定义常量或 typed event，避免拼写错误。
+
+## 事件产生位置
+
+### step 和模型尝试
+
+每次 step 开始：
+
+```go
+l.emit(Event{Type: "step_start", Step: step})
+```
+
+每次 Model attempt：
+
+```go
+l.emit(Event{Type: "model_attempt", Step: step})
+```
+
+输入是 step number；输出是诊断事件；状态变化是观察者增加计数；失败点是模型调用前 callback 已阻塞。
+
+### assistant 响应
+
+模型返回后，Loop 先补齐 role 和 timestamp，再追加 history，然后发：
+
+```go
+l.emit(Event{Type: "assistant", Step: step, Message: &message})
+```
+
+这意味着事件观察到的是已经进入本轮 history 的 assistant message，而不是尚未确认的 delta。流式 delta 由 `HTTPModel.Stream` 的 onDelta callback 处理，不能假设 `Event` 包含每个 token。
+
+### Tool 生命周期
+
+执行前：
+
+```go
+l.emit(Event{Type: "tool_start", Step: step, ToolCall: callPtr(call)})
+```
+
+校验、权限、执行和 after hook 完成后：
+
+```go
+l.emit(Event{Type: "tool_end", Step: step,
+    ToolCall: callPtr(call), ToolResult: resultPtr(result), Error: err})
+```
+
+随后 Loop 把结果转换为 `RoleTool` Message，并发 `tool_result`。输入是 call 和结果；输出是 UI/Telemetry 可消费的时间线；状态变化是 history 增加 Tool message；失败点是工具报错、hook 报错或事件 sink 本身阻塞。
+
+### 结束
+
+无 Tool Call 的 assistant：
+
+```go
+l.emit(Event{Type: "run_end", Step: step, Message: &message})
+```
+
+max steps 或模型 error 当前会返回 error，但没有统一的 `run_end` 事件。学习者可以在此基础上定义 `run_error`，但必须同步更新测试和文档，不能把缺失事件假装成现有行为。
+
+## Event 不等于 durable state
+
+三种东西要分开：
+
+| 对象 | 作用 | 是否恢复依据 |
+| --- | --- | --- |
+| `RunResult.Messages` | 本次运行的 transcript | 可作为 Session 输入 |
+| `Event` | 运行中观察和 UI 更新 | 当前示例不是 |
+| `Recorder.Span` | 诊断耗时和 error | 当前示例不是 |
+
+如果事件先发布再写 Session，进程崩溃后 UI 可能看见一个不存在的结果。成熟 Harness 应明确使用 `observed` 与 `persisted` 事件，或规定事件只表示内存观察。
+
+## Recorder 如何记录 Span
+
+`telemetry.go` 的接口很小：
+
+```go
+type Span struct {
+    Name   string
+    Start  time.Time
+    End    time.Time
+    Error  string
+    Fields map[string]string
+}
+
+func (r *Recorder) Start(name string, fields map[string]string) func(error)
+```
+
+`Start` 立即记录开始时间，返回一个 finish callback。调用 finish 时计算结束时间，把 error 字符串写入 Span，再通过 mutex append 到 Recorder。
+
+输入是 span name、低敏感字段和最终 error；输出是 `Snapshot()` 可读的 Span；状态变化是追加诊断记录；失败点是没有调用 finish、字段包含 prompt/secret、调用者并发读写未经保护。
+
+当前 Harness 的 `OnEvent` 为每个 event 建立 `agent.<type>` Span，因此它是教学连接，不是完整 trace parent-child 关系。生产 Telemetry 还要 run id、provider、model、usage、latency 和 redaction。
+
+## 逐步实现一个 collecting sink
+
+```go
+var events []agent.Event
+loop := agent.AgentLoop{
+    Model: model,
+    Tools: registry,
+    Options: agent.LoopOptions{
+        MaxSteps: 4,
+        OnEvent: func(event agent.Event) {
+            events = append(events, event)
+        },
+    },
+}
+```
+
+这段代码适合单 goroutine 测试。输入是 Loop 事件；输出是切片；状态变化是追加；失败点是并行工具事件可能同时调用 sink，实际 collector 需要 mutex 或 channel。
+
+生产式 collector：
+
+```go
+events := make(chan agent.Event, 32)
+options.OnEvent = func(event agent.Event) {
+    select {
+    case events <- event:
+    default:
+        // 明确选择丢弃策略，而不是无限阻塞 Agent。
+    }
+}
+```
+
+不要在没有定义 backpressure 的情况下无限发送。丢弃 telemetry 可以接受，丢弃 durable Tool Result 不可以；这也是 Event 和状态的区别。
+
+## 运行命令与预期输出
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestToolCallIsExecutedAndReturnedToModel|TestRetryAndMaxSteps'
+go test -race ./...
+```
+
+预期测试通过，race 检查无报告。运行 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+预期包含：
+
+```text
+tool[calculator]> 5
+assistant> 2 + 3 = 5
+final> 2 + 3 = 5
+```
+
+CLI 只打印 assistant 和 tool result；其余 event 通过 Recorder 保存在内存，不会自动打印。demo 可能生成 `.agent-session.jsonl`，验证后可删除。
+
+## 测试设计
+
+### 正常时间线
+
+使用两轮 ScriptedModel，断言事件至少包含：
+
+```text
+step_start -> model_attempt -> assistant(tool call)
+-> tool_start -> tool_end -> tool_result
+-> step_start -> model_attempt -> assistant(text) -> run_end
+```
+
+注意 parallel Tool 的 `tool_start/tool_end` 完成顺序可能不同；不能按事件完成顺序判断结果顺序。需要使用 `Step`、Tool Call ID 和最后的 history 断言。
+
+### retry 时间线
+
+让 ScriptedModel 第一次失败，第二次返回文本。断言 `model_attempt` 出现两次，并且没有两条 assistant message。retry 事件只是诊断；控制流仍看 `completeWithRetry` 的返回值。
+
+### Tool error
+
+让 Tool `Execute` 返回 error。断言 `tool_end.Error` 非 nil、`ToolResult.IsError` 为 true，Loop 仍可把受控错误交给下一轮模型。
+
+### abort
+
+让模型 Delay 一秒，启动 Prompt 后调用 Abort。断言收到 model error/取消返回；不要要求必然收到 run_end，因为当前实现取消路径不发统一终止事件。
+
+### sink 失败
+
+当前 `emit` 直接调用 `OnEvent`，sink panic 会向上冒泡，sink 阻塞会暂停 Loop。这个行为必须在教学上说清楚。生产版本可以用 recover 隔离 listener，但应记录 handler error，不要静默吞掉。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/agent-loop.ts`：assistant、tool、retry 和终止事件的真实控制流。
+- `packages/agent/src/agent.ts`：`AgentEvent`、`subscribe`、生命周期和 queue。
+- `packages/agent/src/harness/events.ts`：durable Harness 设计中的事件类型与观察边界。
+- `packages/agent/src/harness/telemetry.ts`：Telemetry schema 和敏感字段约束。
+
+Pi 的事件模型更丰富，Go 示例只保留最小字段。对应关系是概念映射，不是 API 兼容声明。
+
+## Java 对照
+
+| Go | Java |
+| --- | --- |
+| `EventSink func(Event)` | `EventSink.accept(Event)` 或 Listener |
+| `time.Time` | `Instant` |
+| mutex + slice | synchronized collection |
+| channel | `BlockingQueue` / `Flow.Publisher` |
+| `Recorder.Start` finish callback | `Telemetry.Span` try-with-resources |
+
+Java 的 listener 抛异常也要定义隔离策略；Go callback panic 不能被“日志”自动修复。`Flow` 可表达背压，但本示例 Java 选择简单 Listener，避免把协议学习和 reactive 运行时混在一起。
+
+## 实验：画出一次 run 的事件时间线
+
+### 目标
+
+用结构化事件回答“模型调用了几次、哪个工具失败、最终为什么停止”。
+
+### 准备
+
+打开 `loop.go`、`telemetry.go` 和 `agent_test.go`；只使用 ScriptedModel。
+
+### 步骤
+
+1. 为 Loop 设置 `OnEvent`，收集 type、step、Tool Call ID 和 error。
+2. 执行 calculator 两轮脚本。
+3. 把事件格式化成表格，不打印完整 prompt 和工具输出。
+4. 把第一轮 Tool 改成 unknown tool。
+5. 比较 tool_end error 与第二轮模型收到的 Tool Result。
+6. 再加一个 retry error，比较 attempt 数量。
+
+### 观察点
+
+事件发生位置对应控制流边界；`tool_result` 发生在 history append 之后；Recorder 只保存时长和字段，不拥有 Session。
+
+### 预期结果
+
+你可以区分“观察到 tool_start”和“工具结果已进入下一次 Request”，也能指出当前示例没有完整 persisted event。
+
+### 思考题
+
+如果 EventSink 很慢，应该阻塞 Agent、丢弃事件还是另设队列？哪些事件可以丢，哪些事实丢失后无法恢复？如何给同一次 run 的事件加 correlation id？
+
+## 小结与下一阶段
+
+结构化 Event 让运行可解释，Recorder 让耗时和错误可统计，但二者都不自动等于 durable state。下一阶段用 JSONL Session 保存 transcript，并讨论保存时机、坏行、原子替换和恢复边界。

@@ -5,15 +5,281 @@ description: "定义 Tool、JSON Schema 和执行边界。"
 
 # Go 03：Tool Definition
 
+## 本阶段完成什么
+
+本阶段只设计 Tool contract，不实现文件和 shell。目标是把两个对象分开：
+
+- `ToolDefinition`：发送给模型的名字、描述和参数 schema。
+- `Tool`：Runtime 通过名字找到并执行的 Go 对象。
+
+你将实现 Registry 的注册、查找、定义导出和最小 schema gate，并用计数器证明坏参数没有产生副作用。
+
+## 本阶段不完成什么
+
+本页不负责：
+
+- 验证完整 JSON Schema 标准的所有关键字。
+- 解析任意 provider 的 Tool Call 字段。
+- 执行文件、网络或命令。
+- 决定用户是否批准危险操作。
+
+这些边界分别属于 provider adapter、工具实现和 PermissionPolicy。不要把一个 `Tool` interface 设计成“所有安全问题的解决方案”。
+
+## 前置知识
+
+需要完成 Go 01/02，并理解 `json.RawMessage`、`map[string]any`、slice 和方法 receiver。Go interface 不需要显式 `implements`：方法集匹配就满足接口。
+
+## 输入与新增接口
+
+上一阶段的输入是 `Response.Message`。本阶段新增：
+
 ```go
+type ToolCall struct {
+    ID        string          `json:"id"`
+    Name      string          `json:"name"`
+    Arguments json.RawMessage `json:"arguments"`
+}
+
+type ToolDefinition struct {
+    Name        string         `json:"name"`
+    Description string         `json:"description"`
+    Schema      map[string]any `json:"parameters"`
+}
+
+type ToolResult struct {
+    Content   string
+    Details   map[string]any
+    IsError   bool
+    Terminate bool
+}
+
 type Tool interface {
     Definition() ToolDefinition
     Execute(context.Context, json.RawMessage) (ToolResult, error)
 }
 ```
 
-模型只看到 `Definition`；只有 `Registry.Validate` 通过名称、object 参数和 required 字段检查后，Runtime 才调用 `Execute`。模型生成的是数据，不是 Go 函数调用。
+`ToolCall.Arguments` 保留原始 JSON，是一个重要选择：Registry 可以在统一位置验证，具体 Tool 再解码为自己的 struct。若一开始就解码成 `map[string]any`，会丢失“原始参数”和精确错误上下文。
 
-## 实验
+## Definition 如何变成模型输入
 
-注册 `calculator` 和一个计数 Tool，断言 unknown name、非法 JSON、缺字段都不会进入 Tool；再为错误结果保留 `toolCallID`，让下一轮模型能定位失败。
+一个 calculator 定义可以这样写：
+
+```go
+type CalculatorTool struct{}
+
+func (CalculatorTool) Definition() ToolDefinition {
+    return ToolDefinition{
+        Name: "calculator",
+        Description: "Add, subtract, multiply, or divide two numbers.",
+        Schema: map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "operation": map[string]any{"type": "string"},
+                "left": map[string]any{"type": "number"},
+                "right": map[string]any{"type": "number"},
+            },
+            "required": []any{"operation", "left", "right"},
+        },
+    }
+}
+```
+
+`Name` 是模型产生 call 时使用的标识；`Description` 影响模型选择，但不是权限；`Schema` 描述 JSON 参数形状。模型看到 schema 后仍可能返回坏 JSON、未知字段或危险路径，所以 Runtime 必须再次校验。
+
+## Registry 的职责
+
+```go
+type Registry struct {
+    mu    sync.RWMutex
+    tools map[string]Tool
+}
+
+func NewRegistry() *Registry {
+    return &Registry{tools: make(map[string]Tool)}
+}
+
+func (r *Registry) Register(tool Tool) error {
+    definition := tool.Definition()
+    if definition.Name == "" {
+        return errors.New("tool name cannot be empty")
+    }
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    if _, exists := r.tools[definition.Name]; exists {
+        return fmt.Errorf("tool %q is already registered", definition.Name)
+    }
+    r.tools[definition.Name] = tool
+    return nil
+}
+
+func (r *Registry) Get(name string) (Tool, bool) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    tool, ok := r.tools[name]
+    return tool, ok
+}
+```
+
+`Register` 拒绝空名和重复名，因为重复名会使模型看到一个 definition、Runtime 却随机执行另一个对象。`Get` 使用读锁；具体工具本身是否线程安全，不由 Registry 保证。
+
+## 最小 schema gate
+
+当前项目的 gate 只处理 object 和 required：
+
+```go
+func (r *Registry) Validate(call ToolCall) (Tool, error) {
+    tool, ok := r.Get(call.Name)
+    if !ok {
+        return nil, fmt.Errorf("unknown tool %q", call.Name)
+    }
+    definition := tool.Definition()
+    var object map[string]any
+    if err := json.Unmarshal(call.Arguments, &object); err != nil {
+        return nil, fmt.Errorf("tool %q arguments are invalid JSON: %w", call.Name, err)
+    }
+    if object == nil {
+        return nil, fmt.Errorf("tool %q arguments must be a JSON object", call.Name)
+    }
+    if required, ok := definition.Schema["required"].([]any); ok {
+        for _, item := range required {
+            name, ok := item.(string)
+            if ok {
+                if _, present := object[name]; !present {
+                    return nil, fmt.Errorf("tool %q is missing required argument %q", call.Name, name)
+                }
+            }
+        }
+    }
+    return tool, nil
+}
+```
+
+这个 gate 有四个输出路径：
+
+1. unknown name：没有对象可执行。
+2. malformed JSON：参数无法解析。
+3. 非 object：例如 `[]`、`null` 不满足工具 schema。
+4. missing required：对象存在但字段缺失。
+
+只有四种检查都通过才返回 `Tool`。注意 `required` 的实际 Go 类型来自 JSON 构造：这里使用 `[]any`，而不是 `[]string`。
+
+## 具体 Tool 的第二次解码
+
+通过 Registry 后，calculator 再把 raw bytes 解码到强类型输入：
+
+```go
+func (CalculatorTool) Execute(
+    _ context.Context,
+    raw json.RawMessage,
+) (ToolResult, error) {
+    var input struct {
+        Operation string  `json:"operation"`
+        Left      float64 `json:"left"`
+        Right     float64 `json:"right"`
+    }
+    if err := json.Unmarshal(raw, &input); err != nil {
+        return ToolResult{}, err
+    }
+    switch strings.ToLower(input.Operation) {
+    case "add":
+        return ToolResult{Content: strconv.FormatFloat(input.Left+input.Right, 'f', -1, 64)}, nil
+    default:
+        return ToolResult{}, fmt.Errorf("unknown operation %q", input.Operation)
+    }
+}
+```
+
+Registry 的检查是通用门，具体 Tool 的检查是业务门。`left: "two"` 可能通过当前最小 required gate，但在具体解码时会得到零值；生产代码应进一步检查 type、范围和 enum。示例刻意把这项不足暴露为后续练习，而不是宣称实现了完整 validator。
+
+## 失败 trace 与副作用边界
+
+```text
+ToolCall(name="count", arguments="{}");
+ -> Registry.Get 成功
+ -> required value 缺失
+ -> Validate 返回 error
+ -> execute 没有调用
+ -> Loop 生成 IsError ToolResult
+```
+
+正确顺序是 validate → permission/hook → execute。错误顺序是 execute → 发现参数坏：这会先产生不可逆副作用，再报告失败。
+
+## 测试设计
+
+`agent_test.go` 中的 `countingTool` 用 `atomic.Int32` 记录 Execute 次数。测试使用：
+
+- unknown name，断言计数器为零。
+- `{}` 缺 required，断言计数器为零。
+- 合法参数，后续阶段再断言计数器增加。
+- 重复注册，断言 Registry 返回错误。
+
+测试不应该只断言错误字符串；更重要的是证明执行对象没有被调用。对副作用工具来说，“没有调用”是安全契约。
+
+## 运行方式
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestUnknownTool|TestInvalidArguments'
+go test -race ./...
+```
+
+`-race` 很重要：Registry 的 map 访问和 counter 的并发更新都应被正确保护。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/agent/src/types.ts` 的 `AgentTool` 和 `AgentToolResult` 是 Pi 的更丰富 Tool contract。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall` 处理 lookup、参数准备和 abort 检查；`executePreparedToolCall` 才执行。
+- `packages/coding-agent/src/core/tools/index.ts` 创建 coding tools，并把可用工具 definitions 交给 AgentSession。
+- `packages/coding-agent/src/core/tools/edit.ts`、`read.ts`、`write.ts` 展示具体工具如何再做路径/文本检查。
+
+Go 版本把这些职责压缩进 `Registry.Validate` 和 `executeOne`，但保持“模型输出不是执行证据”的核心边界。
+
+## Java 对照
+
+| Go | Java | 意义 |
+| --- | --- | --- |
+| `interface Tool` | `interface Tool` | 可插拔执行 contract |
+| `json.RawMessage` | Jackson `JsonNode`/raw tree | 延迟解析参数 |
+| `map[string]any` | `ObjectNode` | JSON schema |
+| `Registry` | `ToolRegistry` | name lookup 和 gate |
+| `error` | exception/`ToolResult.error` | 失败传播 |
+
+Go interface 隐式满足，Java interface 需要显式实现；Go 的 struct tag 和 Jackson annotation 都是在协议字段与代码字段之间建立映射。
+
+## 实验：用计数器证明 gate 先于 execute
+
+### 目标
+
+让一个参数非法的 Tool 永远不产生计数副作用。
+
+### 准备
+
+打开 `agent_test.go` 的 `countingTool` 和 `TestInvalidArgumentsDoNotInvokeTool`。
+
+### 步骤
+
+1. 定义 schema required 为 `value`。
+2. 返回 Tool Call `arguments: {}`。
+3. 在 Execute 中递增 `atomic.Int32`。
+4. 运行 Loop，检查 result 的 `IsError`。
+5. 断言计数器仍为 0。
+6. 改成 `{"value":"ok"}`，再观察执行次数。
+
+### 观察点
+
+模型可以提出 call，但只有 Registry 通过 gate 后才得到 Tool 对象。错误结果仍然会回到模型，因此模型可以修正参数，而不是让 Runtime 崩溃。
+
+### 预期结果
+
+非法参数不执行；合法参数执行一次；未知名称没有任何 Tool 被调用。
+
+### 思考题
+
+required 检查够不够防止 `path: "../../secret"`？为什么权限检查不能只依靠模型看到的 Description？如果两个插件注册同名 Tool，拒绝注册和后注册覆盖哪个更容易审计？
+
+## 小结与下一阶段
+
+Tool Definition 是声明，Tool 是执行，Registry 是查找与验证边界。下一阶段把它们放进 `AgentLoop.Run`，让 assistant Tool Call 产生匹配的 `RoleTool` 消息，并用 `MaxSteps` 防止无限循环。

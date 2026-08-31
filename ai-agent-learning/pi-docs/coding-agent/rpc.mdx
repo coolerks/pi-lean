@@ -13,117 +13,1244 @@ RPC Mode 是 Coding Agent 的无界面进程接口：客户端向 `stdin` 写入
 
 ## 源码级中文译文
 
-### 1. 协议边界与启动
+本节按 `rpc.md` 的原文章节顺序翻译。每一节先说明协议事实，再给出客户端实现时需要观察的状态和失败点。示例代码保持原样，命令名、字段名、事件名、路径和 TypeScript 类型不翻译。
 
-启动命令是 `pi --mode rpc [options]`。`--provider` 选择 Provider，`--model` 选择模型并可附带 `:thinking`，`--name`/`-n` 设置 session 显示名，`--no-session` 关闭持久化，`--session-dir` 指定保存目录。RPC 进程把协议输出写到 stdout；客户端不得把普通日志混进 stdout，否则下一方无法把每一行解析为 JSON。诊断信息应走 stderr 或由客户端单独处理。
+### 1. RPC Mode 是什么
 
-协议有三类记录：
+RPC Mode 是 Coding Agent 的无界面运行模式。
 
-| 记录 | 方向 | 含义 |
-| --- | --- | --- |
-| command | client → `stdin` | 要求 Agent 执行动作的 JSON 对象 |
-| response | Agent → `stdout` | 对某条 command 的接受/拒绝结果 |
-| event | Agent → `stdout` | 运行中异步产生的生命周期、流式和工具事件 |
+它通过标准输入接收命令。
 
-一条记录就是一行 JSON，唯一的分隔符是 LF，也就是 `\\n`。客户端可以接受 CRLF，但应去除末尾 CR；不能把 Unicode `U+2028`/`U+2029` 当作换行。Node 的 `readline` 会把这两个字符也当作换行，因此不能直接拿它实现严格 RPC reader。更安全的 reader 使用 UTF-8 decoder 加 buffer，只在找到 LF 时切出一条记录，并在 stream 结束时处理最后一个非空 buffer。
+它通过标准输出发送 response 和 event。
 
-每个 command 都可以带 `id`。Pi 会在对应 response 复制同一个 id，客户端据此把 response 和请求关联起来；没有 id 的 command 也能执行，但不能用 response 做精确相关。`bash_execution_update.id` 特别复制发起 bash 的 id。事件通常没有 command id，工具事件用 `toolCallId`，扩展 UI 用自己的 request id。不要用“事件到达顺序”代替 correlation id。
+每个协议记录都是一个 JSON object。
 
-### 2. Prompt、队列和取消
+每条记录占一行。
 
-`prompt` 的最小请求是 `{type: "prompt", message: "..."}`，可附 `images`。response 只说明消息已接受、排队或立即被处理；`success: true` 不等于模型已经成功回答。如果接受之后发生 Provider、Tool 或 compaction 失败，不会针对同一 request id 再发第二个 response，客户端要从 event 和最终 message 观察失败。
+这使它适合 IDE、桌面 UI、测试程序和后端服务嵌入。
 
-Agent 正在流式运行时，新的 prompt 必须明确 `streamingBehavior`：`steer` 在当前 assistant turn 的 Tool 执行完毕后、下一次 LLM 请求前交付；`followUp` 等待当前 Agent 没有更多工作时交付。不指定行为会被拒绝。`/skill:name` 和 `/template` 在进入队列前展开；Extension command 即使正在 streaming 也可立即执行，但它负责通过 `pi.sendMessage()` 管理自己的 LLM 工作。
+它也适合用另一种语言包装 Pi。
 
-`steer` 只接受运行期间的纠偏消息，交付点是当前 assistant turn 的 Tool batch 之后；`follow_up` 只在 Agent 原本要停止时交付。两者都可以带 image，且不接受 Extension command。`abort` 取消当前 Agent operation；它不是一条 user message，也不保证已开始的远端请求撤销。`clear_queue` 一次取出 steering 和 follow-up 文本。实现 Esc 时可先 clear_queue、把文本放回编辑器、再 abort；如果直接 abort，session 中仍可能继续处理已经排队的消息。
+但它不是一个通用的模型协议。
 
-`new_session` 切换到新 session，可以带 `parentSession` 做关联，也可能被 `session_before_switch` Extension handler 取消。取消仍返回成功 response，但 data 中 `cancelled` 为 true；这表示请求已处理，不表示切换发生。
+它首先是“控制一个 Pi 进程”的应用协议。
 
-```json
-{"id":"req-1","type":"prompt","message":"读取 README 并总结","streamingBehavior":"steer"}
+Node.js/TypeScript 应用如果可以直接使用 `AgentSession`，通常不必启动子进程。
+
+直接使用 `AgentSession` 可以少经过一层 JSONL framing。
+
+直接使用 `AgentSession` 也可以少处理 stdout/stderr 和进程退出。
+
+子进程 RPC 适合进程隔离、语言隔离和独立升级。
+
+因此选择 RPC 还是 SDK 是部署边界的决定，不是功能高低的决定。
+
+> 译者注：RPC 和 MCP 都可能出现 JSON-RPC 或 JSON，但它们的方向不同。RPC 是宿主控制 Agent；MCP 是 Agent 连接外部工具、资源和 prompt server。把 `pi --mode rpc` 误当成 MCP server，会导致命令方向、生命周期和权限设计全部颠倒。
+
+### 2. 启动参数与进程边界
+
+启动命令是：
+
+```bash
+pi --mode rpc [options]
 ```
 
-### 3. 状态、模型与 thinking
+`--provider <name>` 选择默认 Provider。
 
-`get_state` 返回当前 model、`thinkingLevel`、`isStreaming`、`isCompacting`、steering/follow-up mode、session 文件和 id、session name、自动 compaction 开关及 message/pending count。`model` 是完整 Model 对象或 null；`sessionName` 是通过 `set_session_name` 设置的显示名。`get_messages` 返回当前对话的 `AgentMessage`，它是当前状态的消息投影，不等于 session tree 中的全部 entry。
+`--model <pattern>` 选择模型或模型模式。
 
-`set_model` 需要 `provider` 和 `modelId`，成功 response 的 data 是完整 Model。`cycle_model` 在可用模型间前进，只有一个模型时 data 为 null；`get_available_models` 返回模型数组。`set_thinking_level` 接受 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，但高等级要看当前模型能力；`cycle_thinking_level` 循环可用等级，`get_available_thinking_levels` 对不支持 reasoning 的模型返回 `["off"]`。
+模型可以写成 `provider/id`。
 
-`set_steering_mode` 和 `set_follow_up_mode` 的模式是 `all` 或 `one-at-a-time`。前者决定一次边界消费全部还是一条 steering，后者决定 Agent 完成时消费全部还是一条 follow-up；默认都是 `one-at-a-time`。这是队列投递策略，不是取消策略。
+模型后面可以附加 `:<thinking>`。
 
-### 4. Compaction、retry 与 bash
+`--name <name>` 或 `-n <name>` 设置 session 显示名。
 
-`compact` 手动压缩上下文，可带 `customInstructions`。返回 summary、firstKeptEntryId、压缩前 token 数、估算后的 token 数、生成摘要所用的 usage 和 details。`estimatedTokensAfter` 是重建 message context 的 heuristic，不是 Provider 精确计数；自定义 compaction handler 可能没有 usage。`set_auto_compaction` 控制上下文接近上限时是否自动压缩。overflow 触发的 compaction 成功后，`compaction_end.willRetry` 为 true，Agent 会有限度重试原 prompt；被 abort 时 result 为 null 且 aborted 为 true，生成摘要失败时 result 为 null 并带 errorMessage。
+`--no-session` 关闭 session 持久化。
 
-`set_auto_retry` 控制 overloaded、rate limit、5xx 等瞬态故障是否自动重试；`abort_retry` 取消等待中的 delay 并停止 retry。重试事件会公开 attempt、maxAttempts、delayMs 和最终错误，但客户端不应把每次 retry 当成新的 user prompt。
+`--session-dir <path>` 修改 session 文件所在目录。
 
-`bash` 是直接 RPC 命令，不是 LLM tool call。它立即在当前 cwd 执行，输出通过 `bash_execution_update` 增量流向 stdout，最终 response 返回 output、exitCode、cancelled、truncated；使用 command `id` 可关联更新。输出太长时 response 会标出 `truncated: true` 和 `fullOutputPath`，流式 event 仍可能包含完整过程中产生的 chunk。
+客户端启动进程后，应立即分别保存三个句柄。
 
-Bash 结果不会在 bash response 发出时立刻成为下一次模型请求的 assistant/tool message。Pi 保存 `BashExecutionMessage`，下一次 `prompt` 的 context projection 才把它转换成类似 `Ran ...` 加 fenced output 的 `UserMessage`。因此可以连续执行多个 bash，再用一个 prompt 让模型一次看到这些结果。`abort_bash` 只取消正在运行的直接 bash。
+`stdin` 用于写入命令。
 
-### 5. Session、树和持久化
+`stdout` 用于读取协议记录。
 
-`get_session_stats` 返回全 session 的 user/assistant 数、tool call/result 数、token、cost 和当前 context window usage。统计可包括 assistant、Tool 内部 LLM、compaction 与 branch summary；刚 compaction 后没有新的有效 usage 时，contextUsage 的 tokens/percent 可能是 null。`export_html` 将 session 导出到默认或 `outputPath` 指定的 HTML。
+`stderr` 用于读取诊断信息。
 
-`switch_session` 加载另一个 JSONL 文件，可被 `session_before_switch` 取消。`fork` 从 active branch 的某个 user entry 建立分支，返回被 fork 的文本；`clone` 将当前 branch 复制到新 session；二者都可能被 `session_before_fork` 取消。`get_fork_messages` 列出可用于 fork 的 user message。
+stdout 不能混入普通日志。
 
-`get_entries` 按 append 顺序返回除 header 外的全部 entry；与 `get_messages` 不同，它包含 compaction 前历史和 abandoned branch。`since` 接受上次看到的 entry id，是跨重启的 durable cursor；找不到 cursor 时 response 为失败。返回的 `leafId` 让客户端知道 active branch 是否移动。`get_tree` 返回 `{entry, children, label, labelTimestamp}` 树；断裂 parent chain 的 orphan 也会作为 root 呈现。`get_last_assistant_text` 没有 assistant 时返回 `{text: null}`。`set_session_name` 设置显示名，也可在进程启动时用 `--name` 设置。
+stdout 不能打印启动 banner。
 
-### 6. Commands 与资源发现
+stdout 不能打印调试 `console.log`。
 
-`get_commands` 返回 extension commands、prompt templates 和 skills。每项包含 name、description、source 和可选 location/path：source 为 `extension` 时由 `pi.registerCommand()` 注册，`prompt` 来自 `.md` 模板，`skill` 来自 Skill 目录并带 `skill:` 前缀。`/settings`、`/hotkeys` 等 TUI 内建命令不在此列表中，因为 RPC prompt 不会执行它们。客户端应该把这些条目当成可显示能力，而不是相信 path 内容永远安全。
+stdout 不能打印 Python traceback。
 
-### 7. Events 与流式组装
+任何非 JSON 行都可能使客户端解析失败。
 
-事件是 stdout 上的 JSONL，通常没有 request id。`agent_start`/`agent_end` 表示一次低层运行，`agent_settled` 才表示 session 级的 retry、compaction retry 和 queued continuation 都结束。`turn_start`/`turn_end` 包住一个 assistant response 及其 Tool batch；`message_start`/`message_end` 标记一条 AgentMessage 的开始和权威完成值。
+stderr 可以包含诊断信息。
 
-`message_update` 携带增量 `assistantMessageEvent`，可能是 `text_start`、`text_delta`、`text_end`、`thinking_start`、`thinking_delta`、`thinking_end`、`toolcall_start`、`toolcall_delta` 或 `toolcall_end`。更新中的 `usage` 是最新累计 provider usage，可能在完成前保持 0。它不再提供旧的 cumulative `message` 或 `partial` 字段；客户端应从 `message_start`、`contentIndex` 和各 delta 自己组装显示，并以 `message_end.message` 覆盖最终状态。Tool Call 要保存 start 的 id/name，累积 arguments delta，直到 end 的完整 `toolCall`。
+stderr 也应该由宿主持续读取。
 
-`bash_execution_update` 是直接 bash 的输出 chunk；`tool_execution_start`、`tool_execution_update`、`tool_execution_end` 是 LLM Tool 的生命周期。update 的 `partialResult` 是累计结果，不是单个 delta，因此 UI 可以直接替换显示。始终用 `toolCallId` 关联同一个工具调用。
+如果不读取 stderr，缓冲区写满后子进程可能阻塞。
 
-`queue_update` 反映两类待处理队列；`compaction_start/end` 带 manual、threshold 或 overflow reason；`auto_retry_start/end` 说明瞬态错误 retry；摘要 retry 事件分别说明 scheduled、attempt start 和 finished；`extension_error` 表示扩展异常，包含 extensionPath、event 和 error。事件是观察面，不应作为持久化恢复的唯一事实来源。
+客户端应监听 stdout 的 `data`、`end` 和 `error`。
 
-### 8. Extension UI 子协议
+客户端应监听 stderr 的 `data` 和 `error`。
 
-RPC 下 `ctx.mode` 是 `rpc`、`ctx.hasUI` 为 true，因为 dialog 和 fire-and-forget API 仍可工作。`select`、`confirm`、`input`、`editor` 会向 stdout 发 `extension_ui_request`，带唯一 id 和 method，并等待 stdin 上同 id 的 `extension_ui_response`。`notify`、`setStatus`、`setWidget`、`setTitle`、`set_editor_text` 是 fire-and-forget，不等待 response。dialog 的 timeout 到期后由 Agent 端以默认值解决，客户端不用另行计时。
+客户端还应监听子进程的 `exit`。
 
-- `select` 的 request 含 title/options，response 用 `value` 或 `cancelled`。
-- `confirm` 用 `confirmed: true/false` 或 `cancelled`。
-- `input` 和 `editor` 用 `value`；editor 可以带 prefill 多行文本。
-- `notify` 用 message 和 `notifyType`，取值 info/warning/error，默认 info。
-- `setStatus` 以 statusKey 更新/清除 footer 状态；省略 statusText 即清除。
-- `setWidget` 以 widgetKey、widgetLines 和 widgetPlacement 更新文本行；RPC 只支持字符串数组，不执行 component factory。
-- `setTitle` 修改终端窗口/标签标题；`set_editor_text` 写入编辑器文本。
+进程退出不是一条普通 event。
 
-客户端收到取消 response 时，Extension 分别得到 select/input/editor 的 undefined，或 confirm 的 false。`custom()` 在 RPC 返回 undefined；working message、indicator、footer、header、editor component、工具展开等 TUI 专属能力是 no-op；`getEditorText()` 返回空字符串，`getToolsExpanded()` 返回 false，主题读取为空/undefined，`setTheme()` 返回失败。需要真实终端组件时应检查 `ctx.mode === "tui"`，不要只检查 `hasUI`。
+进程退出意味着后续 response 不会再到达。
 
-### 9. 错误、类型与取消
+仍处于 pending 状态的请求必须结束或标记为未知。
 
-命令参数错误、未知命令、model 不存在等在接受前返回 `success: false` 和 error；解析失败也返回 parse error。接受后的模型失败、Tool 失败、compaction 失败、retry 耗尽和 abort 走正常 event/message 流，不会伪造为第二个 response。客户端要区分“请求未接受”和“请求已接受但执行失败”。
+### 3. JSONL framing
 
-RPC 类型是 Provider-neutral Agent 类型的 JSON 投影：`Model` 描述 id/name/api/provider、reasoning、input、contextWindow、maxTokens 和 cost；`UserMessage` 有 role/content/timestamp/attachments；`AssistantMessage` 有 text/thinking/toolCall、api/provider/model、usage、stopReason；Tool Call 中的 arguments 是结构化对象，`ToolResultMessage` 以 toolCallId/toolName 配对，并可携带 nested usage 和 isError。`BashExecutionMessage` 只由直接 bash command 创建，不能与模型生成的 Tool Call 混淆；`Attachment` 保存图片 id、文件名、mime、大小、base64/提取文本/preview。
+RPC 使用严格的 JSONL framing。
 
-取消需要分层理解：`abort` 取消 Agent operation，`abort_retry` 取消退避等待，`abort_bash` 取消直接 shell，Extension UI 的 `cancelled` 只关闭一次 dialog。远端 HTTP 请求是否真的停止由 Provider 和 transport 决定；收到取消后不能把未完成副作用报告为成功。`agent_settled` 是客户端恢复空闲的可靠事件，比单个 `agent_end` 更适合结束一次 UI busy 状态。
+记录分隔符是 LF，也就是字节 `0x0A`。
 
-### 10. Python 与 Node.js 客户端
+一条 JSON 记录内部可以包含转义后的 `\n`。
 
-Python 客户端可以用 `subprocess.Popen` 启动 `pi --mode rpc --no-session`，向 `stdin` 写 `json.dumps(command) + "\\n"` 并 flush，逐行解析 stdout。它应处理 `message_update` 的 text delta，并在 `agent_end` 或更严格的 `agent_settled` 后决定是否完成；生产客户端还应处理 stderr、exit code、parse error 和残留 buffer。
+字符串里的 `\n` 不是记录边界。
 
-Node.js 客户端不能直接使用 `readline`。使用 `StringDecoder("utf8")`，把 Buffer 解码到字符串 buffer，按 LF 切行、去掉 CR，stream end 时 flush decoder 并处理尾部。向 `agent.stdin` 写 JSONL；Ctrl+C 发送 `{type: "abort"}` 而不是粗暴杀掉进程。真实客户端还应保存每个 command id、extension UI request id 和 toolCallId，分别处理 response、dialog response 和生命周期 event。
+只有真实的 LF 字节才切分记录。
+
+客户端不应按任意 Unicode 行分隔符切分。
+
+`U+2028` 可以合法出现在 JSON 字符串中。
+
+`U+2029` 也可以合法出现在 JSON 字符串中。
+
+Node 的 `readline` 会额外处理这些 Unicode 分隔符。
+
+因此 Node `readline` 不是这个协议的严格 reader。
+
+客户端可以接受输入端的 CRLF。
+
+接受 CRLF 时只去掉一行末尾的 CR。
+
+不要删除 JSON 字符串内部的 CR。
+
+不要把空格或 tab 当作记录边界。
+
+不要按 chunk 边界解析 JSON。
+
+一次 `data` chunk 可能只包含半个 JSON。
+
+一次 `data` chunk 也可能包含多条 JSON。
+
+正确的 reader 必须维护字符串 buffer。
+
+每次收到 bytes 时先用 UTF-8 decoder 解码。
+
+然后在 buffer 中寻找真实 LF。
+
+找到 LF 后取出前面的完整行。
+
+如果该行以 CR 结尾，去掉最后一个 CR。
+
+把剩余内容保留在 buffer 中。
+
+stream `end` 时必须 flush decoder。
+
+如果 flush 后还有非空 buffer，要处理最后一条记录。
+
+协议发送方通常会以 LF 结束每条记录。
+
+健壮客户端仍应处理 EOF 前的残留 buffer。
 
 ```text
-Python/Java/Go 的共同策略：
-1. stdout 只接收 JSONL，stderr 单独读取。
-2. 写入命令后 flush，并保存 id → pending request。
-3. response 只代表接受结果；event 驱动进度和最终状态。
-4. 遇到 abort、EOF 或 parse error 时关闭 pending request，避免永久等待。
+chunk 1: {"type":"res
+chunk 2: ponse"}\n{"type":"event"}\n
 ```
 
-### 11. RPC 与 MCP、Go/Java 对照
+上面的 chunk 不能按 chunk 1 和 chunk 2 分别调用 JSON.parse。
 
-RPC 是“控制一个 Pi Agent 进程”的应用协议：命令包括 prompt、model、session、bash 和 UI，事件描述宿主运行状态。MCP 是“让 Agent 发现并调用外部 Tool/resource/prompt”的协议：核心方法包括 `initialize`、`tools/list`、`tools/call`，通常以 JSON-RPC 连接另一个 server。二者都可能使用 JSON，但方向、生命周期、权限主体和 correlation 范围不同；不要把 `--mode rpc` 当成 MCP server。
+正确结果是先拼出完整字符串，再按 LF 切出两条记录。
 
-Go client 通常用 `exec.Cmd`、`StdinPipe`/`StdoutPipe`、`bufio.Reader` 和 `encoding/json`，用 `context.Context` 取消命令/进程，并自己维护 id map；严格实现时不能把 `bufio.Scanner` 的默认行限制或普通日志混入 stdout。Java client 可用 `ProcessBuilder`、`BufferedReader`/`BufferedWriter`、Jackson 和 `ExecutorService`，用 `CancellationToken`、Future/interruption 和 Listener 把 JSONL reader 与 UI 解耦。两种语言都应使用同一原则：Provider 的 SSE 是模型流，RPC 的 JSONL 是进程协议，Agent Event 是运行时语义，三者不能互相替代。
+> 译者注：Go 中不要直接假定 `bufio.Scanner` 的默认 token 长度足够。RPC 的大消息、HTML 路径或 widget 可能超过默认限制；可以提高 buffer，或使用 `bufio.Reader.ReadString('\n')`。Java 中 `BufferedReader.readLine()` 能处理 LF/CRLF，但仍要确认它没有把 stdout 的诊断文本混进 JSON parser。
+
+### 4. 请求、响应与 correlation id
+
+命令由客户端写入 stdin。
+
+命令必须是单行 JSON。
+
+response 由 Pi 写入 stdout。
+
+response 的 `type` 是 `response`。
+
+response 的 `command` 表示对应命令。
+
+response 的 `success` 表示命令是否被接受或处理成功。
+
+每条命令可以带可选的 `id`。
+
+如果带了 `id`，response 会复制同一个 id。
+
+客户端可以用 `id` 找到等待中的请求。
+
+不同命令的 id 应保持唯一。
+
+不要把数组下标作为长期 correlation id。
+
+不要仅凭 response 到达顺序匹配请求。
+
+因为 prompt 接受后会异步产生 events。
+
+event 通常没有原始 command id。
+
+`bash_execution_update` 会带发起 bash 的 id（如果命令提供了 id）。
+
+扩展 UI request 有它自己的唯一 id。
+
+工具事件使用 `toolCallId`。
+
+这些 id 属于不同的命名空间。
+
+客户端应为 command id 建立 pending map。
+
+客户端应为 extension UI id 建立 dialog map。
+
+客户端应为 toolCallId 建立工具显示状态。
+
+response 只解决 command 层的接受结果。
+
+event 解决运行时进度和最终状态。
+
+不能用 `success: true` 推断最终答案成功。
+
+`success: true` 可能只表示消息已经排队。
+
+`success: false` 表示命令在接受前就被拒绝。
+
+接受后的 Provider error 不会再产生第二个 response。
+
+接受后的 Tool error 应从 event/message 流观察。
+
+### 5. `prompt` 命令
+
+最小 prompt 命令如下：
+
+```json
+{"id":"req-1","type":"prompt","message":"Hello, world!"}
+```
+
+`type` 必须是 `prompt`。
+
+`message` 是用户输入的文本。
+
+`id` 用于关联接受 response。
+
+prompt response 可能在模型完成前到达。
+
+因此 prompt response 不是 final answer。
+
+通常 response 是：
+
+```json
+{"id":"req-1","type":"response","command":"prompt","success":true}
+```
+
+这表示消息已被接受、排队或立即交给处理器。
+
+如果消息在输入校验阶段失败，success 为 false。
+
+如果模型随后返回 429，原 prompt 不会获得第二个 response。
+
+客户端必须继续读取 events。
+
+客户端必须继续读取 message_end。
+
+客户端应把 `agent_settled` 作为一次完整工作的结束候选。
+
+如果只等待 prompt response，客户端会过早显示 idle。
+
+prompt 可以携带图片。
+
+图片使用 `ImageContent` 格式。
+
+图片的 `data` 是 base64 文本。
+
+图片的 `mimeType` 描述媒体类型。
+
+图像会增加上下文和请求成本。
+
+客户端应限制图片大小。
+
+客户端不应把未经授权的本地文件自动编码上传。
+
+### 6. streamingBehavior、steer 与 follow_up
+
+Agent 正在 streaming 时再次发送 prompt，需要声明 `streamingBehavior`。
+
+`streamingBehavior: "steer"` 把消息放入 steering queue。
+
+steer 在当前 assistant turn 的 Tool batch 完成后交付。
+
+交付发生在下一次 LLM request 之前。
+
+它适合“停止做 X，改做 Y”这类纠偏。
+
+`streamingBehavior: "followUp"` 把消息放入 follow-up queue。
+
+follow-up 要等当前工作自然结束。
+
+它适合“完成后再检查文档”这类追加任务。
+
+不提供 streamingBehavior 时，正在运行的 Agent 会拒绝普通 prompt。
+
+`steer` 命令本身只适用于 active run。
+
+`follow_up` 命令表示完成后追加。
+
+两者都可以带图片。
+
+两者都不允许直接执行 Extension command。
+
+Skill 命令会在发送或排队前展开。
+
+Prompt template 也会在发送或排队前展开。
+
+Extension command 通过 `prompt` 发送时可能立即处理。
+
+Extension command 的 LLM 工作由 Extension 自己管理。
+
+队列不是把文本插进当前正在发送的 HTTP body。
+
+队列消息要在安全的 turn boundary 注入。
+
+这样可以保持 provider message 顺序。
+
+这样也可以避免同时修改正在遍历的数组。
+
+### 7. abort、clear_queue 与 new_session
+
+`abort` 取消当前 Agent operation。
+
+它不是一条新的用户消息。
+
+它也不是强制杀死远端 HTTP server 的保证。
+
+Provider 是否停止远端请求取决于 transport。
+
+已发生的外部副作用不能因为 abort 就自动回滚。
+
+`clear_queue` 移除 steering 和 follow-up。
+
+clear_queue 的 data 会返回被移除的文本。
+
+交互式 Esc 可以先 clear_queue。
+
+客户端可以把返回文本放回编辑器。
+
+然后客户端再发送 abort。
+
+如果直接 abort，已经排队的消息可能继续处理。
+
+这正是 TUI 需要区分“取消当前动作”和“清空待处理输入”的原因。
+
+`new_session` 创建或切换到新 session。
+
+可选 `parentSession` 用于保存父 session 关联。
+
+Extension 可以通过 `session_before_switch` 取消切换。
+
+被取消时 response 仍可能 success 为 true。
+
+此时 `data.cancelled` 为 true。
+
+success 表示 command 被处理。
+
+cancelled 表示业务动作没有发生。
+
+客户端必须同时读取这两个字段。
+
+### 8. state、messages、model 与 thinking
+
+`get_state` 读取当前运行状态。
+
+`model` 是完整 Model 对象或 null。
+
+`thinkingLevel` 是当前 reasoning level。
+
+`isStreaming` 表示是否正在处理 Agent 流。
+
+`isCompacting` 表示是否正在做 context compaction。
+
+`steeringMode` 描述 steering 一次消费一条还是全部。
+
+`followUpMode` 描述 follow-up 的消费策略。
+
+`sessionFile` 是当前 session 文件路径。
+
+`sessionId` 是当前 session 标识。
+
+`sessionName` 是可选显示名。
+
+`autoCompactionEnabled` 表示是否自动压缩。
+
+`messageCount` 是当前消息投影的数量。
+
+`pendingMessageCount` 是队列中待处理消息数量。
+
+`get_messages` 返回当前对话消息。
+
+它不是 append-only session tree 的完整快照。
+
+它可能不包含 abandoned branch。
+
+它也不能替代 `get_entries` 的 durable cursor。
+
+`set_model` 用 provider 和 modelId 切换模型。
+
+成功 response 的 data 是完整 Model。
+
+`cycle_model` 选择下一个可用模型。
+
+只有一个可用模型时 data 可能为 null。
+
+`get_available_models` 返回所有配置模型。
+
+模型信息可能包含 contextWindow 和 cost。
+
+客户端不要只显示 name 而丢掉 provider/id。
+
+因为不同 Provider 可能有同名模型。
+
+`set_thinking_level` 支持 off、minimal、low、medium、high、xhigh、max。
+
+xhigh 和 max 必须由当前模型能力决定。
+
+不支持 reasoning 的模型通常只有 off。
+
+`cycle_thinking_level` 在可用 level 中循环。
+
+### 9. queue modes
+
+`set_steering_mode` 控制 steering 消费方式。
+
+`all` 在当前 turn 完成后一次交付全部 steering。
+
+`one-at-a-time` 每个完成的 assistant turn 交付一条。
+
+默认是 `one-at-a-time`。
+
+`set_follow_up_mode` 控制 follow-up 消费方式。
+
+`all` 在 Agent 完成时交付全部 follow-up。
+
+`one-at-a-time` 每次完成只交付一条。
+
+默认同样是 `one-at-a-time`。
+
+queue mode 不改变消息的含义。
+
+queue mode 也不等于 abort。
+
+客户端应把 mode 持久化在自己的 UI 状态中。
+
+如果用户修改 mode，下一次 get_state 应重新读取。
+
+### 10. compact、retry 与 context overflow
+
+`compact` 手动减少当前 context 的 token 压力。
+
+它可以带 `customInstructions`。
+
+返回值包含 summary。
+
+返回值包含 `firstKeptEntryId`。
+
+返回值包含 tokensBefore。
+
+返回值包含 estimatedTokensAfter。
+
+返回值可能包含生成 summary 的 usage。
+
+estimatedTokensAfter 是 heuristic。
+
+它不是 Provider 精确 tokenizer 的承诺。
+
+不同 Provider 的 token 计数可能不同。
+
+自定义 compaction handler 可能省略 usage。
+
+`set_auto_compaction` 开关控制接近上限时的自动压缩。
+
+overflow compaction 成功后通常会设置 `willRetry: true`。
+
+这意味着 Pi 会有限度地重试原 prompt。
+
+compaction 被 abort 时 result 为 null 且 aborted 为 true。
+
+compaction 失败时 result 为 null 且 errorMessage 提供原因。
+
+`set_auto_retry` 控制 transient error 的自动重试。
+
+常见 transient error 是 overloaded、rate limit 和 5xx。
+
+`abort_retry` 取消等待中的 delay。
+
+它也阻止后续 retry attempt。
+
+retry attempt 不是新的用户输入。
+
+retry 可能产生新的 usage 和成本。
+
+客户端显示 retry 时应显示 attempt/maxAttempts。
+
+### 11. `bash` 与 stdout/stderr
+
+`bash` 是直接 RPC command。
+
+它不是模型返回的 Tool Call。
+
+它立即在当前 cwd 执行 shell command。
+
+请求可以带 command id。
+
+输出通过 `bash_execution_update` events 流出。
+
+最终 response 包含 output。
+
+最终 response 包含 exitCode。
+
+最终 response 包含 cancelled。
+
+最终 response 包含 truncated。
+
+如果输出被截断，可能包含 fullOutputPath。
+
+流式 event 的 chunk 仍可能覆盖整个执行期间的输出。
+
+`bash` 的 stdout/stderr 由 Pi 合并或按实现转换为结果。
+
+外层 RPC 的 stdout 仍只允许 JSONL。
+
+shell 命令产生的文字不能直接写入外层 stdout。
+
+这就是“被执行命令的 stdout”和“RPC server 的 stdout”必须分开的原因。
+
+直接 bash 的结果先形成 `BashExecutionMessage`。
+
+它不会在 bash response 发出时自动成为下一次 LLM 的消息。
+
+下一次 prompt 构建 context 时才会投影它。
+
+投影形式包含 `Ran \`command\`` 和 fenced output。
+
+多个 bash 可以先后执行。
+
+后续 prompt 会一次看到这些 bash 结果。
+
+`abort_bash` 只取消正在运行的直接 bash。
+
+它不等同于 `abort` 当前 Agent operation。
+
+> 译者注：这是最容易踩坑的两个 stdout。协议 stdout 是机器接口，shell stdout 是业务数据。Go/Java client 必须只从 Pi 的 stdout 解析 JSON；如果你自己启动 MCP 或 shell server，也应为其 stdout 建立独立 pipe，不能把两个进程的输出拼在一起。
+
+### 12. session、stats、fork 与 tree
+
+`get_session_stats` 返回 session 级统计。
+
+统计包括 userMessages。
+
+统计包括 assistantMessages。
+
+统计包括 toolCalls 和 toolResults。
+
+统计包括 tokens。
+
+统计包括 cost。
+
+统计包括 contextUsage。
+
+Tool 内部的 LLM 工作可能进入统计。
+
+compaction 和 branch summary 的 usage 也可能进入统计。
+
+刚完成 compaction 时 tokens/percent 可能是 null。
+
+因为新的 assistant usage 还没有产生。
+
+`export_html` 把 session 导出成 HTML。
+
+默认路径由 Pi 决定。
+
+也可以传入 outputPath。
+
+`switch_session` 载入另一个 JSONL session。
+
+它可能被 `session_before_switch` 取消。
+
+`fork` 从 active branch 的 user entry 创建新分支。
+
+它返回被 fork 的原文本。
+
+`clone` 把当前 branch 复制到新 session。
+
+`get_fork_messages` 返回可供 fork 的 user messages。
+
+`get_entries` 按 append 顺序读取 entry。
+
+它不包含 session header。
+
+它包含 compaction 前历史。
+
+它包含 abandoned branch。
+
+`since` 是 entry id cursor。
+
+正确的 cursor 可以跨客户端重启使用。
+
+找不到 since 时 response 为失败。
+
+`leafId` 表示当前活动叶子。
+
+空 session 的 leafId 为 null。
+
+`get_tree` 返回 entry、children、label 和 labelTimestamp。
+
+parent chain 断裂的 entry 也会作为 root 出现。
+
+`get_last_assistant_text` 没有 assistant 时返回 text null。
+
+`set_session_name` 修改当前显示名。
+
+启动时也可以用 `--name` 设置初始名称。
+
+### 13. commands、skills 与 prompt templates
+
+`get_commands` 返回可用的 extension commands。
+
+它也返回 prompt templates。
+
+它还返回 skills。
+
+extension command 的 source 是 `extension`。
+
+prompt template 的 source 是 `prompt`。
+
+skill 的 source 是 `skill`。
+
+skill 名称通常带 `skill:` 前缀。
+
+location 可以是 user。
+
+location 可以是 project。
+
+location 也可以来自显式 path。
+
+path 可能是绝对路径。
+
+客户端应把 path 当作提示信息，不应无条件读取或执行。
+
+`/settings`、`/hotkeys` 等 TUI 内建命令不会出现在列表中。
+
+它们依赖交互式 TUI。
+
+RPC 客户端可以把 get_commands 结果渲染成自己的 palette。
+
+调用时仍应通过 prompt 发送正确的 `/name`。
+
+### 14. events 总体模型
+
+events 是 Agent operation 的观察流。
+
+它们以 JSONL 写入 stdout。
+
+event 通常不带原始 prompt id。
+
+客户端必须用事件字段和本地状态进行关联。
+
+`agent_start` 表示低层 Agent run 开始。
+
+`agent_end` 表示一个低层 run 结束。
+
+`agent_end` 后仍可能发生 retry。
+
+`agent_end` 后仍可能发生 compaction retry。
+
+`agent_end` 后仍可能处理 queued continuation。
+
+`agent_settled` 表示 session 级工作真正稳定。
+
+UI busy 状态更适合等待 agent_settled。
+
+`turn_start` 开始一个 assistant turn。
+
+`turn_end` 结束该 turn。
+
+一个 turn 可能包含多个 Tool result。
+
+`message_start` 和 `message_end` 包围一条消息。
+
+`message_end.message` 是最终权威消息。
+
+### 15. message_update 与流式拼装
+
+`message_update` 提供增量事件。
+
+它不是完整的累计 message 快照。
+
+`usage` 是最新累计 usage。
+
+有些 Provider 直到结束才报告 usage。
+
+因此流中 usage 可能暂时是零。
+
+`text_start` 表示文本 block 开始。
+
+`text_delta` 表示文本片段。
+
+`text_end` 表示文本 block 结束。
+
+`thinking_start` 表示 thinking block 开始。
+
+`thinking_delta` 表示 thinking 片段。
+
+`thinking_end` 表示 thinking block 结束。
+
+`toolcall_start` 提供 id 和 toolName。
+
+`toolcall_delta` 提供参数片段。
+
+`toolcall_end` 提供完整 toolCall。
+
+客户端应按 contentIndex 保存多个 block。
+
+不能把不同 contentIndex 的 delta 拼在一起。
+
+工具参数通常需要把多个字符串片段连接起来。
+
+连接后还要解析 JSON。
+
+解析前不能执行工具。
+
+`message_update` 不再保证旧的 partial 字段存在。
+
+客户端应从 message_start 加 delta 自己构建展示状态。
+
+完成时用 message_end 覆盖本地 partial。
+
+### 16. 工具 events 与队列 events
+
+`bash_execution_update` 关联直接 bash command。
+
+它的 id 复制命令 id。
+
+`tool_execution_start` 表示 LLM Tool 开始。
+
+`tool_execution_update` 表示工具的累计 partial result。
+
+`tool_execution_end` 表示工具完成。
+
+工具 event 使用 `toolCallId` 关联。
+
+`partialResult` 是累计值，不只是本次 delta。
+
+UI 可以直接用最新 partialResult 替换旧显示。
+
+不要把累计结果重复追加，否则界面会重复文本。
+
+`queue_update` 表示 pending steering/follow-up 变化。
+
+它不是 message_end。
+
+它也不是 durable session tree 的完整记录。
+
+`compaction_start` 携带 manual、threshold 或 overflow reason。
+
+`compaction_end` 携带 result、aborted 和 willRetry。
+
+`auto_retry_start` 携带 attempt、delayMs 和错误。
+
+`auto_retry_end` 表示 retry 成功或最终失败。
+
+摘要 retry 有三个独立事件。
+
+`extension_error` 记录 extensionPath、event 和 error。
+
+客户端遇到未知 event type 时应保留原始 JSON。
+
+这样新版本增加 event 时旧客户端仍可诊断。
+
+### 17. Extension UI 子协议
+
+Extension UI 是建立在 RPC 基础流之上的第二层协议。
+
+dialog 方法会暂停 Extension，等待 response。
+
+fire-and-forget 方法只发送 request，不等待 response。
+
+所有 UI request 都有 `type: "extension_ui_request"`。
+
+所有 UI request 都有唯一 id。
+
+所有 UI request 都有 method。
+
+`select` 请求包含 title 和 options。
+
+客户端返回 value 或 cancelled。
+
+`confirm` 请求包含 title 和 message。
+
+客户端返回 confirmed 或 cancelled。
+
+`input` 请求要求自由文本。
+
+客户端返回 value 或 cancelled。
+
+`editor` 请求可以携带 prefill。
+
+返回值是编辑后的多行文本。
+
+`notify` 是无需响应的通知。
+
+`notifyType` 可以是 info、warning 或 error。
+
+`setStatus` 使用 statusKey 更新状态。
+
+省略 statusText 可以清除状态。
+
+`setWidget` 使用 widgetKey 和 widgetLines。
+
+widgetPlacement 可以是 aboveEditor 或 belowEditor。
+
+RPC 只支持字符串数组 widget。
+
+component factory 不会在 RPC 中执行。
+
+`setTitle` 修改 terminal title。
+
+`set_editor_text` 修改输入编辑器文本。
+
+dialog 的 id 必须精确匹配。
+
+错误 id 不应被接受为当前 dialog 的回答。
+
+超时由 Agent 端自动解决。
+
+客户端不需要另起 timer 模拟 Agent timeout。
+
+RPC 中 `ctx.mode` 是 `rpc`。
+
+RPC 中 `ctx.hasUI` 是 true。
+
+这不表示存在真实 TUI。
+
+`custom()` 返回 undefined。
+
+working indicator、footer、header 等 TUI 专属方法是 no-op。
+
+`getEditorText()` 返回空字符串。
+
+`getToolsExpanded()` 返回 false。
+
+`getAllThemes()` 返回空数组。
+
+`getTheme()` 返回 undefined。
+
+`setTheme()` 返回失败结果。
+
+需要真实 TUI 组件时应检查 `ctx.mode === "tui"`。
+
+> 译者注：`hasUI: true` 在这里的意思是“对话框协议可用”，不是“可以安全调用所有 TUI API”。Java 客户端应把 UI request 当成异步 RPC，并用 `CompletableFuture`/Future 按 id 保存等待者；Go 客户端可以用 channel 或 callback 分发 response。fire-and-forget 不应误发送 response。
+
+### 18. 错误、取消和进程退出
+
+命令未被接受时返回 `success: false`。
+
+未知 command 是输入错误。
+
+缺少必填字段是输入错误。
+
+model 不存在是业务校验错误。
+
+JSON 解析失败会返回 parse error。
+
+解析失败不应使客户端继续猜测字段。
+
+接受后的模型错误通过正常 event/message 流发送。
+
+接受后的 tool error 也通过正常流发送。
+
+compaction 失败通过 compaction event 体现。
+
+retry 耗尽通过 auto_retry_end 体现。
+
+abort 是一种终止原因。
+
+客户端必须区分 rejected 和 failed。
+
+rejected 表示没有创建工作。
+
+failed 表示工作已接受但执行失败。
+
+abort 不保证远端计费停止。
+
+abort_bash 不保证已经启动的子进程回滚。
+
+session corrupted 时客户端应保留错误并停止自动写入。
+
+EOF 表示 Pi 进程已离开协议循环。
+
+进程 exit code 需要和最后一个 event 一起判断。
+
+stdout 解析失败时应记录原始行，但注意脱敏。
+
+stderr 不应被当作协议 response。
+
+API key、Authorization 和工具参数不应无条件写日志。
+
+### 19. Types 的中文解释
+
+`Model` 是模型能力和计费 metadata 的 JSON 投影。
+
+它包含 id、name、api 和 provider。
+
+它可以包含 reasoning。
+
+它可以包含 input 能力。
+
+它可以包含 contextWindow 和 maxTokens。
+
+它可以包含 cost。
+
+`UserMessage` 表示用户消息。
+
+它可以是字符串 content。
+
+它也可以是 TextContent/ImageContent block 数组。
+
+`AssistantMessage` 可以包含 text。
+
+它可以包含 thinking。
+
+它可以包含 toolCall。
+
+它还包含 api、provider 和 model。
+
+usage 与 stopReason 需要单独处理。
+
+`stop` 表示自然结束。
+
+`length` 表示达到输出长度上限。
+
+`toolUse` 表示产生了工具调用。
+
+`error` 表示模型处理失败。
+
+`aborted` 表示被取消。
+
+`ToolResultMessage` 必须用 toolCallId 配对。
+
+它还应保留 toolName。
+
+isError 表示工具结果是否失败。
+
+nested usage 表示工具内部做过 LLM 工作。
+
+`BashExecutionMessage` 只由直接 bash command 创建。
+
+它不是模型生成的 ToolResultMessage。
+
+`Attachment` 保存图像及其提取信息。
+
+base64 数据可能很大，客户端应避免无意复制多份。
+
+### 20. Python client 逐行解释
+
+Python 示例使用 `subprocess.Popen` 启动 RPC 子进程。
+
+`stdin=subprocess.PIPE` 让客户端发送命令。
+
+`stdout=subprocess.PIPE` 让客户端读取 JSONL。
+
+`text=True` 让 Python 以文本流处理。
+
+生产代码仍应明确 UTF-8 编码策略。
+
+`send(cmd)` 使用 `json.dumps` 序列化命令。
+
+末尾加真实换行。
+
+调用 flush 让命令及时进入子进程。
+
+`read_events()` 逐行读取 stdout。
+
+每行调用 `json.loads`。
+
+坏行应捕获 JSONDecodeError。
+
+不能让一个坏 event 使整个进程无提示退出。
+
+示例监听 `message_update`。
+
+它取出 `assistantMessageEvent`。
+
+它只输出 text_delta。
+
+thinking 和 toolcall 应由更完整的 UI 另行处理。
+
+示例用 agent_end 结束循环。
+
+严谨客户端应等待 agent_settled。
+
+客户端还应开线程或异步任务读取 stderr。
+
+收到 EOF 时应结束所有 pending promise。
+
+### 21. Node.js client 逐步解释
+
+Node 示例用 `spawn` 启动 Pi。
+
+`StringDecoder("utf8")` 防止多字节字符跨 chunk 被拆坏。
+
+不能对每个 Buffer 直接调用 `toString` 后简单拼接未完成字符。
+
+`buffer` 保存尚未切出的文本。
+
+reader 只寻找 `\n`。
+
+找到后切出一行。
+
+去掉末尾 `\r` 以兼容 CRLF。
+
+`end` 时调用 decoder.end。
+
+最后残留内容也要交给 onLine。
+
+解析出的 JSON 可能是 response 或 event。
+
+二者都必须依据 `type` 分流。
+
+`message_update` 的 text_delta 可以立即渲染。
+
+`SIGINT` 时发送 abort 是友好取消。
+
+直接 `agent.kill()` 可能丢失末尾 event。
+
+kill 仍是超时后的兜底措施。
+
+stdin 写入后应保存 pending command id。
+
+UI request response 要使用另一个 id map。
+
+子进程退出后不能永久等待没有 response 的 request。
+
+> 译者注：Java 的 `ProcessBuilder` 对应 Node `spawn`，`BufferedReader` 对应严格 JSONL reader，Jackson 对应 `JSON.parse`，`ExecutorService`/Future 对应异步读取和取消；Java `HttpClient` 适合模型或远端 RPC 的 HTTP transport，但不能替代本地进程的 stdin/stdout pipe。Go 的 `exec.Cmd`、`StdoutPipe`、`bufio.Reader` 和 `encoding/json` 也能实现同一边界，需要自己定义 id map、EOF 和 context cancellation 语义。
+
+### 22. RPC 与 MCP 的最终辨析
+
+RPC 的 client 是宿主应用。
+
+RPC 的 server 是 Pi coding agent 进程。
+
+RPC 命令控制 prompt、model、session、bash 和 UI。
+
+RPC event 描述 Pi 的运行过程。
+
+MCP 的 client 通常属于 Agent Runtime。
+
+MCP 的 server 提供工具、资源或 prompt。
+
+MCP 的典型方法包括 initialize。
+
+MCP 还包括 tools/list。
+
+MCP 还包括 tools/call。
+
+MCP 可能使用 stdio。
+
+MCP 也可能使用 HTTP transport。
+
+RPC 的 prompt 方向是 client 到 Agent。
+
+MCP 的 tools/call 方向是 Agent 到外部 server。
+
+RPC 的 event 是 Agent 到 client。
+
+MCP server 的 response 是对 MCP request 的回应。
+
+RPC 的 session 是 Pi 对话状态。
+
+MCP 的 session/connection 是协议能力协商状态。
+
+二者的权限主体也不同。
+
+RPC client 可能获得 bash 和 session 控制能力。
+
+MCP server 只应获得明确注册的工具能力。
+
+不要把 RPC stdout 当成 MCP transport。
+
+不要把 `extension_ui_request` 当成 MCP request。
+
+不要把 `tool_execution_start` 当成 JSON-RPC response。
+
+### 23. 一个完整请求 trace
+
+用户在 UI 中输入“检查测试并修复失败”。
+
+客户端创建 command id `req-7`。
+
+客户端写入一行 prompt JSON。
+
+Pi 解析这一行。
+
+Pi 校验 model、session 和 streaming state。
+
+Pi 返回 success response。
+
+此时请求已接受，但还没有 final。
+
+Pi 发出 agent_start。
+
+Pi 发出 turn_start。
+
+Provider stream 产生 message_start。
+
+Provider stream 产生 message_update。
+
+模型产生 toolcall_start。
+
+模型产生 toolcall_delta。
+
+模型产生 toolcall_end。
+
+Pi 发出 message_end。
+
+Pi 发出 tool_execution_start。
+
+Tool 执行 read 或 bash。
+
+Pi 发出 tool_execution_update。
+
+Pi 发出 tool_execution_end。
+
+Pi 发出 turn_end。
+
+如果队列为空，Pi 进入下一轮。
+
+如果有 steering，Pi 先发 queue_update 并注入它。
+
+如果 context 超限，Pi 发出 compaction_start。
+
+compaction 完成后发 compaction_end。
+
+需要重试时继续发 auto retry events。
+
+最终 assistant message 发出 message_end。
+
+低层 run 发出 agent_end。
+
+如果还有自动 continuation，不应立即宣布 idle。
+
+全部工作结束后发 agent_settled。
+
+客户端用本地状态机展示完成。
+
+客户端用 response id 记录“接受”。
+
+客户端用 event 记录“进展”。
+
+客户端用 agent_settled 记录“稳定结束”。
+
+### 24. 客户端实现检查清单
+
+先实现一个严格的 LF reader。
+
+再实现 JSON parse 和未知 event 保留。
+
+再实现 command id pending map。
+
+再实现 response 与 event 分流。
+
+再实现 message_update partial assembler。
+
+再实现 toolCallId 的工具显示。
+
+再实现 extension UI dialog map。
+
+再实现 EOF 和 exit code 处理。
+
+再实现 stderr 独立消费。
+
+再实现 abort 超时兜底。
+
+再实现 session cursor 和 get_entries。
+
+再实现重连前的 session 恢复策略。
+
+不要把一次成功 response 当作 final answer。
+
+不要把 stdout 的 shell 输出当作协议记录。
+
+不要使用 `readline` 代替严格 LF reader。
+
+不要在没有权限策略时暴露任意 bash。
+
+不要把 RPC client 当成 MCP client。
+
+不要把事件顺序当成跨重启的 durable log。
+
+先用 `--no-session` 做协议单元测试。
+
+再加入 session、fork、compaction 和 retry 测试。
+
+测试空行、CRLF、Unicode 分隔符和半包 JSON。
+
+测试 command rejection、accepted failure 和 EOF。
+
+测试 UI response id 错配。
+
+测试 bash output truncation。
+
+测试 abort 与 agent_settled 的先后关系。
+
+### 25. 小结
+
+RPC 的最小单位是一行 JSON。
+
+stdin 是命令入口。
+
+stdout 是协议出口。
+
+stderr 是诊断出口。
+
+response 说明命令层是否接受。
+
+event 说明运行时发生了什么。
+
+message_end 是消息完成边界。
+
+agent_settled 是 session 级稳定边界。
+
+id 负责相关性。
+
+toolCallId 负责工具相关性。
+
+UI request id 负责对话框相关性。
+
+steer 和 follow_up 是不同队列。
+
+abort、abort_retry、abort_bash 是不同取消层级。
+
+Session tree 和 message projection 不是同一个视图。
+
+Compaction 改变 context 投影，不等于删除全部历史。
+
+RPC 和 MCP 解决不同的连接问题。
+
+Go 和 Java 都能从标准库实现客户端。
+
+但客户端必须把 framing、取消、错误和安全边界写清楚。
+
+这才是一个可维护的 Agent RPC 集成，而不是“启动进程然后读几行文本”。
 
 ## 章节对照
 

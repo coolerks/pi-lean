@@ -13,25 +13,125 @@ description: "本地开发、路径解析、调试和测试方式。"
 
 ## 中文译文
 
-### 环境与从源码运行
+### 这页的用途
 
-官方开发流程是 clone 仓库、执行 `npm install` 和 `npm run build`；从源码启动使用 `pi-test.sh`。这个脚本可以从任意调用目录执行，Pi 仍保留调用者的 current working directory，因此 cwd 决定项目指令、Session 和 Tool 的相对路径。当前教材分析工作区的固定 commit；若你在 fork 上开发，应把英文示例中的仓库地址换成自己的地址，不要把这段命令当成必须重新 clone 当前工作区。
+Development 文档讲的是如何在本地运行、改动、调试和测试 Pi 源码。它不是用户安装指南，也不是“修改源码后直接 npm publish”的发布教程。正确的开发顺序是：先固定 Node/package manager 与研究 commit，再从 source 启动，理解 package 边界，最后用 focused test 验证。
 
-### Fork 与重命名
+### Setup：安装与从源码运行
 
-在 `package.json` 的 `piConfig` 中设置 `name`、`configDir` 和 `bin`：`name` 影响 CLI banner，`configDir` 影响配置/Session 位置，`bin` 决定安装后的可执行入口。重命名不只是换标题，还会改变环境变量和用户配置路径；应在干净目录验证迁移行为。
+官方命令是：
 
-### 路径解析
+```bash
+git clone https://github.com/earendil-works/pi-mono
+cd pi-mono
+npm install
+npm run build
+```
 
-Pi 有 npm 安装、standalone binary 和从源码运行三种资产布局。访问 package 资源时必须使用 `src/config.ts` 提供的 `getPackageDir`、`getThemeDir` 等 helper，不要直接依赖 `__dirname`。Node 的 ESM、打包后的 binary 和源码路径对 `__dirname` 的假设不同；统一 helper 才能让主题、扩展和其他资源在三种模式下找到。
+本任务已经存在当前工作区时不应再次 clone 覆盖它；在自己的 fork 中才使用这组命令。`npm install` 安装 workspace 依赖，`npm run build` 按 package 依赖构建产物。构建失败要区分依赖安装、TypeScript 类型、native dependency 和源码错误，不能只看最后一行。
 
-### 调试与测试
+从源码运行：
 
-隐藏命令 `/debug` 将渲染后的 TUI 行（含 ANSI code）以及最近发给 LLM 的消息写入 `~/.pi/agent/pi-debug.log`。这对排查布局和请求组装很有用，但日志可能包含项目内容，分享前应脱敏。非 LLM 测试使用 `./test.sh`，不需要 API key；`npm test` 会运行完整测试，指定文件时按项目的 Vitest 命令传路径。不要把真实 Provider 凭据作为单元测试前置条件。
+```bash
+/path/to/pi-mono/pi-test.sh
+```
 
-源码包边界包括 `ai`（Provider abstraction）、`agent`（Loop 和 message types）、`tui`（终端组件）与 `coding-agent`（CLI/interactive mode）。进入源码时先沿 package dependency 读接口，再追实现；不要只看最终 TUI 输出推断 Loop 行为。
+脚本可以从任意目录调用，但 Pi 保留调用者的 current working directory。因此 `/path/to/project` 仍决定相对文件、project instructions、Session 目录和 Tool 的工作范围。`pi-test.sh` 的脚本路径与运行 cwd 是两件事。
 
-> 译者注：`pi-test.sh` 保持调用 cwd 类似 Java 进程接收 `user.dir`，而 `configDir` 类似应用级 home。两者决定的资源作用域不同，调试时要分别记录。
+> 译者注：Java 读者可以把调用 cwd 类比为 `user.dir`，把 source entry 类比为 Maven exec plugin 的 classpath 入口；Go 读者可以把它理解为 `os.Getwd()` 与可执行文件目录不能混用。很多“找不到配置”的 bug 都是把这两个路径当成同一个。
+
+### Fork / Rebranding
+
+在 `package.json` 中使用：
+
+```json
+{
+  "piConfig": {
+    "name": "pi",
+    "configDir": ".pi"
+  }
+}
+```
+
+fork 时同时检查 `name`、`configDir` 和 `bin`。它们会影响 CLI banner、配置路径、session 路径和环境变量名称；只修改 banner 不代表完成了 rebrand。应该在空的 HOME、空的 session directory 和干净安装中验证：旧配置是否被意外读取，新路径是否可写，卸载命令是否匹配新的 bin。
+
+### Path Resolution：不要猜资源路径
+
+Pi 支持 npm 安装、standalone binary 和 tsx/source 三种执行形态。package assets 必须通过 `src/config.ts`：
+
+```typescript
+import { getPackageDir, getThemeDir } from "./config.js";
+```
+
+不要直接使用 `__dirname`。ESM 中它本来就不是 CommonJS 的默认变量；standalone binary 还可能把资源放在 bundle 相邻目录，tsx source 又使用源码目录。`getPackageDir()` 和 `getThemeDir()` 把这些布局差异收口到一个边界。
+
+排查路径时打印三项而不是猜：调用 cwd、package dir、config dir。一个主题加载失败可能是 package asset 路径错；一个 session 找不到可能是 config/session dir 错；两者不是同一故障。
+
+### Debug Command
+
+隐藏命令 `/debug` 将内容写到 `~/.pi/agent/pi-debug.log`，包括带 ANSI code 的 rendered TUI lines 和最近发给 LLM 的 messages。它适合查布局、光标、换行、请求组装和 context 误差，但日志可能含项目代码、prompt、路径和敏感信息。分享前应复制到临时文件并脱敏，不能把 debug log 当作公开 issue 的默认附件。
+
+观察一次 tool call 时建议记录：
+
+```text
+1. 用户输入与当前 cwd
+2. 构建出的 system prompt（注意秘密）
+3. provider request 的 message/tool shape
+4. assistant tool call 的 id/name/arguments
+5. tool result 的 isError 与长度
+6. 下一轮 messages 是否追加并保持配对
+```
+
+### Testing：测试层次
+
+官方示例：
+
+```bash
+./test.sh                         # 非 LLM 测试，不需要 API key
+npm test                          # 全部测试
+npm test -- test/specific.test.ts # 指定测试
+```
+
+`./test.sh` 适合快速运行 deterministic tests；`npm test` 可能包含需要环境变量的 provider/e2e 测试，运行前读项目脚本。指定测试时要使用正确 workspace 路径，避免把一个不存在的相对文件当成成功。
+
+测试 Agent Loop 时优先使用 faux/scripted provider：第一轮返回 Tool Call，第二轮返回 final；这样可以断言 message、event、retry 和 max steps，不消耗真实 token。HTTP adapter 则使用 localhost fake server，测试 status、JSON、SSE 和 cancellation。
+
+### Project Structure 与阅读路线
+
+```text
+packages/
+  ai/           # LLM provider abstraction
+  agent/        # Agent loop and message types
+  tui/          # Terminal UI components
+  coding-agent/ # CLI and interactive mode
+```
+
+`ai` 负责 Provider/Model/stream/message 契约；`agent` 负责 loop 和 tool lifecycle；`tui` 负责渲染与输入；`coding-agent` 负责把资源、Session、工具、Extension 和模式组合起来。不要从 TUI 的最终字符串反推 Agent Loop；应从 `coding-agent -> agent -> ai` 沿调用链读。
+
+建议源码调试实验：在 `packages/agent/src/agent-loop.ts` 的 loop 入口、tool execution 前后和 event emission 处设置 breakpoint；再在 `packages/coding-agent/src/core/agent-session.ts` 的 event handler 与 session write 处观察。断点只用于理解当前 commit，不要为了教学修改 Pi 核心源码。
+
+### Go 与 Java 对照
+
+| 开发动作 | Go | Java |
+| --- | --- | --- |
+| 依赖安装 | `go mod download` | `mvn test`/dependency resolution |
+| cwd | `os.Getwd()` | `Path.of("").toAbsolutePath()` |
+| Debug output | `log`/event sink | Logger/Listener |
+| focused test | `go test -run` | `mvn -Dtest=... test` |
+| cancellation | `context.Context` | `Future`/interrupt |
+
+### 实验与检查清单
+
+1. 不重新 clone 当前工作区，记录 `git rev-parse HEAD` 和 `git remote -v`。
+2. 从一个临时 cwd 执行 `pi-test.sh`，确认 Pi 使用调用 cwd。
+3. 故意把资源路径改成 `__dirname`（在临时分支），观察 source/binary 差异，然后恢复。
+4. 启用 `/debug`，执行一次不含秘密的 fake prompt，检查 ANSI 与最近 messages。
+5. 运行 focused test，再运行非 LLM 全套；记录每项 exit code。
+6. 写一个 breakpoint trace，说明消息从 `AgentSession` 到 `agent-loop` 再到 provider 的路径。
+
+### 小结
+
+Pi 开发的关键不是“能跑起来”而是明确运行 cwd、资源路径、配置路径、package 入口和测试边界。`pi-test.sh`、`src/config.ts`、`/debug` 与 focused test 分别解决启动、资源、观察和回归问题。
 
 ## 章节对照
 

@@ -1,17 +1,301 @@
 ---
-title: "Java 15：Harness"
-description: "组合 Java Provider、Loop、Tools、Session、Plugin、Skill、MCP 和 Telemetry。"
+title: "Java 15：组合 Harness 与验收"
+description: "把 Model、ToolRegistry、Agent、Session、插件和 Telemetry 组合成可运行边界。"
 ---
 
-# Java 15：Harness
+# Java 15：组合 Harness 与验收
 
-`Harness` 是组合根：构造 `PermissionPolicy`、`ToolRegistry`、`AgentLoop`、`Session` 和 `Telemetry`，`prompt` 恢复历史、执行并保存结果。它展示模块边界，不能把一次 demo 误称为 durable operation log。
+## 本阶段要回答的问题
+
+前面的章节分别实现了 HTTP adapter、SSE、Tool registry、有限 Loop、文件工具、Session、队列、SPI、Skill、MCP 和 Telemetry。现在把它们组合起来。但组合不是把所有对象塞进一个 `while (true)`：Harness 要决定生命周期、依赖关系、持久化时机、权限边界和关闭顺序。
+
+本示例的 `Harness` 是一个**可测试的教学组合层**，不是 Pi `harness.v2.md` 设计中的 durable operation runtime。它会保存消息 JSONL，并能 reload；它没有 operation intent/result ledger、crash-point recovery、跨进程 writer lease 或外部副作用 exactly-once。教材明确这条边界，避免读者把 demo 当生产系统。
+
+完成本页后，你应该能画出：
+
+```text
+Main
+ -> Harness
+    -> Agent
+       -> AgentLoop
+          -> Model
+          -> ToolRegistry -> PermissionPolicy -> Tools
+    -> Session
+    -> Telemetry
+    -> PluginManager
+```
+
+## 前置知识与模块职责
+
+需要理解构造器注入、组合优于继承、`AutoCloseable`、不可变 record、JSONL 和线程安全。每个模块的职责如下：
+
+| 模块 | 负责 | 不负责 |
+| --- | --- | --- |
+| `HttpModel`/`ScriptedModel` | 一次模型请求或可重复测试响应 | 决定何时继续 Loop |
+| `AgentLoop` | assistant step、Tool Call、结果、retry、终止 | Session durable recovery |
+| `Agent` | running 状态、steering/follow-up/nextRun、abort | Provider JSON 转换 |
+| `ToolRegistry` | definition、名称 lookup、required gate | sandbox 和审批 |
+| `PermissionPolicy` | workspace path、明显命令拒绝 | OS 容器隔离 |
+| `Session` | 消息快照、JSONL 保存/加载 | operation ledger |
+| `Harness` | 创建和连接上述组件、prompt/compact 生命周期 | 让模型获得额外智能 |
+| `Telemetry` | 被动记录 span | 驱动 Loop 或恢复状态 |
+
+这是一个责任表，不是说所有项目都必须采用同样类名。
+
+## 构造 Harness：依赖从外向内组装
+
+```java
+public Harness(
+        Model model,
+        Path workspace,
+        Path sessionPath,
+        ObjectMapper mapper) {
+    this.mapper = mapper;
+    this.sessionPath = sessionPath;
+    this.telemetry = new Telemetry();
+    PermissionPolicy policy = new PermissionPolicy(workspace);
+    ToolRegistry registry = new ToolRegistry();
+    this.registry = registry;
+    registry.register(BuiltInTools.read(policy));
+    registry.register(BuiltInTools.write(policy));
+    registry.register(BuiltInTools.edit(policy));
+    registry.register(BuiltInTools.grep(policy));
+    registry.register(BuiltInTools.shell(policy));
+    registry.register(BuiltInTools.calculator());
+    LoopOptions options = new LoopOptions(
+            12, ExecutionMode.PARALLEL, 2, 25,
+            null, null, event -> { /* record */ });
+    this.agent = new Agent(
+            new AgentLoop(model, registry, options));
+    this.session = new Session(mapper);
+}
+```
+
+构造顺序体现依赖方向：Policy 先给 Tools，Tools 进入 Registry，Registry 和 Model 给 AgentLoop，Loop 给 Agent，最后 Harness 持有 Session 与 Telemetry。`ScriptedModel` 与 `HttpModel` 都实现 `Model`，因此 Harness 不需要知道底层 provider。
+
+输入是外部传入的 model、workspace 和 session path；输出是一个拥有清晰关闭责任的 Harness。当前构造器没有自动加载 SPI，这是为了让测试和启动流程显式；应用可以调用 `loadPlugin`。
+
+## `prompt` 的状态转换
+
+```java
+public RunResult prompt(String text) throws Exception {
+    List<Message> history = new ArrayList<>(session.snapshot());
+    history.add(Message.user(text));
+    RunResult result = agent.run(history);
+    session.replace(result.messages());
+    save();
+    return result;
+}
+```
+
+调用前读取 Session snapshot，再追加当前 user message；`agent.run` 只修改自己的 history；返回后将完整前缀替换回 Session 并保存。这样 Harness 不让 AgentLoop 直接持有 Session，也避免把可变 Session list 传给模型。
+
+一次成功 trace：
+
+```text
+session snapshot: []
+ -> add user("请计算 2 加 3")
+ -> AgentLoop model response: calculator call
+ -> ToolRegistry + calculator -> "5"
+ -> append role=TOOL
+ -> second model response: "2 + 3 = 5"
+ -> Session.replace(messages)
+ -> Session.save(temp + atomic move)
+ -> return RunResult
+```
+
+如果模型请求失败，当前 AgentLoop 会返回已经产生的 history 和 error；Harness 仍尝试保存这个前缀。这个行为让调试信息不随异常丢失，但它仍不是 operation ledger：无法区分某个外部 Tool 是否已经产生副作用后进程崩溃。
+
+## `load` 与重启
+
+```java
+public static Harness load(
+        Model model,
+        Path workspace,
+        Path sessionPath,
+        ObjectMapper mapper) throws IOException {
+    Harness harness = new Harness(
+            model, workspace, sessionPath, mapper);
+    if (sessionPath != null
+            && Files.exists(sessionPath)) {
+        harness.session.replace(
+                Session.load(sessionPath, mapper).snapshot());
+    }
+    return harness;
+}
+```
+
+`load` 先创建新的工具和 Agent，再读取 JSONL 消息。第二次进程不复用旧的 Java 对象，也不复用旧的 cancellation；它从持久化 message history 继续。若文件中间行损坏，`Session.load` 抛出带行号的 `IOException`，调用者应进入修复流程，而不是忽略这一行继续执行。
+
+重启示例：
+
+```java
+try (Harness first = new Harness(model, dir, file, mapper)) {
+    first.prompt("hello");
+}
+try (Harness second = Harness.load(nextModel, dir, file, mapper)) {
+    List<Message> restored = second.session().snapshot();
+    // restored 包含 user 与 assistant 两条消息
+}
+```
+
+输入是第一次进程写出的 JSONL，输出是第二个 Harness 的消息快照。模型可以更换，但 provider message compatibility 仍需由 adapter 保证。恢复消息不等于恢复一个未完成 Tool effect。
+
+## compact 的位置
+
+```java
+public void compact(int maxTokens) throws IOException {
+    session.replace(Compactor.compact(
+            session.snapshot(), maxTokens));
+    save();
+}
+```
+
+Compaction 在 Harness 层调用，因为它改变 Session 与下一次 request 的 context。Loop 不应该在不通知 Session 的情况下偷偷截断 history。当前 Compactor 只保留 system、摘要和最近四条消息；生产版本需要保留 tool call/result 配对、权限结论、用户约束和明确的 compaction metadata。
+
+## 插件、MCP 与权限的组合边界
+
+```java
+public void loadPlugin(AgentPlugin plugin) {
+    plugins.load(plugin, registry);
+}
+```
+
+插件注册的是 Tool，Harness 仍控制 Registry 和 PermissionPolicy。MCP client 产生的 remote Tool 也必须注册前审查 definition，执行时仍经过本地 schema gate 和取消令牌。不能因为 Tool 来自 SPI 或 MCP，就跳过 workspace/command policy。
+
+`close()` 反向关闭插件：
+
+```java
+@Override
+public void close() {
+    plugins.close();
+}
+```
+
+关闭顺序的重要性在于插件可能持有线程、socket 或临时资源。生产 Harness 还应先阻止新 prompt，等待 active run 到边界，再关闭 transport、telemetry exporter 和 storage。
+
+## Telemetry 是旁路观察者
+
+Harness 使用 `EventSink` 为每个事件创建 span：
+
+```java
+try (Telemetry.SpanScope ignored = telemetry.start(
+        "agent." + event.type(),
+        Map.of("step", Integer.toString(event.step())))) {
+    // event 已产生；span 在 close 时写入快照
+}
+```
+
+输入是事件类型、step 和字段，输出是 `Telemetry.Span`。它不应该修改 history、不应该决定重试，也不应该把 prompt、API key、文件内容和 Tool 参数默认写入日志。真正的 OpenTelemetry exporter 可在这个边界之后接入。
+
+## 失败与风险矩阵
+
+| 故障 | 当前示例行为 | 成熟 Harness 的下一步 |
+| --- | --- | --- |
+| model timeout/429 | exception 进入 retry | 按 status 和幂等性分类、记录 usage |
+| invalid tool args | error ToolResult，不执行 | 完整 schema validator |
+| Tool 非零退出 | error ToolResult | 保留 stderr、退出码、超时和审批记录 |
+| user abort | token cancel，shell 强制销毁 | 写 abort intent，恢复时 reconciliation |
+| context too long | 手动调用 Compactor | overflow 分类、bounded recovery |
+| JSONL 损坏 | 带行号失败 | backend repair 或人工恢复 |
+| MCP EOF | IOException | transport state、重连和 pending request |
+| plugin load error | 注册时抛异常 | capability/version/isolation policy |
+
+表格把当前能力和未来工程工作分开；不要把“有 try/catch”叫作 durable recovery。
+
+## 完整验收命令
 
 ```bash
 cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest test
+mvn -q -Dtest=HttpModelTest,McpClientTest test
 mvn test
 mvn package
 java -jar target/agent-harness-1.0.0.jar --demo
 ```
 
-要继续到生产级，需要 operation intent/result、崩溃恢复、幂等副作用和真实 sandbox，见 [成熟 Harness](/19-build-harness/architecture)。
+预期 demo 输出：
+
+```text
+tool[calculator]> 5
+final> 2 + 3 = 5
+```
+
+`mvn test` 使用 ScriptedModel、本地 `HttpServer`、管道 fake MCP server 和 SPI test resource，不需要 API key。`mvn package` 生成包含 Jackson 的 fat jar；验证完成后可以删除 `target/`，避免把构建产物当成源码交付。
+
+## JUnit 验收清单
+
+至少检查：
+
+1. AgentLoop 两轮请求的 history 和 Tool Result 配对。
+2. unknown tool/缺 required 参数不会调用 Tool。
+3. retry、maxSteps、abort 都有边界。
+4. Session 保存后可以 reload，坏行报告行号。
+5. Harness prompt 后的消息可被新 Harness 读取。
+6. SPI `spi_echo` 被发现并注册。
+7. MCP `tools/list` 与 `tools/call` 按 request id 匹配。
+8. PermissionPolicy 拒绝 workspace 外路径和明显危险命令。
+9. 多 Tool Call 在 parallel 模式下结果按 source order。
+10. Telemetry snapshot 是被动记录。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- 真实 Coding Agent 主组合在 `packages/coding-agent/src/core/agent-session.ts` 的 `AgentSession`；它连接 `Agent`、SessionManager、resource loader、tools、extensions 和 UI。
+- Loop 控制流在 `packages/agent/src/agent-loop.ts` 的 `runAgentLoop`、`executeToolCalls` 以及 `packages/agent/src/agent.ts` 的 `Agent`。
+- Session tree/context 在 `packages/coding-agent/src/core/session-manager.ts`；不是简单把 `List<Message>` 写成单个字符串。
+- Extension lifecycle 在 `packages/coding-agent/src/core/extensions/loader.ts` 与 `runner.ts`；Pi 的动态加载能力不能由 Java `ServiceLoader` 逐字复刻。
+- `packages/agent/src/harness/agent-harness.ts` 当前仍是 scaffold；本示例的 `Harness` 不能声称实现 durable API。
+
+Pi 的选择是把很多能力拆在 package 和 runtime 中；Java 示例选择一个小型组合 facade，目的是让依赖方向可视化，而不是宣称两者结构相同。
+
+## Go 对照
+
+| Java | Go |
+| --- | --- |
+| `Harness` + `Session` | `Harness` + `Session` |
+| `Agent` synchronized queues | `Agent` mutex/queue |
+| `HttpClient`/Jackson | `http.Client`/encoding/json |
+| `ServiceLoader` | explicit Plugin registry |
+| `Path`/`Files` | `filepath`/`os` |
+| `Telemetry.SpanScope` | Recorder finish callback |
+
+Java 的 checked exception 让组装方法显式声明失败；Go 的 `error` 返回值让 `Prompt` 调用者显式处理。两版都用 ScriptedModel 证明组合层可以在离线测试中运行。
+
+## 动手实验：从零验收 Harness
+
+### 目标
+
+不调用真实 Provider，证明一次 prompt、保存、重启、再读取的完整闭环，并明确它与 durable Harness 的差距。
+
+### 准备
+
+准备 JDK 21、Maven、临时目录；阅读 `Harness.java`、`Session.java`、`Agent.java` 和 `AgentTest.harnessPersistsAndReloads`。
+
+### 步骤
+
+1. 用第一轮只返回 `Message.assistant("ok")` 的 ScriptedModel 创建 Harness。
+2. 调用 `prompt("hello")`，打印 `RunResult.messages()` 和 JSONL 文件。
+3. 关闭第一个 Harness，创建第二个 ScriptedModel 和 `Harness.load`。
+4. 断言 reload 后仍有 user 与 assistant 两条消息。
+5. 在 prompt 中加入 calculator Tool Call，观察 tool message 的 `toolCallId`。
+6. 让模型第一次失败，检查 retry 和 Session 保存的前缀。
+7. 把 session 文件第二行改成坏 JSON，确认 reload 报行号。
+8. 对比这个“消息快照恢复”和 `harness.v2.md` 所需的 operation intent/result 恢复。
+
+### 观察点
+
+Harness 是生命周期边界；AgentLoop 是控制流；Session 是消息存储；Telemetry 是旁路观察；Plugin/MCP 是能力来源。没有 operation ledger 时，程序不能可靠判断崩溃前某个外部 effect 是否已经发生。
+
+### 预期结果
+
+你能从一份 Java stack trace 定位问题属于 HTTP adapter、Loop、Tool、Session 还是组合层，并能说明为什么必须把恢复语义单独建模。
+
+### 思考题
+
+如果 `Session.save` 成功但进程在 Tool 产生副作用后崩溃，重新 prompt 会不会重复执行？如果插件注册了与内建 Tool 同名的工具，应该 fail-fast 还是显式 namespace？如果 telemetry exporter 阻塞，能否让它阻塞 Tool 执行？
+
+## 小结与下一步
+
+Java 15 的成果不是“有一个大类”，而是一个可观察的依赖图：Model 提供响应，Loop 推动控制流，ToolRegistry 守住执行入口，Agent 管生命周期与队列，Session 保存消息，Harness 负责组合，Telemetry 记录旁路事实。下一步进入 `19-build-harness`，把教学组合层升级为有明确 operation intent、recovery、权限和幂等语义的成熟设计。

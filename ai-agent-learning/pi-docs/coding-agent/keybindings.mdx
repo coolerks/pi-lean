@@ -113,6 +113,73 @@ history action 不受多行光标位置影响，总是切换历史条目。编�
 
 单个 action 可以是字符串或数组；用户配置覆盖默认值。Emacs 常见映射使用 `ctrl+b/f`、`alt+b/f`、`ctrl+p/n` 和 `ctrl+h`；Vim 风格可以把方向键额外映射到 `alt+h/j/k/l`。这些配置只改变按键到 action 的映射，不改变 action 本身的队列或模型语义。
 
+### Action、按键与焦点的关系
+
+配置文件保存的是“按键如何映射到 action”，不是把某个字符直接绑定到一个函数。TUI 先读取终端输入并解析 modifier，再根据当前焦点选择 editor、selector、fullscreen transcript 或应用层的 keybinding manager。最后才由对应 action 改变编辑器、session、模型选择器或运行状态。因此同一个 `ctrl+p` 在主编辑器里可以是历史导航，在模型选择器里又可以是切换模型；这不是冲突，而是焦点路由的结果。
+
+例如，下面的设置只改变主编辑器焦点下的行为：
+
+```json
+{
+  "tui.editor.historyPrevious": "ctrl+p",
+  "app.model.cycleForward": "alt+p"
+}
+```
+
+如果当前焦点是 selector，`ctrl+p` 仍可能由 selector 的 action 处理。不要通过删除 selector 的默认配置来解决一个 editor 绑定问题。先确认焦点、模式和 action namespace，再检查配置是否成功加载。
+
+> 译者注：这是 keybinding 文档最容易被误读的地方。`ctrl+p` 不是一个全局 JavaScript callback 名称，而是经过“终端输入 → 当前组件 → action id”三层路由。Java 中可以把它类比成不同 Swing/JavaFX 组件的 `InputMap`，Go 中则像把事件交给当前拥有焦点的 handler。
+
+### 配置覆盖、数组与禁用
+
+单个字符串表示一个按键，数组表示多个等价按键。用户配置会覆盖该 action 的默认值，而不是自动把用户值与默认值合并。例如：
+
+```json
+{
+  "tui.editor.cursorLeft": ["left", "ctrl+b"],
+  "tui.altScreen.pageUp": [],
+  "app.message.followUp": "alt+enter"
+}
+```
+
+第一项明确提供两个快捷键；第二项完全禁用 transcript 的 page-up action；第三项只保留一个 follow-up 快捷键。数组为空与省略配置不同：省略表示沿用默认值，空数组表示用户有意关闭它。
+
+修改后要在同一个 Pi session 中执行 `/reload`。如果没有生效，依次检查：JSON 是否合法、action id 是否拼写正确、当前工作目录和 settings 文件是否正确、当前组件是否拥有焦点、是否运行在 fullscreen 模式。配置字段的拼写错误不会变成一个新的 action。
+
+### 编辑器、选择器和应用 action 的范围
+
+编辑器 action 处理光标、单词、行、删除、撤销和 kill ring。`historyPrevious` 与 `historyNext` 不依赖光标是否位于多行 prompt 的首尾，它们直接切换历史条目。`tui.input.submit` 会提交 prompt，而 `tui.input.newLine` 只插入换行；把二者混淆会让多行代码提前发送给模型。
+
+选择器 action 只作用于当前 list，例如 `tui.select.up`、`confirm` 和 `cancel`。它们不应该被当作 session tree action。应用 action 则处理 `app.interrupt`、session、model、thinking、tool output 和 follow-up。源码或扩展注册快捷键时，应使用完整 namespace，避免扩展和宿主共享短名称造成迁移歧义。
+
+### Fullscreen、Windows 与终端差异
+
+`--tui-mode fullscreen` 时，未带 modifier 的 `home`、`end`、`pageUp`、`pageDown` 优先作用于 transcript；带 `ctrl` 的版本继续控制编辑器。regular 模式下这些键都指向编辑器。`tui.altScreen.*` 是 transcript action，因此把 `tui.editor.pageUp` 改绑并不会自动改变 fullscreen transcript 的滚动。
+
+`super` 是否可用取决于终端是否按 Kitty keyboard protocol 单独上报 modifier。鼠标和触控板是否能滚动 transcript 还取决于终端设置，详见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。原生 Windows 不支持 Unix job control，所以 `app.suspend` 没有默认绑定；WSL 仍可以使用 Linux 的 `ctrl+z`/`fg`。
+
+> 译者注：这解释了“配置正确但快捷键仍不响应”的常见故障。Pi 能否执行 action 与终端是否把原始按键编码成可辨识事件是两件事；调试时先用终端输入报告工具确认字节/修饰键，再看 Pi action 路由。
+
+### 与 Agent 状态的关系
+
+快捷键只触发控制入口，不直接修改模型历史。例如 `app.message.followUp` 将消息放入 follow-up 队列，实际何时进入下一次模型请求由 Agent Loop 的 turn boundary 决定；`app.interrupt` 请求取消当前运行，是否能停止远端 HTTP 请求则取决于 provider 和 abort signal。`app.tools.expand` 只改变展示，不改变 Tool Result。
+
+这条边界很重要：如果扩展把一个 keybinding 直接连接到文件写入，就绕过了 Agent Runtime 的权限、事件和审计路径。正确做法是触发一个 command，让宿主按正常 capability 和 permission 流程处理。
+
+### 可执行实验：定位一个“失效”快捷键
+
+1. 复制当前 `~/.pi/agent/keybindings.json` 到临时目录，并只加入 `tui.editor.historyPrevious: ["ctrl+p"]`。
+2. 启动 Pi，输入两条不同 prompt；先在编辑器焦点下按 `ctrl+p`，再在 model selector 中按同一键。
+3. 切换 `--tui-mode fullscreen`，比较 `pageUp` 与 `ctrl+pageUp` 的对象。
+4. 将 `tui.altScreen.pageUp` 改为空数组并执行 `/reload`，确认 transcript 不再响应该 action。
+5. 在 Windows/WSL 或支持 Kitty protocol 的终端重复测试，记录平台差异。
+
+观察点是“输入事件、焦点、action、状态变化”四个阶段。预期结果：相同按键在不同焦点可能触发不同 action，但每个 action 的语义保持不变。
+
+> 译者注：如果你要把这套机制移植到 Go/Java，不要从 `switch key == "ctrl+p"` 开始。Go 可以用 `map[ActionID][]Key` 加当前 handler，Java 可以用 `Map<ActionId, Set<KeyStroke>>` 加 Listener；这样用户配置仍然可覆盖默认值，测试也能断言路由而非终端细节。
+
+> 译者注：配置快捷键时应优先绑定语义 action，而不是依赖某个默认组合键。这样换终端、换操作系统或升级默认配置时，用户意图仍然稳定，自动化测试也能直接断言 action。
+
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

@@ -37,6 +37,74 @@ Review staged changes (`git diff --cached`). Focus on bugs, security, and error 
 
 > 译者注：template 是可复用 prompt 资源，Skill 通常还携带 references/assets 和能力说明；两者都能影响模型 Context，但都不能替代 Runtime 的权限检查。
 
+### 从文件到命令的完整生命周期
+
+模板不是一个新的 slash command 实现，也不是模型 Tool。Pi 在加载阶段发现 Markdown 文件，取文件名作为 command name，解析可选 frontmatter；用户输入 `/review` 后，运行时把文件内容和参数展开，再把结果作为一次 prompt 提交。模型看到的是展开后的文本，不会看到一个名为 `review` 的函数调用。
+
+```text
+发现路径
+  -> 读取 frontmatter
+  -> filename review.md => /review
+  -> autocomplete 显示 description/argument-hint
+  -> 用户输入 /review args
+  -> 展开 $1/$@/${1:-default}
+  -> 生成完整 user prompt
+  -> Agent Loop 按普通消息处理
+```
+
+> 译者注：这条链解释了 template 与 Tool 的边界。模板只改变输入文本，Tool 才是 Runtime 可以校验并执行的能力。Java 可以把 template 看成文件加载器加字符串替换器，Go 可以用 `os.ReadFile` 加确定性的展开函数；二者都不应因为模板内容出现 `bash` 就自动授予 shell 权限。
+
+### Locations 的优先级和信任
+
+全局模板适合个人工作流，项目模板适合仓库协作，package 模板适合发布资源，settings 数组适合显式声明非标准路径，CLI `--prompt-template` 适合一次运行注入。项目 `.pi/prompts` 只有项目 trusted 后才应加载，这是因为模板会影响模型行为，未审查的仓库内容不应无条件进入 system/user prompt。
+
+`prompts/` 目录发现是非递归的。例如：
+
+```text
+prompts/review.md          -> 自动发现
+prompts/code/review.md     -> 不自动发现
+```
+
+第二个文件要通过 settings 或 package manifest 显式列出。`--no-prompt-templates` 关闭自动发现，但命令行显式给出的 `--prompt-template` 仍然是用户明确指定的输入。调试时先打印最终发现列表，不要只看文件是否存在。
+
+### Frontmatter 与 autocomplete
+
+`description` 是给用户看的选择提示；缺失时使用正文第一条非空行，因此正文第一行不要放无意义的标题。`argument-hint` 只是展示语法，不会验证 `<PR-URL>` 是否真的是 URL，也不会替 `${1:-default}` 生成默认值。真正的参数缺失处理必须由模板默认值、prompt 约束或后续工具校验完成。
+
+```markdown
+---
+description: Review a pull request
+argument-hint: "<PR-URL> [focus]"
+---
+Review $1 and focus on ${2:-correctness, security, and tests}.
+```
+
+如果用户输入 `/review https://example.test/pr/1 security`，`$1` 是 URL，`$2` 是 `security`。如果没有第二个参数，默认文本才会进入展开结果。注意 `<`、`>` 在 Markdown 中是提示语法；它们不是模板引擎要替换的变量。
+
+### 参数展开的边界
+
+位置参数从 1 开始；`$@` 与 `$ARGUMENTS` 将全部参数拼接。`${@:N}` 和 `${@:N:L}` 用于从指定位置截取参数，适合把前一个参数当资源名、后面的参数当说明。值中有空格时在命令行中加引号，否则用户输入会被拆成更多 positional arguments。
+
+建议在展开后记录“模板名、参数数量、是否使用默认值”，不要记录可能包含 token、源码或个人数据的完整 prompt。模板文件和参数都属于不可信输入，尤其是 package 安装来的模板。
+
+### 使用、故障和测试
+
+可执行实验如下：
+
+1. 在临时 `.pi/prompts/review.md` 写入 `description` 和 `$1`。
+2. 在 trusted 项目中启动 Pi，确认 `/review` 出现在 autocomplete。
+3. 输入 `/review "auth module"`，检查空格是否保持为一个参数。
+4. 输入没有参数的 `/review`，确认默认值或缺失参数行为符合预期。
+5. 在 `prompts/sub/review.md` 放置同名文件，确认非递归规则。
+6. 加入 `--no-prompt-templates`，再用显式 `--prompt-template` 对照发现结果。
+7. 修改文件后重新启动或按当前运行时的 reload 机制刷新，确认缓存没有掩盖文件变化。
+
+常见故障包括：模板没有 description 导致 autocomplete 内容取正文首行；项目不 trusted 导致文件不加载；文件名冲突导致 command 不清晰；引号缺失导致参数切分；模板中写了未定义变量导致模型收到空白或字面量。每种故障都应在测试中断言最终展开文本，而不是只断言文件被读取。
+
+> 译者注：模板替换器应是纯函数：给定模板正文和参数，输出确定文本，不触碰文件系统和网络。这样可以用 Go table test 或 Java JUnit 覆盖 `$1`、默认值、切片、空参数和引号边界；发现器另测路径、trust 和 `--no-*` 开关。
+
+> 译者注：一个好的模板应该让输入边界可见：用户提供哪些参数、缺省值是什么、展开后会发送什么文本。把复杂业务逻辑塞进模板，会让错误难以定位；应把副作用交给经过权限检查的 Tool。
+
 ## 章节对照
 
 | 源文档标题 | 中文阅读标题 |

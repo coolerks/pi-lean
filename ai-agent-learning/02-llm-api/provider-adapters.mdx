@@ -5,28 +5,175 @@ description: "理解统一 Model/Message/Stream 如何隔离厂商 API。"
 
 # Provider Adapter 与 Model
 
-## 为什么不能让 Loop 依赖厂商 SDK
+## 学习目标
 
-如果 Loop 直接接收 OpenAI 的 response item，切换到 Anthropic 就会把 provider 分支散落在状态机、Tool、UI 和 Session 中。Adapter 把变化收在边界：Loop 只知道 `Context`、统一 `AssistantMessageEventStream`、`ToolCall` 和 `Usage`。
+本页要建立一个可测试的 Provider 边界：Agent Loop 不知道 OpenAI、Anthropic 或 Google 的原始 DTO；它只消费统一的 Model、Message、Tool Call、Usage、Stream 和 Stop Reason。读完后，你应能判断一个字段应该放在 adapter、Loop 还是 Harness。
 
-## Pi 的三层
+## 前置问题：为什么不能直接 import SDK
 
-| 层 | Pi 位置 | 责任 |
+假设 Loop 直接处理 OpenAI Chat Completions：
+
+```text
+if response.choices[0].message.tool_calls != null:
+    ...
+```
+
+当切换 Anthropic，代码会变成 content block 分支；切换 Responses API，又要处理 output item。久而久之，Provider 判断会散落到 Loop、Tool、UI、Session 和测试中。任何一个厂商字段变化都可能破坏整个运行时。
+
+Adapter 的目标不是“隐藏所有差异”，而是明确哪些差异必须在边界归一化，哪些能力差异要作为 capability 暴露。
+
+## 三层模型
+
+```mermaid
+flowchart LR
+    Loop[Agent Loop] --> Model[统一 Model]
+    Model --> Provider[Provider / Models]
+    Provider --> Adapter[API Adapter]
+    Adapter --> HTTP[HTTP / SSE / SDK]
+    HTTP --> Vendor[OpenAI / Anthropic / Google]
+    Vendor --> HTTP
+    HTTP --> Adapter
+    Adapter --> Model
+    Model --> Loop
+```
+
+| 层 | Pi 位置 | 主要责任 | 不应做什么 |
+| --- | --- | --- | --- |
+| `Model` | `packages/ai/src/types.ts` 的 `Model` | 描述 provider、id、api、能力、窗口、成本 | 不拼厂商 JSON |
+| `Provider`/`Models` | `packages/ai/src/models.ts` | 注册模型、解析 credentials、选择 stream 函数 | 不执行 Tool |
+| API adapter | `packages/ai/src/api/*.ts` | payload、消息转换、流解析、错误归一化 | 不决定业务权限 |
+| Agent Loop | `packages/agent/src/agent-loop.ts` | step、Tool 调度、继续/结束 | 不判断厂商私有字段 |
+| Harness | `packages/agent`/coding-agent | Session、队列、恢复、配置、Telemetry | 不把 model 当成权限系统 |
+
+## 统一 Model 至少描述什么
+
+```text
+provider       -> 供应商标识
+id             -> 模型标识
+api            -> 使用哪种 API 形状
+contextWindow -> 输入/输出预算
+maxOutput     -> 能否指定输出上限
+reasoning     -> 是否支持 thinking/reasoning
+toolCalling   -> 是否支持工具调用
+cost           -> 输入/输出/缓存计价
+```
+
+能力字段很重要：没有 Tool Calling 的模型不能只因为名字相似就被当成支持工具的模型。模型目录也可能动态更新；类型安全的静态目录与运行时验证应同时存在。
+
+## 三种请求/响应形状
+
+### Chat Completions
+
+典型形态是 `messages` 数组、`choices[].message` 和 `finish_reason`。assistant 的 `tool_calls` 通常含 function name 和 JSON 字符串 arguments，Tool Result 常用 role `tool`。优点是概念直观，限制是不同服务商对字段扩展不一致。
+
+### Responses API
+
+Responses 使用 output items 表示 message、function call、function output 和 reasoning 等对象，流事件可能分别表示 item added、arguments delta、item done。不能在核心 Loop 中硬编码 `choices[0]`。
+
+### Anthropic Messages
+
+system 通常独立传递，user/assistant content 是 blocks；tool use 和 tool result 也是 blocks。一个 assistant 响应可能同时包含文本和 tool use，因此 `content` 非空不能证明本轮应结束。
+
+### Google Gemini
+
+函数调用/函数响应通常放在 parts，角色和工具声明方式也不同。adapter 把它们转换成统一的 Tool Call 和 Tool Result，Loop 不需要知道 parts 的具体形状。
+
+## 归一化边界
+
+应在 adapter 归一化：
+
+- provider response 到 `AssistantMessage` 的文本/内容块。
+- 多种 function-call 形状到 `ToolCall{id,name,arguments}`。
+- finish/stop 原因到有限的内部 `StopReason`。
+- token、缓存和 reasoning 计量到 `Usage`。
+- SSE/事件流到 `AssistantMessageEvent`。
+- HTTP 错误、Provider 错误和 retry-after 到可分类的错误对象。
+
+不应过早归一化：
+
+- Provider 的 response id、deferred handle、thinking signature 等后续需要的能力。
+- 仅部分模型支持的能力；应保留 capability，而不是假装所有模型一样。
+- 调试所需的安全 raw metadata；但默认不能记录 credential、prompt、文件内容和完整 payload。
+
+一个好的统一类型既能让 Loop 简单，又不会抹掉恢复或计费所需的信息。
+
+## Retry 的位置
+
+`packages/ai/src/utils/provider-retry.ts` 的 `retryProviderRequest` 负责一次 Provider request 的可重试判断，例如 408、409、429、5xx 和显式 retry header，并处理 `retry-after` 与可中断退避。
+
+这与 Agent step retry 分开：
+
+```text
+Provider request retry:
+    同一 request/同一 tool intent，网络层重试
+
+Agent step retry:
+    重新进行一次 assistant step，可能产生新响应
+
+Harness recovery:
+    崩溃重启后根据 durable intent/result 决定跳过、重做或标记
+```
+
+如果三层都无限重试，一个 429 就可能造成指数级重复请求；如果把 Tool step 当普通 HTTP 重试，可能重复外部副作用。
+
+## Pi 的源码阅读入口
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/ai/src/types.ts`：`Model`、`Context`、统一 message/event 类型。
+- `packages/ai/src/models.ts`：`Models`、Provider 注册和 `streamSimple`/dispatch。
+- `packages/ai/src/providers/all.ts`：`builtinProviders`、`builtinModels` 的集中组合。
+- `packages/ai/src/api/anthropic-messages.ts`：Anthropic Messages 转换。
+- `packages/ai/src/api/openai-completions.ts`：Chat Completions 转换。
+- `packages/ai/src/api/openai-responses.ts`：Responses item/stream 转换。
+- `packages/ai/src/api/google-generative-ai.ts`：Gemini 请求与响应形状。
+- `packages/ai/src/utils/provider-retry.ts`：请求层 retry policy。
+
+阅读方法是先从 `Model` 反向追到 `streamSimple`，再追到 adapter；不要只看 provider 名称推测行为。源码和官方 API 文档不一致时，当前源码描述当前 Pi 行为，差异要显式标注。
+
+## Go 与 Java 设计
+
+| 责任 | Go 示例 | Java 示例 |
 | --- | --- | --- |
-| Model | `packages/ai/src/types.ts` 的 `Model` | 描述 `provider`、`id`、`api`、能力、窗口和成本。 |
-| Provider | `packages/ai/src/models.ts` 的 `Provider`/`Models` | 注册模型、选择 API stream 函数、处理 auth 和能力。 |
-| API adapter | `packages/ai/src/api/*.ts` | 拼 payload、转换消息、解析 stream、归一化 stop reason/usage。 |
+| 统一接口 | `Model` | `Model` |
+| payload | `map[string]any` + JSON | Jackson object tree |
+| stream | `StreamingModel.Stream` | `StreamingModel.stream` |
+| 错误 | `error` + context | checked exception + token |
+| 测试替身 | `ScriptedModel` | `ScriptedModel` |
 
-`packages/ai/src/providers/all.ts` 用 `builtinProviders()` 集中登记当前构建的 provider。当前列表包括 OpenAI、Anthropic、Google、Bedrock、Mistral、OpenRouter、xAI、DeepSeek 等多个适配器；不要把这份目录当成“每个都可用”，认证和模型目录仍由运行环境决定。
+两个示例都只实现 OpenAI-compatible 基础形状，故意不把所有真实 Provider 差异伪装成已支持。教学重点是 adapter 边界，而不是复制每家 SDK。
 
-## 三种常见 API
+## 动手实验：加入一个 Provider capability
 
-- Chat Completions：消息数组和 `choices[].message`，工具结果多以 role 表示。
-- Responses：output item 可以是 message、function call、function output；流事件更细。
-- Anthropic Messages：`system` 单独传递，content block 表示文本、thinking、tool use/result。
+### 目标
 
-它们的语义相同部分是“模型请求 + 结构化工具 + 结果回传”，字段和流事件不同。教材示例固定自己的内部 DTO，不复制任何厂商 SDK 类型。
+让 Loop 在不导入厂商类型的情况下知道模型是否支持 Tool Calling。
 
-## 重试边界
+### 准备
 
-`packages/ai/src/utils/provider-retry.ts` 的 `retryProviderRequest` 对 408、409、429、5xx 和显式 `x-should-retry` 做判断，支持 `retry-after` 与可中断退避。重试应发生在一次请求内部；Agent 层还要决定是否重做整个步骤，二者不能混为一个无限循环。
+打开 `packages/ai/src/types.ts`、`packages/ai/src/models.ts`，再打开 Go/Java 示例的 `Model` 接口。
+
+### 步骤
+
+1. 列出一个统一 `Model` 必须提供的字段。
+2. 把“支持工具”和“支持 reasoning”作为 capability，而不是从 provider 名称猜。
+3. 为 Fake/Scripted Model 固定 capability。
+4. 在 Loop 进入 Tool 分支前做 capability 检查。
+5. 用两个测试：支持工具时完成 calculator；不支持时返回明确错误。
+6. 在 adapter 测试中只验证 payload 转换，不验证 Loop 的完整生命周期。
+
+### 观察点
+
+adapter 测试的输入是统一 Request、输出是厂商 JSON 或统一 Response；Loop 测试只看统一类型。这样失败定位能回答“是协议转换坏了，还是控制流坏了”。
+
+### 预期结果
+
+更换 Provider 只需要新增 adapter/model definition，不需要在每个 Tool 和 UI 分支增加 provider if/else。
+
+### 思考题
+
+如果 Anthropic 的 thinking signature 必须原样回传，应该被完全抹平成字符串吗？如果一个 Provider 的 token usage 缺失，Usage 应该填零、标记 unknown，还是让请求失败？请从成本审计和用户体验分别分析。
+
+## 小结
+
+Provider adapter 是“协议差异的防火墙”，不是万能抽象。它归一化 Loop 必须理解的语义，同时保留 capability、response id 和安全 raw metadata 等恢复所需信息。`Model` 让循环可测试，`Provider` 负责选择，adapter 负责翻译，Harness 负责更长生命周期；这四层不能混成一个巨型客户端。

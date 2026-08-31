@@ -1,12 +1,324 @@
 ---
-title: "Java 09–14：Session、Compaction、SPI、Skill 与 MCP"
-description: "把内存循环接到 JSONL、ServiceLoader 和 JSON-RPC。"
+title: "Java Agent Runtime：阶段总览"
+description: "在进入逐项实现前，先看 Session、Compaction、队列、SPI、Skill 与 MCP 如何连接。"
 ---
 
-# Java 09–14：Session、Compaction、SPI、Skill 与 MCP
+# Java Agent Runtime：阶段总览
 
-`Session` 逐行保存 Jackson record，写入临时文件后原子替换；坏行带行号抛出错误。`Compactor` 保留 system 和最近尾部，用摘要替换旧消息，明确这是教学策略而不是完整语义压缩。
+> 本页是路线总览，不是新的编号阶段；后续页面会分别实现这里列出的能力。
 
-`AgentPlugin` 是 Java interface，可由 `ServiceLoader` 从 `META-INF/services` 发现；`PluginManager` 负责 register/close。`SkillDiscovery` 只加载 frontmatter，正文按需读取。
+## 为什么需要这一组能力
 
-`McpClient` 以 newline-delimited JSON-RPC 调用 `tools/list` 和 `tools/call`，Remote Tool 再适配成本地 `Tool`。它串行匹配 id；生产版本应加 initialize、并发 dispatcher、超时、重连和权限。
+Java 04 的 Loop 每次从 `List<Message>` 开始，运行结束后对象就可以被垃圾回收。真实 Coding Agent 不能接受这个边界：进程可能崩溃，context 可能超过窗口，用户可能在运行中追加要求，工具能力还可能来自插件或另一个进程。
+
+本页把后续的 Session、Compaction、Steering、SPI、Skill 和 MCP 放在一条运行时主线上：
+
+```text
+AgentLoop
+ -> Agent queues
+ -> Session JSONL
+ -> Compactor
+ -> Plugin/SPI
+ -> Skill metadata
+ -> MCP JSON-RPC remote Tool
+```
+
+这些模块并不是一个大类。Session 保存对话，Compaction 控制 context 大小，队列改变下一次 turn 输入，Plugin 增加本地能力，Skill 提供按需说明，MCP 连接远程能力。把它们分别理解，才能在最后组装 Harness。
+
+## 前置知识与边界
+
+需要掌握 Jackson 序列化、JSONL、`Path` 文件操作、Java `ServiceLoader`、线程安全和 JSON-RPC。当前示例不依赖第三方 Agent Framework；Jackson 只做 JSON AST/序列化。
+
+本页不声称实现 Pi `harness.v2.md` 中的 operation ledger、崩溃恢复状态机或 exactly-once 外部副作用。Java 示例提供的是可运行的教学边界：Session 原子保存消息；MCP client 串行 request；Plugin 用 SPI；更完整 durable 设计见 [Harness 可靠性](/07-harness/reliability)。
+
+## Java 09：Session 为什么不只是一个 List
+
+```java
+public final class Session {
+    private final ObjectMapper mapper;
+    private final List<Message> messages = new ArrayList<>();
+
+    public synchronized void append(Message... entries) {
+        messages.addAll(List.of(entries));
+    }
+
+    public synchronized List<Message> snapshot() {
+        return List.copyOf(messages);
+    }
+}
+```
+
+内存中的 Session 使用 `synchronized` 保护写入，并用 `List.copyOf` 给调用者快照。快照可被 Loop 自己追加，不会改动 Session 原列表。`append` 与 `replace` 是状态边界；模型 request 不应该持有可变内部 list。
+
+JSONL 保存一行一个 `Message`：
+
+```java
+public synchronized void save(Path path) throws IOException {
+    Path directory = path.getParent() == null
+            ? Path.of(".") : path.getParent();
+    Files.createDirectories(directory);
+    Path temporary = Files.createTempFile(directory,
+            ".session-", ".tmp");
+    try {
+        try (BufferedWriter writer = Files.newBufferedWriter(
+                temporary, StandardCharsets.UTF_8)) {
+            for (Message message : messages) {
+                writer.write(mapper.writeValueAsString(message));
+                writer.newLine();
+            }
+        }
+        try {
+            Files.move(temporary, path,
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException exception) {
+            Files.move(temporary, path,
+                    StandardCopyOption.REPLACE_EXISTING);
+        }
+    } finally {
+        Files.deleteIfExists(temporary);
+    }
+}
+```
+
+先写临时文件，再 replace 目标文件，避免读者看到半行 JSON。文件系统不支持 atomic move 时的 fallback 仍不是完美事务；文档必须诚实标注这个风险。`load` 逐行解析，坏行会带行号抛出 `IOException`，而不是静默跳过损坏历史。
+
+失败 trace：
+
+```text
+session.jsonl line 1 -> valid Message
+line 2 -> invalid JSON
+ -> IOException("invalid session line 2")
+ -> 不返回“看似完整”的 Session
+```
+
+## Java 10：Compaction 是有损的 context 变换
+
+```java
+public static List<Message> compact(
+        List<Message> messages, int maxTokens) {
+    if (maxTokens <= 0) {
+        throw new IllegalArgumentException(
+                "maxTokens must be positive");
+    }
+    if (estimateTokens(messages) <= maxTokens) {
+        return List.copyOf(messages);
+    }
+    List<Message> result = new ArrayList<>();
+    int start = 0;
+    if (!messages.isEmpty()
+            && messages.get(0).role() == Message.Role.SYSTEM) {
+        result.add(messages.get(0));
+        start = 1;
+    }
+    int keepFrom = Math.max(start, messages.size() - 4);
+    result.add(Message.assistant(
+            "[compaction summary: " + (keepFrom - start)
+            + " earlier messages omitted]") );
+    result.addAll(messages.subList(keepFrom, messages.size()));
+    return List.copyOf(result);
+}
+```
+
+输入是旧 history 与 token 上限，输出是保留 system、摘要和最近尾部的新 history。当前 `estimateTokens` 只是字符数除以 4 的教学估计，不是任何 provider 的真实 tokenizer。它没有理解 tool call/result 配对，也没有让模型生成语义摘要，因此不能用于生产恢复。
+
+必须问清楚什么不能丢：当前任务约束、最近工具结果、未完成的 assistant/tool 配对、权限决定和用户最新指令。Pi 的 compaction 设计比这个示例复杂，阅读 `packages/coding-agent/docs/compaction.md` 与 `SessionManager`。
+
+## Java 11：Steering、Follow-up 与 Next Run
+
+`Agent` 把三个队列区分开：
+
+| 队列 | 注入时机 | 示例 |
+| --- | --- | --- |
+| steering | 当前运行的下一次模型请求前 | “不要修改数据库代码” |
+| follow-up | 模型本来要停止时 | “完成后再写测试” |
+| nextRun | 当前运行结束、下一次 prompt 开始时 | “下次先解释方案” |
+
+```java
+public synchronized void steer(String text) {
+    ensureRunning();
+    steering.add(Message.user(text));
+}
+
+public synchronized void followUp(String text) {
+    ensureRunning();
+    followUps.add(Message.user(text));
+}
+
+public synchronized void nextRun(String text) {
+    nextRun.add(Message.user(text));
+}
+```
+
+`steer` 和 `followUp` 要求 active run；`nextRun` 可以在 idle 时排队。`Agent.prompt` 在同一个 synchronized 区域中捕获并清空 nextRun，然后标记 running，避免两个并发 prompt 抢到同一条消息。
+
+`abort()` 只清理当前 run 的 steering/follow-up，保留 nextRun：
+
+```java
+public synchronized void abort() {
+    ensureRunning();
+    steering.clear();
+    followUps.clear();
+    currentCancellation.cancel();
+}
+```
+
+这不等于中断任意 Java 线程。模型和 Tool 必须主动调用 `throwIfCancelled`；shell 工具还要销毁进程。队列消息只有在检查点进入下一次 request，不能修改已发送 request。
+
+## Java 12：ServiceLoader 插件
+
+```java
+public interface AgentPlugin extends AutoCloseable {
+    String name();
+    void register(ToolRegistry registry);
+
+    @Override
+    default void close() { }
+}
+```
+
+`ServiceLoader` 需要在 `META-INF/services/learning.agent.AgentPlugin` 中写实现类名：
+
+```text
+learning.agent.SpiTestPlugin
+```
+
+```java
+public void loadFromSpi(ToolRegistry registry) {
+    ServiceLoader.load(AgentPlugin.class)
+            .forEach(plugin -> load(plugin, registry));
+}
+```
+
+JVM 从 classpath 发现实现并实例化。`PluginManager` 负责 register 和反向 close；注册失败应该让启动失败或进入明确错误，不应返回一个缺少工具的“成功” Agent。教学版本没有 ClassLoader 隔离，插件代码和宿主拥有同一进程权限。
+
+## Java 13：Skill Discovery 与渐进披露
+
+```java
+public record Skill(
+        String name, String description, Path path) { }
+```
+
+`SkillDiscovery.discover(root)` 扫描 `SKILL.md`，解析 frontmatter 的 `name` 与 `description`，但不把完整正文放进 system prompt。模型先知道技能目录和简短用途，需要时再读取文件。
+
+```text
+50 skills × 2,000 tokens = 100,000 tokens
+只放 name + description ≈ 50 × 30 tokens = 1,500 tokens
+```
+
+这不是免费优化：按需读取会多一次 Tool 调用，正文也必须做路径权限和内容校验。Skill 描述不能授予 shell 权限；Extension 和 MCP 也不能绕过 PermissionPolicy。
+
+## Java 14：从 JSON-RPC 到 MCP Tool
+
+最小 JSON-RPC request：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+```
+
+`McpClient.call` 为每个请求分配 id，写入一行 JSON，循环读 stdout，直到找到相同 id 的 response。`tools/list` 的每个工具被包装成本地 `Tool`；其 definition 来自远端 `inputSchema`，execute 则调用 `tools/call`。
+
+```java
+JsonNode result = call(
+        "tools/call", params, cancellation);
+StringBuilder content = new StringBuilder();
+for (JsonNode item : result.path("content")) {
+    if (item.path("type").asText().equals("text")) {
+        content.append(item.path("text").asText());
+    }
+}
+return new ToolResult(
+        content.toString(),
+        result.path("isError").asBoolean(false), false);
+```
+
+输入是远端工具名和参数，输出是本地 `ToolResult`。这里的串行读取适合教学 fake server；生产 client 需要 initialize/capability 协商、notification、并发 response dispatcher、超时、断线和认证。MCP Tool 仍要经过本地 Registry 与 PermissionPolicy，不应因来自远端就自动信任。
+
+失败 trace：
+
+```text
+tools/call id=2
+ -> server stdout EOF
+ -> IOException("MCP server closed stdout")
+ -> Agent 不把空字符串当成功 Tool Result
+```
+
+## JUnit 测试矩阵
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest#sessionAndSkillPersistenceWork test
+mvn -q -Dtest=McpClientTest test
+mvn -q -Dtest=AgentTest#serviceLoaderDiscoversPlugins test
+mvn test
+```
+
+应覆盖：
+
+| 模块 | 测试证据 |
+| --- | --- |
+| Session | 保存后 reload 的 message 数和 role 不变 |
+| 损坏 Session | 坏 JSON 行报告行号 |
+| Compaction | 超过上限后仍有 summary 和尾部 |
+| Queue | active/inactive 调用语义不同，abort 清理正确 |
+| SPI | `spi_echo` 被 ServiceLoader 发现并注册 |
+| Skill | frontmatter 缺失时失败，合法 metadata 被发现 |
+| MCP | tools/list、tools/call 按 id 配对 |
+
+`ScriptedModel` 让 Session 测试不依赖网络；`McpClientTest` 使用 `PipedInputStream`/`PipedOutputStream` 模拟另一个进程。测试中不要把 `ProcessBuilder` 指向真实生产 MCP server。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- Session 主路径在 `packages/coding-agent/src/core/session-manager.ts` 的 `SessionManager`、`buildContextEntries` 和 `sessionEntryToContextMessages`。
+- Compaction 资料在 `packages/coding-agent/docs/compaction.md`，运行时会把 summary、保留尾部和后续 entries 重新投影为 context。
+- Steering/follow-up 在 `packages/agent/src/agent.ts` 的 `PendingMessageQueue` 与 `agent-loop.ts` 的 turn 边界。
+- Skill discovery 在 `packages/coding-agent/src/core/skills.ts` 的 `loadSkills`/`formatSkillsForPrompt`；资源边界在 `resource-loader.ts`。
+- Extension loader 在 `packages/coding-agent/src/core/extensions/loader.ts`，MCP 是否启用要以当前 core/extension 代码为准，不能仅凭行业惯例假定内建。
+
+## Go 对照
+
+| Java | Go | 责任 |
+| --- | --- | --- |
+| `synchronized` + `List.copyOf` | `sync.Mutex` + slice copy | Session/queue 快照 |
+| Jackson `JsonNode` | `json.RawMessage` | 动态 JSON |
+| `ServiceLoader` | explicit interface registry | 插件发现 |
+| `PipedInputStream` | `io.Pipe`/stdio | 测试 transport |
+| `CancellationToken` | `context.Context` | 取消传播 |
+| `Files`/`Path` | `os`/`filepath` | 文件工具 |
+
+## 动手实验
+
+### 目标
+
+完成一次“运行中 steering、结束 follow-up、重启 reload、MCP 远程调用”的观察实验。
+
+### 准备
+
+阅读 `Agent.java`、`Session.java`、`Compactor.java`、`McpClient.java` 和对应 JUnit。准备 JDK 21 和一个临时目录。
+
+### 步骤
+
+1. 用 `ScriptedModel` 第一轮返回 calculator call，运行期间调用 `agent.steer("只读")`。
+2. 让模型下一轮返回 final，同时从 `QueueSource` 注入 follow-up。
+3. 将返回的 `RunResult.messages()` 保存到 JSONL，创建新 `Session` reload。
+4. 把 `maxTokens` 调小，比较压缩前后的 token estimate 和尾部消息。
+5. 用 `McpClientTest` fake server 返回工具定义，再执行 remote Tool。
+6. 删除 frontmatter 的 description，观察 Skill discovery 的失败位置。
+
+### 观察点
+
+steering 不会插入已发送 request；Session 保存的是消息而不是完整 operation ledger；MCP client 的 response id 必须配对；Skill 的 metadata 先进入 discovery，正文按需读取。
+
+### 预期结果
+
+你能把“上下文恢复”“当前运行控制”“本地插件”“技能说明”“远程工具协议”分别放进不同模块，而不是用一个 `Plugin` 类包住所有问题。
+
+### 思考题
+
+如果保存 JSONL 时进程在 rename 前崩溃，旧文件和临时文件如何处理？如果同一个 MCP server 返回两个同名 Tool，Registry 应该拒绝还是命名空间化？如果 steering 在工具已经产生副作用后到达，能否声称它撤销了副作用？
+
+## 小结与下一阶段
+
+Java 09–14 把内存 Loop 连接到运行时边界：Session 提供可恢复消息快照，Compaction 控制上下文，Agent 队列提供 turn 边界，SPI/Skill/MCP 提供不同类型的扩展。下一阶段用 `Harness` 组合这些模块，并明确它离 durable AgentHarness 还差什么。

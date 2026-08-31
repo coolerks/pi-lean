@@ -1,12 +1,297 @@
 ---
 title: "Java 05：基础 Coding Tools"
-description: "用 Path、Files、ProcessBuilder 实现受限本地工具。"
+description: "用 Path、Files、ProcessBuilder 实现受限 read/write/edit/grep/shell。"
 ---
 
 # Java 05：基础 Coding Tools
 
-`BuiltInTools` 提供 `read`、`write`、`edit`、`grep`、`shell`、`calculator`。`PermissionPolicy` 在 `Path.normalize().toAbsolutePath()` 后检查 workspace；`ProcessBuilder` 的输出和退出码进入 Tool Result。
+## 本阶段目标
 
-## 实验
+一个 Coding Agent 的能力不是“模型会写代码”，而是模型能够提出结构化 Tool Call，Runtime 在权限边界内读写文件、搜索文本和运行检查命令。本阶段把五个最小工具接入 Java Harness：`read`、`write`、`edit`、`grep`、`shell`。
 
-测试 workspace 外路径、旧文本不唯一、shell 超时、非零退出码和大输出；读两个独立文件可并行，同一文件的写读要保序。
+完成后，你应该能回答：
+
+1. 工具的 definition 如何进入下一次模型 request？
+2. `Path` 如何避免 `../../` 逃出 workspace？
+3. `edit` 为什么要求旧文本唯一匹配？
+4. shell 的 stdout、stderr、exit code 和 cancellation 如何进入 `ToolResult`？
+5. 为什么这些检查仍然不是 sandbox？
+
+本页不实现完整 IDE、增量 patch、symlink 安全审计、容器、网络隔离或复杂 shell parser。教学实现的价值是让每一步副作用都可定位、可测试。
+
+## 前置知识：Java 文件和进程 API
+
+需要理解：
+
+- `Path` 表示路径对象；`resolve` 拼接路径，`normalize` 消除 `.`/`..`。
+- `Files.readString`、`writeString`、`walk` 直接访问文件系统。
+- `ProcessBuilder` 创建操作系统进程；`Process.waitFor` 等待进程结束。
+- `JsonNode.path("x")` 在字段缺失时返回 missing node；它不会自动报错。
+- `ToolResult` 是 Runtime 的结果，不是 stdout 的简单别名。
+
+工具都实现同一个接口：
+
+```java
+public interface Tool {
+    ToolDefinition definition();
+    ToolResult execute(
+            CancellationToken cancellation,
+            JsonNode arguments) throws Exception;
+}
+```
+
+输入是取消令牌和已经解析的 JSON object，输出是可供 Loop 追加的结果。真正调用前仍需经过 `ToolRegistry.validate` 和 `PermissionPolicy`。
+
+## workspace policy：先解析，再访问
+
+```java
+public Path resolvePath(String requested) throws IOException {
+    Path candidate = workspace
+            .resolve(requested == null ? "" : requested)
+            .normalize().toAbsolutePath();
+    if (!candidate.startsWith(workspace)) {
+        throw new SecurityException(
+                "path is outside workspace: " + requested);
+    }
+    return candidate;
+}
+```
+
+失败 trace：
+
+```text
+requested = "notes/../README.md"
+ -> workspace.resolve
+ -> normalize
+ -> workspace 内，允许
+
+requested = "../../.ssh/id_rsa"
+ -> normalize 后在 workspace 外
+ -> SecurityException
+ -> Files.readString 从未执行
+```
+
+`startsWith` 比字符串前缀更可靠，因为它按路径组件比较。但符号链接可能把 workspace 内路径指向外部；生产代码还要使用 `toRealPath`、OS 权限、容器和敏感路径策略。这个 policy 不是 sandbox。
+
+## read：输出必须有上限
+
+```java
+return new SimpleTool(
+        "read",
+        "Read a UTF-8 text file in the workspace.",
+        schema("path", "string"),
+        (cancel, args) -> {
+            Path path = policy.resolvePath(
+                    args.path("path").asText());
+            cancel.throwIfCancelled();
+            String text = Files.readString(path);
+            if (text.length() > 32_000) {
+                text = text.substring(0, 32_000)
+                        + "\n[output truncated]";
+            }
+            return new ToolResult(text, false, false);
+        });
+```
+
+输入是 `path` 字段，输出是 UTF-8 文本。执行前的取消检查防止一个已取消的请求继续打开文件；长度上限防止单个日志文件耗尽 context。截断标记是必要的：模型必须知道它看到的是 prefix，不是完整文件。
+
+## write：覆盖是高风险动作
+
+`write` schema 需要 `path` 和 `content`：
+
+```java
+ObjectNode definition = schema("path", "string");
+definition.with("properties")
+        .putObject("content").put("type", "string");
+definition.withArray("required").add("content");
+
+return new SimpleTool(
+        "write",
+        "Write UTF-8 text to a workspace file.",
+        definition,
+        (cancel, args) -> {
+            Path path = policy.resolvePath(
+                    args.path("path").asText());
+            cancel.throwIfCancelled();
+            Files.createDirectories(path.getParent());
+            Files.writeString(path,
+                    args.path("content").asText());
+            return new ToolResult(
+                    "wrote " + args.path("path").asText(),
+                    false, false);
+        });
+```
+
+输入是目标路径和全文内容，输出是简短确认。当前代码会覆盖已有文件；生产工具应支持审批、备份、原子临时文件、文件大小限制和冲突检测。不要把模型返回的 `content` 当成可信代码，也不要把“wrote”当成内容审计。
+
+## edit：唯一匹配保护误改
+
+```java
+String current = Files.readString(path);
+String oldText = args.path("oldText").asText();
+int first = current.indexOf(oldText);
+if (first < 0 || first != current.lastIndexOf(oldText)) {
+    throw new IllegalArgumentException(
+            "oldText must occur exactly once");
+}
+String updated = current.substring(0, first)
+        + args.path("newText").asText()
+        + current.substring(first + oldText.length());
+Files.writeString(path, updated);
+```
+
+如果 `oldText` 出现零次，模型可能基于过期上下文编辑；出现多次，无法知道要改哪一个。两种情况都 fail-closed。成功后输出的是 edit confirmation；失败应变成 error Tool Result，不能“猜一个位置”继续写。
+
+## grep：读很多文件也需要预算
+
+```java
+try (Stream<Path> paths = Files.walk(root)) {
+    for (Path path : paths
+            .filter(Files::isRegularFile).toList()) {
+        cancel.throwIfCancelled();
+        byte[] bytes = Files.readAllBytes(path);
+        if (containsZero(bytes)) continue;
+        List<String> lines = Files.readAllLines(path);
+        for (int index = 0; index < lines.size(); index++) {
+            if (lines.get(index).contains(query)) {
+                hits.add(path + ":" + (index + 1)
+                        + ":" + lines.get(index));
+            }
+            if (hits.size() >= 50) break;
+        }
+        if (hits.size() >= 50) break;
+    }
+}
+```
+
+`grep` 输出文件、行号和文本，最多返回 50 个命中；包含零字节的文件被当作二进制跳过。真实实现还需要忽略 `.git`、遵循 `.gitignore`、限制单行长度和处理编码错误。`Files.walk` 的目录范围必须来自 policy，不能让模型任意扫描整个 home。
+
+## shell：检查命令、等待和退出码
+
+```java
+String command = args.path("command").asText();
+policy.checkCommand(command);
+Process process = new ProcessBuilder("sh", "-c", command)
+        .directory(policy.workspace().toFile()).start();
+while (!process.waitFor(10, TimeUnit.MILLISECONDS)) {
+    if (cancel.isCancelled()) {
+        process.destroyForcibly();
+        cancel.throwIfCancelled();
+    }
+}
+String output = new String(
+        process.getInputStream().readAllBytes(),
+        StandardCharsets.UTF_8);
+if (output.length() > 32_000) {
+    output = output.substring(0, 32_000)
+            + "\n[output truncated]";
+}
+return new ToolResult(output,
+        process.exitValue() != 0, false);
+```
+
+循环等待而不是无限 `waitFor()`，给取消留下检查点。非零退出码进入 `isError=true`，但仍把输出回传给模型，让它能看见测试失败。当前只读取 stdout，生产实现应合并或分别保存 stderr，并给进程硬超时、CPU/内存限制、网络策略和进程组清理。
+
+> 译者注：黑名单只能挡住几个已知字符串，不能证明命令安全。例如 shell quoting、重定向、子进程和环境变量都可能绕过简单匹配。真正的安全边界应在 OS sandbox 或容器，而不是 prompt 或字符串扫描。
+
+## 工具与 AgentLoop 的连接
+
+```text
+assistant.toolCalls
+ -> ToolRegistry.validate
+ -> PermissionPolicy
+ -> BeforeToolHook
+ -> Tool.execute
+ -> AfterToolHook
+ -> ToolResult
+ -> Message.tool(call.id)
+ -> next model request
+```
+
+`ToolCall.id` 必须一路保留。并行时不能用完成顺序替换 id；`Message.tool` 的 `toolCallId` 用来告诉 provider 这个结果属于哪个 assistant call。
+
+## JUnit 测试矩阵
+
+| 测试 | 预期 |
+| --- | --- |
+| read workspace 内 | 返回内容和路径相关结果 |
+| read `../../outside` | `SecurityException`，不读文件 |
+| write 缺 content | Registry gate 拒绝 |
+| edit oldText 不存在 | 原文件不变 |
+| edit oldText 重复 | 原文件不变，抛唯一匹配错误 |
+| grep 二进制 | 不把二进制内容作为命中 |
+| grep 大目录 | 最多 50 个结果 |
+| shell `false` | `isError=true`、保留输出 |
+| shell `rm -rf` | policy 拒绝，不启动进程 |
+| shell cancellation | destroy 进程并抛 `CancellationException` |
+| output 超长 | 包含 `[output truncated]` |
+
+运行：
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn -q -Dtest=AgentTest test
+mvn test
+```
+
+测试必须使用 `@TempDir` 或 `Files.createTempDirectory`，不能把仓库根目录作为 write/edit workspace。Shell 测试只运行 `printf`、`false` 或短时 `sleep`，不要调用网络和真实删除命令。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/tools/read.ts`、`write.ts`、`edit.ts` 与本页的五类工具对应。
+- `packages/coding-agent/src/core/tools/index.ts` 的 `createCodingTools` 负责装配工具，并把 definitions 交给 `AgentSession`。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall`/`executePreparedToolCall` 连接 validation、hook 和 execute。
+- `packages/coding-agent/docs/security.md` 说明项目可信度、sandbox 与 shell 风险，不能把当前 Java policy 描述成 Pi 的全部安全能力。
+
+Pi 的工具结果还包含 UI render、details、streaming 和更丰富的 error metadata；Java 示例先突出文件/进程副作用边界。
+
+## Go 对照
+
+| Java | Go |
+| --- | --- |
+| `Path`/`Files` | `filepath`/`os` |
+| `ProcessBuilder` | `os/exec` |
+| `JsonNode` | `json.RawMessage` |
+| `CancellationToken` | `context.Context` |
+| `TimeUnit` polling | `select`/context |
+| `ToolResult` record | `ToolResult` struct |
+
+Java 的 `Files.walk` 返回 Stream，需要关闭；Go 的目录遍历通常显式处理 error。两边都必须在执行前做权限检查，在执行中检查取消。
+
+## 动手实验
+
+### 目标
+
+在临时 workspace 建立一个小项目，用 Tool 完成“搜索—编辑—测试”，并记录每个安全检查点。
+
+### 准备
+
+准备 JDK 21，阅读 `BuiltInTools.java`、`PermissionPolicy.java`、`ToolRegistry.java` 和 `AgentTest`。创建 `A.txt`、`B.txt`，不要使用真实凭据目录。
+
+### 步骤
+
+1. 调用 `grep(query="TODO")`，记录命中文件和行号。
+2. 调用 `edit` 把一个唯一 TODO 替换为实现，先尝试一个重复 `oldText`。
+3. 调用 `read` 验证文件，比较截断前后的结果。
+4. 调用 `shell(command="false")`，观察非零退出如何回到模型。
+5. 调用 workspace 外路径，确认异常发生在 `Files` 之前。
+6. 让 shell 执行短时命令，同时取消 token，观察进程销毁。
+7. 把 `ExecutionMode.PARALLEL` 改成 `SEQUENTIAL`，解释为何同文件写读必须保序。
+
+### 观察点
+
+Tool definition 不是权限；schema 通过不是执行成功；stdout 不是 final answer；非零 exit 仍然是一个需要回传的 Tool Result。每个副作用前后都应能找到代码和事件证据。
+
+### 预期结果
+
+你能画出 `ToolCall → Registry → Policy → Tool → ToolResult → Message.tool`，并指出当前实现还缺 symlink 防护、完整 schema、sandbox 和审计 ledger。
+
+### 思考题
+
+如果模型要求 `write` 一个超大文件，应该在解析、审批还是执行阶段限制？如果 `edit` 成功写入后进程崩溃，重试会不会重复副作用？如果用户只允许 read，如何让 policy 与 Tool definitions 同步而不是只在执行时拒绝？
+
+## 小结与下一阶段
+
+五个 Coding Tools 让模型可以观察和修改受限 workspace，但安全来自多层边界的组合，而不是某一个黑名单。下一阶段将这些工具放进 Harness，继续处理 Session、队列、插件和恢复语义。

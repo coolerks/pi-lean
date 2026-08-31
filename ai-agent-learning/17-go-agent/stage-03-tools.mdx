@@ -5,18 +5,274 @@ description: "把 Tool Loop 变成可用的本地 Coding Agent。"
 
 # Go 05–08：Coding Tools、并行、重试与事件
 
-## Coding Tools
+本页是 Go 05 到 Go 08 的综合实验页。建议先完成 `stage-05-coding-tools` 和 `stage-04-loop`，再用本页把副作用、并行、重试和事件放到一条可观察的链路里。
 
-`builtin_tools.go` 实现 `read`、`write`、`edit`、`grep`、`shell` 和 `calculator`。`PermissionPolicy` 先把路径限制在 workspace，shell 拒绝明显危险模式；输出有上限。它是教学保护，不是 OS 沙箱。
+## 本阶段完成什么
 
-## 并行
+- 把 `read`、`write`、`edit`、`grep`、`shell` 统一成 Tool。
+- 在路径解析和命令检查前拒绝明显越权请求。
+- 限制文件/搜索/shell 输出，避免 Tool Result 无限增大 context。
+- 解释为什么 independent read 可以并行，而 write/read 同一文件不能盲目并行。
+- 用 Go goroutine + `sync.WaitGroup` 执行 parallel batch，并按 source index 回传结果。
+- 用有界 retry 和指数 backoff 处理模型临时错误。
+- 用 `EventSink` 观察过程，不让事件偷偷修改 Agent 状态。
 
-`LoopOptions.ToolMode` 为 `Parallel` 时用 goroutine 并行执行多个 Tool，结果按 assistant 的 source index 写回 `results` 切片；因此执行完成顺序可以不同，而给模型的消息顺序稳定。写入同一文件的 Tool 应设置 Sequential 或由更高层依赖分析控制。
+## 本阶段不完成什么
 
-## 事件
+`PermissionPolicy` 不是 sandbox。它不隔离 syscall、网络或子进程，也不能抵御所有 shell 绕过方式。并行实现也没有做资源依赖分析；调用者必须为相互依赖的 Tool 选择 `Sequential`。
 
-`EventSink` 观察 `step_start`、`model_attempt`、`assistant`、`tool_start/end`、`tool_result` 和 `run_end`。事件不应成为第二个状态机；Session/Telemetry 可以订阅它，但不应偷偷改变消息。
+## 前置知识
 
-## 重试和取消
+完成 Tool Registry 和 `AgentLoop.Run`。理解 context、goroutine、WaitGroup、文件权限和 `os/exec`。先在临时 workspace 运行，绝不要把测试 workspace 指向 home。
 
-`RetryPolicy` 对模型请求做有界的指数 delay；timer 选择 `ctx.Done()`，所以退避也能取消。`Agent.Abort` 调用内部 cancel 并清理当前 run 的 steering/follow-up，`nextRun` 保留。
+## Coding Tool 的共同形状
+
+每个具体工具都实现同一个 interface：
+
+```go
+type Tool interface {
+    Definition() ToolDefinition
+    Execute(context.Context, json.RawMessage) (ToolResult, error)
+}
+```
+
+`Definition` 进入 Model Request；`Execute` 只由 Registry 验证后的 call 进入。具体工具通常分三层：decode arguments、PermissionPolicy、真实 I/O。
+
+## read：受限读取和截断
+
+```go
+func (t ReadTool) Execute(_ context.Context, raw json.RawMessage) (ToolResult, error) {
+    var input struct { Path string `json:"path"` }
+    if err := json.Unmarshal(raw, &input); err != nil {
+        return ToolResult{}, err
+    }
+    path, err := t.Policy.ResolvePath(input.Path)
+    if err != nil {
+        return ToolResult{}, err
+    }
+    content, err := os.ReadFile(path)
+    if err != nil {
+        return ToolResult{}, err
+    }
+    maxBytes := t.MaxBytes
+    if maxBytes <= 0 { maxBytes = 32 << 10 }
+    truncated := len(content) > maxBytes
+    if truncated { content = content[:maxBytes] }
+    result := string(content)
+    if truncated { result += fmt.Sprintf("\n[output truncated at %d bytes]", maxBytes) }
+    return ToolResult{Content: result, Details: map[string]any{
+        "path": path, "truncated": truncated,
+    }}, nil
+}
+```
+
+`ResolvePath` 先把相对路径接到 workspace，再 `Abs`/`Clean`，最后检查它是否是 workspace 或其子路径。截断标记必须告诉模型结果不完整，否则模型可能误以为文件到此结束。
+
+## write：目录和覆盖语义
+
+`WriteTool` 使用 `os.MkdirAll(filepath.Dir(path), 0o755)` 创建父目录，再 `os.WriteFile(path, content, 0o644)` 覆盖文件。它应明确告诉调用者这是覆盖写，而不是 append；生产实现还要考虑 atomic temp+rename、symlink、文件权限和人工批准。
+
+```text
+decode path/content
+ -> ResolvePath
+ -> MkdirAll parent
+ -> WriteFile
+ -> return wrote N bytes
+```
+
+写入 workspace 外的 `../` 路径应在任何 I/O 前返回错误。路径 policy 是必须的，不能只在 UI 中警告。
+
+## edit：唯一 oldText
+
+`EditTool` 读取文件，计算 `strings.Count(content, oldText)`，只有 count 等于 1 才替换：
+
+```go
+count := strings.Count(string(content), input.OldText)
+if count != 1 {
+    return ToolResult{}, fmt.Errorf(
+        "oldText must occur exactly once, found %d", count,
+    )
+}
+updated := strings.Replace(string(content), input.OldText, input.NewText, 1)
+return ToolResult{Content: "edited " + input.Path}, os.WriteFile(path, []byte(updated), 0o644)
+```
+
+唯一性防止“相同代码出现两处但模型以为改了一处”。这仍不是 patch transaction：进程可能在 write 中途崩溃，成熟 Harness 要把 intent/result 持久化。
+
+## grep：搜索而不是加载全部文件
+
+`GrepTool` 用 `filepath.WalkDir` 遍历 workspace，跳过目录、读取失败文件和含 NUL 的二进制文件；用 `MaxHits` 限制行数，返回 `path:line:text`。`MaxHits` 和 `MaxBytes` 是 context 保护，不只是 UI 美化。
+
+## shell：最危险的 Tool
+
+```go
+func (t ShellTool) Execute(ctx context.Context, raw json.RawMessage) (ToolResult, error) {
+    var input struct { Command string `json:"command"` }
+    if err := json.Unmarshal(raw, &input); err != nil { return ToolResult{}, err }
+    if err := t.Policy.CheckCommand(input.Command); err != nil {
+        return ToolResult{}, err
+    }
+    command := exec.CommandContext(ctx, "sh", "-c", input.Command)
+    command.Dir = t.Policy.Workspace
+    var output bytes.Buffer
+    command.Stdout, command.Stderr = &output, &output
+    err := command.Run()
+    if err != nil { return ToolResult{Content: output.String(), IsError: true}, err }
+    return ToolResult{Content: output.String()}, nil
+}
+```
+
+`CommandContext` 把 context 取消传到子进程；不过 shell 可能派生子进程，生产系统仍需 process group、资源限制和 sandbox。当前 `CheckCommand` 只拒绝空命令和若干明显模式（`rm -rf`、`git push` 等），不能当作完整命令解析器。
+
+## 并行：执行顺序与回传顺序
+
+当前 loop 的 parallel 分支：
+
+```go
+results := make([]ToolResult, len(assistant.ToolCalls))
+var waitGroup sync.WaitGroup
+for index, call := range assistant.ToolCalls {
+    waitGroup.Add(1)
+    go func(index int, call ToolCall) {
+        defer waitGroup.Done()
+        results[index] = l.executeOne(ctx, assistant, call, options, step)
+    }(index, call)
+}
+waitGroup.Wait()
+```
+
+每个 goroutine 只写自己的 `results[index]`，所以没有多个 goroutine 写同一槽位的 race。WaitGroup 结束后，Loop 按 index 生成 RoleTool 消息。完成事件的先后可能不同，但模型看到的结果顺序稳定。
+
+适合并行：`read A`、`read B`、两个互不相交的检索。必须顺序：`write A` 后 `read A`、先创建目录再写文件、共享临时文件上的两个 edit。并行不是越多越好，副作用和资源依赖决定模式。
+
+## Retry 与 backoff
+
+`completeWithRetry` 只对 Model 请求重试：
+
+```go
+for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+    response, err := l.Model.Complete(ctx, request)
+    if err == nil { return response, nil }
+    if ctx.Err() != nil || attempt == policy.MaxAttempts { break }
+    delay := policy.BaseDelay * time.Duration(1<<(attempt-1))
+    timer := time.NewTimer(delay)
+    select {
+    case <-timer.C:
+    case <-ctx.Done():
+        timer.Stop()
+        return Response{}, ctx.Err()
+    }
+}
+return Response{}, lastErr
+```
+
+retry 次数有界，delay 指数增长但没有抖动。生产实现应按错误类型区分 429/5xx 与 invalid request，并加入 jitter；绝不能对已经产生不可逆副作用的 Tool 随意自动重试。
+
+## 事件：观察不是第二个状态机
+
+`EventSink` 看到 `step_start`、`model_attempt`、`assistant`、`tool_start`、`tool_result`、`tool_end`、`model_error`、`run_end`。事件回调可以写日志或 telemetry，但不应该修改 history；需要改变 Agent 行为应使用明确的 Hook 或 queue。
+
+```go
+options.OnEvent = func(event Event) {
+    fmt.Printf("step=%d type=%s\n", event.Step, event.Type)
+}
+```
+
+`Event` 中 `Message`、`ToolCall` 和 `ToolResult` 是观察快照指针。若异步保存事件，应复制需要的数据，不要假设后续对象不会改变。
+
+## 失败 trace
+
+### 路径越权
+
+```text
+ToolCall read("../../.ssh/id_rsa")
+ -> Registry.Validate 通过（JSON 形状合法）
+ -> PermissionPolicy.ResolvePath 拒绝
+ -> Execute 不读取文件
+ -> error ToolResult
+```
+
+### 并行写读
+
+```text
+write A 与 read A 同批
+ -> 两个 goroutine 完成顺序不确定
+ -> read 可能看到旧内容
+ -> 选择 Sequential 或显式资源锁
+```
+
+### retry 中取消
+
+```text
+attempt 1 -> temporary error
+ -> backoff timer
+ -> ctx.Done
+ -> 返回 context.Canceled
+ -> 不开始 attempt 2
+```
+
+## 测试设计与命令
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run 'TestKnowledge|TestTool|TestMultiple|TestRetry'
+go test -race ./...
+go vet ./...
+```
+
+使用 `t.TempDir()` 建 workspace。测试 read 的截断和越权、edit 的 0/2 次匹配、shell 的被拒绝命令和 context cancel；并行测试用两个独立 Tool 记录完成时间，再检查 `RunResult.Messages` 的 source order。
+
+为什么使用 `ScriptedModel`？因为 Tool 并行测试要让模型稳定返回固定的两个 call；真实模型会改变选择和参数，让失败无法定位。Fake model 只让我们验证 Runtime，不牵涉 API key。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/tools/read.ts`、`write.ts`、`edit.ts` 是 Pi 内置 coding Tool 的入口。
+- `packages/coding-agent/src/core/tools/index.ts` 创建 tools，并根据 active tool names 暴露 definitions。
+- `packages/agent/src/agent-loop.ts` 的 `prepareToolCall`、`executeToolCalls` 和 execution mode 对应本页的 gate、batch 和 source order。
+- `packages/coding-agent/docs/security.md` 与 trust/sandbox 源码提醒：Tool allowlist 不等于 OS sandbox。
+
+Go 版本省略 Pi 的渲染、diff、流式 Tool 进度和更细的 abort hook，但保留 Tool definition、校验、执行、结果回传的主链路。
+
+## Java 对照
+
+Java `Path.normalize().startsWith(workspace)` 对应 Go `ResolvePath`；Java `ProcessBuilder` 对应 Go `exec.CommandContext`。Java `ExecutorService` 提交 Future 对应 goroutine/WaitGroup；两者都要按原始 call index 收集结果，而不能按完成顺序追加。
+
+Java Listener 与 Go `EventSink` 都是观察边界。Java 的 checked exception 和 Go `error` 都必须让模型请求错误、Tool 错误和取消保持可区分。
+
+## 实验：在受限目录运行 Coding Agent
+
+### 目标
+
+验证“合法 JSON、合法工具名、合法路径”仍然要经过权限和输出边界。
+
+### 准备
+
+使用 `t.TempDir()`；创建 `a.txt` 和一个超过 32 KiB 的 `large.txt`。不要使用仓库根目录中的真实敏感文件。
+
+### 步骤
+
+1. 用 read 读取 `a.txt`，记录 `Details.path`。
+2. 用 read 读取 `large.txt`，检查 truncation marker。
+3. 用 read 读取 `../outside.txt`，确认没有调用 `os.ReadFile`。
+4. 用 edit 让 oldText 出现两次，检查唯一性错误。
+5. 用 shell 执行 `printf ok`，再执行被策略拒绝的命令。
+6. 让模型返回 read A/read B 两个 calls，打开 Parallel 并检查回传顺序。
+7. 把其中一个 Tool 改成阻塞，再取消 context，观察结果。
+
+### 观察点
+
+安全 gate 发生在副作用之前；输出上限影响返回内容但不改变文件；parallel 的完成顺序和 message 顺序是两个不同概念。
+
+### 预期结果
+
+workspace 外路径、危险 shell 和重复 edit 都失败；独立读取可以并发；cancel 后不会无界重试。
+
+### 思考题
+
+为什么字符串黑名单不能证明 shell 安全？如果 read A 正在运行时 steering 要求“不要读取 B”，应让已经发出的 A 怎么办？重试一个失败的 write 是否一定安全？
+
+## 小结与下一阶段
+
+Go 05–08 把纯控制流接到受控副作用，并补上并行、重试、取消和可观察事件。下一页继续回到 `AgentLoop` 的 runtime 细节，再把 Message、Session 和 compaction 放到更长生命周期中。

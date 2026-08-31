@@ -5,42 +5,141 @@ description: "为 Java 后端工程师设计的 AI Agent 学习路径。"
 
 # 阅读指南
 
-## 适合谁
+这套教材不是 API 目录，而是一条从 HTTP 请求走到 Agent Harness 的工程学习路径。每章都回答一个问题：**这件事在一次真实 Agent 请求中发生在哪里，谁负责它，失败时怎么办？**
 
-你有 Java 后端经验，熟悉 HTTP、JSON、并发和测试；Go 只需要基础语法，TypeScript 只解释到能够读懂 Pi。教程不要求先学 React，也不要求先安装 Agent Framework。
+## 学习目标
 
-学完后，你应该能从 HTTP API 开始写出一个带 Tool Calling 的 Agent，解释它的持久化、取消、重试和权限边界，并读懂 Pi 的关键调用链。
+完成学习后，你应该可以：
 
-## 怎么走
+- 看懂 `system`、`user`、`assistant`、`tool` 消息和 Provider 的请求体。
+- 解释模型输出的 `tool_call` 为什么不是 Java 方法调用。
+- 从一个 `ScriptedModel` 写出有限步数的 Tool Calling Loop。
+- 用 Session、Compaction、Steering、Retry 和 Permission 把循环变成可运行的 Harness。
+- 沿着 Pi 的 `AgentSession → Agent → agent-loop.ts → Provider` 调用链定位源码。
+- 用 Go 的 `context.Context` 和 Java 的 cancellation/`Future` 表达取消。
+
+## 前置知识
+
+你需要能读懂 Java 类、interface、集合、异常、HTTP 和 JSON；不要求先会 TypeScript、React 或某个 Agent Framework。Go 部分会解释 module、struct、interface、goroutine 和 channel，但不会把本教材变成 Go 语法课。
+
+如果你不熟悉 TypeScript，先记住五个映射：
+
+| Pi/TypeScript | Java 类比 | Go 类比 | 在 Agent 中的作用 |
+| --- | --- | --- | --- |
+| `interface` | interface | interface | 描述 Model、Tool 等边界 |
+| `Promise<T>` | `Future<T>` | 返回值配合 `context.Context` | 表示将来完成的异步结果 |
+| `async/await` | 阻塞 `Future.get()` 或组合异步任务 | goroutine/channel | 等待网络或工具完成 |
+| `AsyncIterable<T>` | Listener/`Flow.Publisher` | channel/回调 | 按增量消费流式事件 |
+| `AbortSignal` | cancellation token/interrupt | `context.Context` | 传递停止意图 |
+
+这些只是行为类比，不是类型级等价。例如取消一个 HTTP 请求，不代表已经发生的远端计费或文件写入会自动回滚。
+
+## 推荐阅读顺序
 
 <Steps>
-  <Step title="先建立模型边界">
-    阅读 LLM、Message、Context 和 Tool Calling。每次先问：这一段是模型输出，还是 Runtime 的动作？
+  <Step title="第一步：先分清边界">
+    阅读 [从 LLM 到 Agent](/01-foundations/llm-to-agent)、[核心概念](/01-foundations/concepts) 和 [Message 与 API 数据结构](/01-foundations/api-messages)。每读一段都标注它属于模型输出、Runtime 状态还是 Harness 责任。
   </Step>
-  <Step title="再写最小闭环">
-    用 `ScriptedModel` 测试两轮：第一轮返回 calculator 的 `tool_call`，第二轮返回文本。这样不需要 API key。
+  <Step title="第二步：从 HTTP 走到 Tool Calling">
+    阅读 [HTTP、SSE 与 Streaming](/02-llm-api/http-and-streaming)、[Provider Adapter](/02-llm-api/provider-adapters) 和 [Structured Output](/02-llm-api/structured-output)。先手写请求，再看统一类型为什么存在。
   </Step>
-  <Step title="最后补可靠性">
-    加入 max steps、retry、abort、Session、Compaction、Steering、Permission 和 Telemetry。
+  <Step title="第三步：实现最小循环">
+    阅读 [基础 Agent Loop](/03-agent-loop/basic-loop)，运行 Go/Java 的 `ScriptedModel` 测试，然后再读 Pi 的 [Agent Loop 源码](/09-pi-source/agent-loop-source)。不要从源码第一行倒推概念。
+  </Step>
+  <Step title="第四步：补工程边界">
+    学习 Tool 生命周期、Context、Session、Compaction、Steering、Follow-up、权限和 Telemetry。此时才进入 Harness 的持久化与恢复设计。
+  </Step>
+  <Step title="第五步：对照两种实现">
+    先完成 Go 01–15，再完成 Java 01–15。每个阶段都比较接口、取消、并发、测试和错误传播，而不是机械翻译两份代码。
+  </Step>
+  <Step title="第六步：最后再看框架">
+    用最终 Harness 章节的表格反向检查 Spring AI、LangChain4j、LangGraph、Eino、ADK 等框架隐藏了哪些边界。
   </Step>
 </Steps>
 
-## 哪些可以略读
+## 每章的学习方法
 
-- 已经熟悉 HTTP/SSE 的读者可以略读 `02-llm-api` 的协议细节，但仍应看 Provider adapter 的边界。
-- 只想实现单进程 Agent 的读者可先略过 `07-harness/reliability` 的崩溃恢复设计，之后再回来做设计实验。
-- `pi-docs` 是查阅型内容，不必按顺序读；学习原创教材时以当前源码为事实来源。
+每页至少做四件事：
 
-## 三种语言的关系
+1. **先回答场景问题。** 例如“模型返回 JSON 后，谁真的打开文件？”
+2. **画数据流。** 把输入、输出、状态改变和副作用分别画出来。
+3. **运行最小实验。** 优先使用离线 Fake/Scripted Model，先验证控制流，再接真实 API。
+4. **写失败路径。** 至少考虑 timeout、坏 JSON、unknown tool、取消和达到 max steps。
 
-| 语言/层 | 教材中的用途 |
-| --- | --- |
-| TypeScript | 观察 Pi 的接口、联合类型、`Promise`、`AsyncIterable` 和事件流。 |
-| Go | 用 `context.Context`、channel 和标准库展示显式并发与取消。 |
-| Java | 用 interface、`ExecutorService`/`Future`、Listener 和 `ServiceLoader` 建立同一组抽象；异步封装时可再使用 `CompletableFuture`。 |
+读源码时不要只复制类型定义。对每个入口写下：调用方是谁、它接收什么、返回什么、下一步调用谁、失败是否改变 Session。
 
-`async/await` 可以先类比 Java `CompletableFuture` 的顺序组合；`AbortSignal` 可以类比取消令牌，但它不是线程强杀。Go 的 `context.Context` 同样只表达取消和截止时间，实际工具必须主动检查它。
+## 哪些内容可以暂时略读
 
-## Pi 的角色
+- 已熟悉 HTTP/SSE 的读者可以先跳过协议细节，但不能跳过 Provider adapter 的归一化边界。
+- 只做单轮问答的读者可以先跳过 `07-harness/reliability`，但完成 Tool Calling 后必须回来理解崩溃和恢复。
+- 只想使用 Pi 的读者可以先查阅 `pi-docs/`；要自己实现 Harness 的读者必须完成原创教材和 Go/Java 示例。
+- Provider 的厂商差异可以先掌握表格，再回看每个 API adapter 的源码路径。
 
-Pi 是案例，不是唯一正确答案。当前研究版本的低层 `Agent` 和 `agent-loop.ts` 可以运行；`harness/agent-harness.ts` 是尚未完成的公共骨架。教材会把“源码事实”“官方说明”和“设计推断”分开。
+## 三种语言的职责
+
+| 层 | TypeScript/Pi | Go 示例 | Java 示例 |
+| --- | --- | --- | --- |
+| 模型边界 | `Model`、`AsyncIterable` | `Model`、`StreamingModel` | `Model`、SSE callback |
+| 工具边界 | `AgentTool` | `Tool` + `Registry` | `Tool` + `ToolRegistry` |
+| 取消 | `AbortSignal` | `context.Context` | `CancellationToken` + interruption |
+| 并发 | Promise/async iterator | goroutine、channel | `ExecutorService`/`Future` |
+| 插件 | Extension loader | explicit registry | SPI/`ServiceLoader` |
+| 持久化 | Session manager | JSONL `Session` | Jackson JSONL `Session` |
+
+这里的比较是为了看设计约束，不是声称三者实现相同功能。Pi 当前公共 `AgentHarness` 仍是 scaffold；可运行的 coding-agent 主路径是 `Agent`、`AgentSession`、`SessionManager` 和 `ExtensionRunner`。
+
+## 入口源码与研究基线
+
+所有 Pi 源码结论绑定 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。核心入口包括：
+
+- `packages/agent/src/agent-loop.ts`：一次或多次 assistant step 的控制流。
+- `packages/agent/src/agent.ts`：生命周期、队列和 abort。
+- `packages/ai/src/types.ts`：统一 Message、Tool Call、Usage 和事件类型。
+- `packages/coding-agent/src/core/agent-session.ts`：Coding Agent 的 session/runtime 组合。
+
+## 动手实验：画你的第一张边界图
+
+### 目标
+
+把一条“用户让 Agent 修改文件”的请求拆成模型输出、Runtime 动作和 Harness 状态。
+
+### 准备
+
+准备纸、Mermaid 编辑器或任意文本文件；不需要 API key。节点至少包括 User、Context、LLM、Provider、Agent Loop、Tool Executor、Session 和 Telemetry。
+
+### 步骤
+
+1. 从 User 画箭头到 Context，并写出 system prompt、history、tools 三类输入。
+2. 从 Context 画箭头到 Provider/LLM，标注“请求”而不是“执行”。
+3. 从 LLM 画出 assistant text 与 Tool Call 两条可能路径。
+4. 从 Tool Call 画到 schema、permission、execute，再画回 Tool Result。
+5. 在 execute 旁标出唯一产生文件/进程副作用的位置。
+6. 在 run 结束后画 Session persistence 和 Telemetry，但不要把它们画成模型输出。
+
+### 观察点
+
+模型只产生候选内容和调用意图；Runtime 决定是否执行；Harness 保存状态并处理失败。Provider 只负责协议适配。
+
+### 预期结果
+
+你的图中至少有两条回路：Tool Result 回到下一次模型请求，Session/Telemetry 记录一次运行但不代替 Context。
+
+### 思考题
+
+如果把 Permission 放在 UI 而不放在 Tool Executor 前面，脚本调用或 RPC 调用能否绕过它？如果 Session 保存了 Tool Call 却没有 Tool Result，恢复时应该怎样标记？
+
+## 自测清单
+
+在进入下一章前，用自己的话回答：
+
+- Context Window、Session 和 Memory 为什么不是一个东西？
+- `tool_call` 和真正的函数执行分别在哪一层？
+- 为什么 `maxSteps` 不能省略？
+- 为什么 Provider adapter 不应散落在 Agent Loop 中？
+- 一个进程崩溃后，哪些信息足以恢复，哪些外部副作用无法撤销？
+
+答不出来时，不要继续堆框架。回到对应的 JSON、测试和事件图，把一次请求从输入追到终点。
+
+## 小结
+
+学习 Agent 的有效顺序是：先理解协议，再实现循环；先用 Fake Model 测控制流，再研究真实 Provider；先知道副作用在哪里，再讨论 Harness 的恢复和安全。这样读 Pi 源码时，你看到的是一组工程决策，而不是一堆陌生的 TypeScript 语法。

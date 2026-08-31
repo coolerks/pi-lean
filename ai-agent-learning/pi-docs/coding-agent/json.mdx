@@ -13,25 +13,269 @@ description: "机器消费的 JSON 事件流模式和消息格式。"
 
 ## 中文译文
 
-用 `pi --mode json "Your prompt"` 把所有 Session 事件逐行写到 stdout，适合脚本、日志管道或自定义 UI。每一行都是独立 JSON 对象，不能把整个 stdout 当成一个 JSON array；stderr 应单独处理。
+### 快速开始：JSONL 是 stdout 上的协议
 
-### 事件类型与消息类型
+```bash
+pi --mode json "Your prompt"
+```
 
-wire event 类型是 `JsonAgentSessionEvent`。它基本对应 `AgentSessionEvent`，但 `message_update` 去掉了累计 `partial` 快照，改为包含 `usage` 和精简的 `assistantMessageEvent`。`toolcall_start` 保留稳定的 `id`、`toolName`，其余增量只传 delta。`queue_update` 在 steering/follow-up 队列改变时发送完整队列；`compaction_start`/`compaction_end` 同时覆盖手动和自动压缩。
+`--mode json` 启动 Coding Agent 的 JSON Event Stream Mode。Pi 不把最终答案单独写成一段普通文本，而是把 Session 生命周期中产生的事件逐行写到标准输出（`stdout`）。每一行都是一个独立的 JSON object，也就是 JSON Lines（JSONL），不是一个包住所有事件的 JSON array。因此消费端应当“读一行、解析一行、处理一行”，而不是等进程结束后再调用一次 `JSON.parse`。
 
-底层 `AgentEvent` 还包括 `agent_start/end`、`turn_start/end`、`message_start/update/end` 和 `tool_execution_start/update/end`。基础消息来自 `packages/ai/src/types.ts` 的 `UserMessage`、`AssistantMessage`、`ToolResultMessage`；Coding Agent 还增加 `BashExecutionMessage`、`CustomMessage`、`BranchSummaryMessage`、`CompactionSummaryMessage`。这些 role/type 是协议字段，客户端应按 discriminator 分支，不要用是否有 `content` 猜类型。
+这个模式适合三类调用方：
 
-### 输出与增量拼接
+1. **脚本**：shell、Python、Go 或 Java 可以实时等待 `message_end`，不必解析 TUI 的 ANSI 控制字符。
+2. **自定义 UI**：前端或桌面程序可以根据 `message_update` 增量渲染文本，根据 Tool 事件显示进度。
+3. **流水线**：另一个进程可以把 JSONL 写入日志、数据库或消息队列，再按 `type` 建立索引。
 
-第一行通常是 `type: "session"` 的 header，包含 `version`、`id`、`timestamp` 和 `cwd`；随后是 lifecycle、message、Tool 和 compaction 事件。`message_update` 只传增量，不传累计 `message`，所以客户端需要按 `contentIndex` 和 `delta` 拼接文本、thinking 或 Tool Call arguments；Provider 只在完成时报告 usage 时，中间 usage 可能为零。最终 `message_end` 才是权威完整消息，`agent_end` 给出本次最终 messages。
+`stdout` 是机器协议通道，不能混入调试日志、进度条或“正在思考”文字。需要给人看的 UI、警告和诊断应放在 `stderr`。例如下面的 `2>/dev/null` 只丢弃 stderr，stdout 中仍保留可供 `jq` 解析的 JSONL：
 
-例如只筛选完整消息：
+```bash
+pi --mode json "List files" 2>/dev/null
+```
+
+> 译者注：把 stdout 和 stderr 分开是这个模式最容易被忽略的边界。若插件或外层脚本把一行普通日志打印到 stdout，消费者读到那一行时就会出现“JSON 解析失败”；日志应该打印到 stderr，或者通过合法的 event 传递。
+
+> 译者注：JSON mode 只描述“发生了什么”的事件流，不是远程控制 API。RPC mode 还定义命令输入、响应关联和控制语义；两者都可能采用 JSONL，但客户端不能因为格式相似就把 RPC 请求写入 JSON mode 的 stdin。
+
+### Event Types：先按 type 分派
+
+wire event 的统一类型是 `JsonAgentSessionEvent`。这里的 wire 指发送给进程外部消费者的协议表示，不是某个 TypeScript class 的实例。它大体匹配 `AgentSessionEvent`，但对高频的流式消息更新做了一个重要优化：不重复发送不断增长的累计快照。
+
+源类型的核心定义如下，类型名和字段名必须保持原样，因为它们就是客户端的协议 contract：
+
+```typescript
+type WithoutPartial<T> = T extends { partial: unknown } ? Omit<T, "partial"> : T;
+
+type JsonAssistantMessageEvent<T> = T extends { type: "toolcall_start"; partial: unknown }
+  ? WithoutPartial<T> & { id: string; toolName: string }
+  : WithoutPartial<T>;
+
+type JsonAgentSessionEvent =
+  | Exclude<AgentSessionEvent, { type: "message_update" }>
+  | {
+      type: "message_update";
+      usage: Usage;
+      assistantMessageEvent: JsonAssistantMessageEvent<AssistantMessageEvent>;
+    };
+```
+
+逐层看这段 TypeScript：
+
+- `WithoutPartial<T>` 是条件类型。如果一个事件有 `partial` 字段，就用 `Omit` 去掉这个字段；否则保留原类型。
+- `JsonAssistantMessageEvent<T>` 对普通事件使用上面的规则；`toolcall_start` 例外地补回固定大小的 `id` 和 `toolName`，让 UI 不用等待完整 arguments 才知道正在调用哪个 Tool。
+- `JsonAgentSessionEvent` 排除旧的 `message_update`，再用新的 JSON 形状重新定义它。这个写法不是运行时转换，而是告诉 TypeScript 编译器“线上事件应符合什么结构”。
+
+> 译者注：这里的泛型和条件类型只在 TypeScript 编译期工作。Go 客户端不需要复刻 `WithoutPartial<T>`，可以定义 `map[string]json.RawMessage` 先读 `type`，再把这一行解码到对应 struct；Java 则可先用 Jackson `JsonNode.path("type")` 做 discriminator，再映射到 record。不要把 TypeScript 类型定义误认为 Pi 会在 stdout 中输出类型名。
+
+`queue_update` 在 steering 或 follow-up 队列发生任何变化时，发送当前完整的 pending queue，而不是只发送一条变化记录。这样重连的 UI 可以直接恢复队列视图。`compaction_start` 和 `compaction_end` 同时覆盖手动压缩和自动压缩；消费者不要只监听“用户点击压缩”才更新状态。
+
+除了 Session 层事件，底层 Agent Loop 还提供 `AgentEvent`。它们分为四组：
+
+1. **Agent 生命周期**：`agent_start` 表示一次 Agent run 开始；`agent_end` 带着最终 `AgentMessage[]` 表示 run 结束。
+2. **Turn 生命周期**：`turn_start` 开始一次 assistant step；`turn_end` 同时带本轮 assistant message 和 `ToolResultMessage[]`。
+3. **Message 生命周期**：`message_start`、`message_update`、`message_end` 描述一条消息从开始、增量到定稿。
+4. **Tool 执行**：`tool_execution_start`、`tool_execution_update`、`tool_execution_end` 描述 Runtime 真正执行 Tool 的过程。
+
+对应的底层形状是：
+
+```typescript
+type AgentEvent =
+  // Agent lifecycle
+  | { type: "agent_start" }
+  | { type: "agent_end"; messages: AgentMessage[] }
+  // Turn lifecycle
+  | { type: "turn_start" }
+  | { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+  // Message lifecycle
+  | { type: "message_start"; message: AgentMessage }
+  | { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+  | { type: "message_end"; message: AgentMessage }
+  // Tool execution
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+  | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+```
+
+这里要区分“模型说它要调用 Tool”和“Runtime 已经执行 Tool”：`toolcall_start` 属于 assistant stream，`tool_execution_start` 才表示执行器开始工作。一个合法的 Tool Call 仍可能在参数校验、权限检查或执行阶段失败，不能仅凭 `toolcall_start` 就显示成功。
+
+客户端的第一条分支逻辑应类似：
+
+```text
+read line
+  -> JSON.parse(line)
+  -> inspect event.type
+  -> update lifecycle/message/tool state
+  -> discard or report malformed line
+```
+
+不要用 `content` 是否存在来猜事件种类；assistant message 可能是工具调用，tool execution 可能返回空字符串，compaction 事件也未必有普通文本。
+
+### Message Types：消息类型不是只有 role/content
+
+基础消息定义位于 `packages/ai/src/types.ts`：
+
+- `UserMessage`：用户输入。它可能来自命令行、RPC 或队列，不应被假定为当前进程的唯一输入来源。
+- `AssistantMessage`：模型生成的 settled message，可能包含文本、thinking block 或 Tool Call。
+- `ToolResultMessage`：Runtime 执行 Tool 后回填给模型的结果，通常带着对应的 Tool Call ID 和错误标记。
+
+Coding Agent 还在 `packages/coding-agent/src/core/messages.ts` 增加：
+
+- `BashExecutionMessage`：shell/bash 执行记录，展示命令、输出或失败信息。
+- `CustomMessage`：扩展或宿主写入的自定义消息。
+- `BranchSummaryMessage`：Session 分支导航或汇总产生的摘要。
+- `CompactionSummaryMessage`：上下文压缩后替代旧消息的摘要。
+
+这些类型有明确的 discriminator。客户端应按 `type`、`role` 和具体字段做分支，不要把所有 JSON object 强行映射成一个只有 `content` 字符串的结构。消息对象是 Session 内容；事件对象是“内容发生变化的通知”，两者的生命周期不同。
+
+> 译者注：代码块中的 `bash` 是源文档中的技术文字时，实际命令名仍是 `bash`；在自己的日志和 JSON schema 中不要引入零宽字符。`BashExecutionMessage` 的关键是“执行记录”，它不是模型生成的 assistant message，也不能直接当成可执行命令。
+
+### Output Format：逐行解析和增量重建
+
+每一行都是 JSON object。第一行通常是 session header：
+
+```json
+{"type":"session","version":3,"id":"uuid","timestamp":"...","cwd":"/path"}
+```
+
+它提供本次 Session 的版本、稳定 ID、创建时间和工作目录。`cwd` 是运行 Pi 时的环境信息，不代表消费者可以访问该目录；外部系统仍需要自己的权限判断。
+
+随后会按实际执行过程出现事件。一个简化的完整顺序可能是：
+
+```json
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","content":[],...}}
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}
+{"type":"message_end","message":{...}}
+{"type":"turn_end","message":{...},"toolResults":[]}
+{"type":"agent_end","messages":[...]}
+```
+
+不要把这段顺序当成所有请求都固定相同：出现 Tool 时会插入 Tool execution 事件和 Tool Result；发生 retry、compaction、steering 或 follow-up 时也会有额外事件。客户端应允许未知的未来 `type`，至少保留原始行并报告，而不是因新增事件直接崩溃。
+
+`message_update` 是 delta-only：它不包含累计的 `message` 字段，也不包含 `assistantMessageEvent.partial`。这样做是为了让流大小随增量线性增长，而不是每个 token 都重复完整历史。顶层 `usage` 是 Provider 报告的最新累计 usage；如果某 Provider 只在完成时报告 usage，中间 event 中它可能保持零。
+
+要重建文本、thinking 或 Tool Call arguments：
+
+1. 按 `contentIndex` 为每个 content block 建立 buffer。
+2. 对 `text_delta` 把 `delta` 追加到对应文本 buffer。
+3. 对 thinking 或 Tool Call arguments 也按同样的 index 追加，不能按 event 到达次数猜位置。
+4. 遇到 `message_end`，用其中的完整 message 覆盖本地临时状态；它是最终权威值。
+5. `agent_end` 表示本次 run 的最终 messages 集合，可用于关闭运行中的 UI 状态。
+
+`toolcall_start` 事件还会包含固定大小的 `id` 和 `toolName`。arguments 可能仍在后续 delta 中逐片到达；UI 可以先显示“调用 `toolName`”，但只有 `message_end` 或执行结果才足以确认最终参数和结果。
+
+> 译者注：`usage` 在中间为零不等于本次消耗为零。它只表示 Provider 还没有报告累计数据；计费系统应以完成事件、Provider 原始响应或专门 telemetry 为准，不能用 JSON stream 的中间零值覆盖最终账务。
+
+#### stdout、stderr、退出码和背压
+
+`stdout` 的每一行都应能独立被 JSON parser 消费；不要在 stdout 上执行 `echo "debug"`。调试信息可以这样写：
+
+```bash
+printf 'debug: waiting for event\\n' >&2
+```
+
+命令结束时，退出码表示进程层面的成功或失败；它不能替代事件中的 `agent_end`、Tool error 或 Provider error。消费者应同时记录：是否读到合法的 terminal event、进程退出码是多少、stderr 是否有诊断。若进程在中途退出，已经读到的 JSONL 是有效前缀，但不能把最后一个 `message_update` 当成完整答案。
+
+管道还有背压问题：如果消费者不及时读取 stdout，Pi 写入管道可能阻塞，进而暂停模型流或 Tool 进度。实时消费者应持续读取并尽快转发，不能等到全部输出后再读取。取消管道时，要关闭进程并等待它退出；不要只杀掉读取线程而留下正在运行的 Agent。
+
+> 译者注：JSONL 的“逐行”不代表一次 `read()` 恰好得到一行。操作系统可能把半行、几行或空闲片段交给读取端；Go 应使用 `bufio.Scanner`/`ReadString`, Java 应使用 `BufferedReader.readLine()`，并检查行长度和 EOF。HTTP Provider 的 SSE 也有同样的 framing 问题，但 JSON mode 本身的 framing 是换行。
+
+### Example：脚本消费完整消息
+
+最小 shell 示例只筛选最终定稿的 message：
 
 ```bash
 pi --mode json "List files" 2>/dev/null | jq -c 'select(.type == "message_end")'
 ```
 
-> 译者注：JSON mode 是 AgentSession 的观察/集成表面；RPC mode 则是带命令和响应语义的控制协议。两者都可能使用 JSONL，但不能互换客户端。
+`jq -c` 对每个输入 object 输出紧凑 JSON。它会同时看到用户消息、assistant 消息或其他 `message_end`，因此生产脚本还应检查 `message.role`、`message.content` 或 Tool Call 字段，而不能仅凭事件类型当成最终答案。
+
+Python 版本使用标准库的逐行读取：
+
+```python
+import json
+import subprocess
+
+process = subprocess.Popen(
+    ["pi", "--mode", "json", "List files"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+try:
+    for line in process.stdout:
+        event = json.loads(line)
+        if event.get("type") == "message_end":
+            print(event.get("message", {}))
+finally:
+    process.terminate()
+    process.wait(timeout=5)
+```
+
+输入是一个由 Pi 产生的 JSONL stream；输出是 Python object 的打印结果。`stderr=PIPE` 时必须另行消费 stderr，否则长时间运行可能堵塞；示例为了突出 stdout 解析而省略了诊断转发，实际程序可用另一个线程读取它。
+
+Go 版本用 `bufio.Scanner`：
+
+```go
+cmd := exec.Command("pi", "--mode", "json", "List files")
+stdout, err := cmd.StdoutPipe()
+if err != nil { log.Fatal(err) }
+if err := cmd.Start(); err != nil { log.Fatal(err) }
+scanner := bufio.NewScanner(stdout)
+for scanner.Scan() {
+    var event struct { Type string `json:"type"` }
+    if err := json.Unmarshal(scanner.Bytes(), &event); err != nil { log.Fatal(err) }
+    if event.Type == "message_end" { fmt.Println(string(scanner.Bytes())) }
+}
+if err := scanner.Err(); err != nil { log.Fatal(err) }
+if err := cmd.Wait(); err != nil { log.Fatal(err) }
+```
+
+`Scanner` 默认 token 上限约 64 KiB；Tool 输出或单条 message 很大时应调用 `scanner.Buffer` 提高上限。`cmd.Wait()` 负责回收子进程；如果先取消，应调用 `cmd.Process.Kill()` 或更温和的终止，再等待 Wait，避免僵尸进程。
+
+Java 版本用 `ProcessBuilder` 和 `BufferedReader`：
+
+```java
+Process process = new ProcessBuilder("pi", "--mode", "json", "List files")
+        .redirectError(ProcessBuilder.Redirect.INHERIT)
+        .start();
+try (BufferedReader reader = process.inputReader()) {
+    String line;
+    while ((line = reader.readLine()) != null) {
+        JsonNode event = new ObjectMapper().readTree(line);
+        if ("message_end".equals(event.path("type").asText())) {
+            System.out.println(event.path("message"));
+        }
+    }
+}
+int exitCode = process.waitFor();
+if (exitCode != 0) throw new IllegalStateException("pi exited: " + exitCode);
+```
+
+Java 的 `BufferedReader.readLine()` 去掉行尾分隔符，Jackson 只解析当前这一行；`redirectError(INHERIT)` 防止 stderr 无人消费。生产代码应复用一个 `ObjectMapper`，不要在每一行重新创建它。Java `HttpClient` 适合直接消费远程 SSE Provider，但本页的 JSON mode 是一个本地子进程协议，优先用 `ProcessBuilder`。
+
+> 译者注：Go `bufio.Scanner`、Java `BufferedReader` 和 Node 的 readline 都处理“按换行切帧”，但都不能让调用变成可取消。取消需要关闭 pipe、终止子进程、等待退出，并在上层区分“正常 agent_end”和“用户 abort”。
+
+#### 可复制实验：从事件流提取 final answer
+
+**目标**：确认一次 JSON mode 运行中，增量事件不是最终答案，`message_end` 才是稳定边界。
+
+**准备**：安装 Pi 和 `jq`；在受限测试仓库执行，不要把真实密钥或生产路径传给 shell Tool。
+
+**步骤**：
+
+1. 执行 `pi --mode json "List files" 2>/dev/null > /tmp/pi-events.jsonl`。
+2. 查看前十行：`head -n 10 /tmp/pi-events.jsonl | jq -c .`。
+3. 提取定稿消息：`jq -c 'select(.type == "message_end")' /tmp/pi-events.jsonl`。
+4. 统计事件类型：`jq -r '.type' /tmp/pi-events.jsonl | sort | uniq -c`。
+5. 不要用 `cat /tmp/pi-events.jsonl | jq -s .` 作为实时消费方案；`-s` 会等待 EOF 并把流收成 array。
+
+**预期观察**：第一行是 `session`，正常运行至少出现 `agent_start`、`turn_start`、消息事件和 `agent_end`；若模型调用 Tool，还会出现 `tool_execution_*`。具体事件数量随模型、工具和版本变化。
+
+**思考题**：如果只收到 `message_update` 就杀掉进程，能否安全地恢复完整 assistant message？如果 stdout 消费者变慢，为什么 Agent 可能看起来“卡住”？当 `jq` 报 `parse error` 时，应先检查 stdout 是否混入日志，还是先怀疑 Provider JSON？
+
+> 译者注：源文档给出的是协议形状，不是永久不变的 event 白名单。客户端应记录未知 event，按 `type` 做向后兼容；要判断一次运行是否真正完成，还要结合 `agent_end`、退出码和 stderr，而不是只看最后一行。
 
 ## 章节对照
 

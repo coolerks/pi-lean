@@ -5,33 +5,75 @@ description: "使用 Go 标准库从 HTTP client 逐步构建可测试 Harness�
 
 # Go Agent 实现路线
 
-代码位于 `examples/go-agent/`，模块使用 Go 1.21 语法，当前环境用 Go 1.25.6 验证。它不依赖 LangChain 等框架；所有模型行为由 `ScriptedModel` 驱动，真实 HTTP 请求是显式选择。
+这组课程不是一个可以复制粘贴的“大黑盒 Agent”。我们把同一个请求拆成十五个可验证的台阶：先发 HTTP，再解析流，再定义 Tool，最后才组合 Session、队列、插件、Skill、MCP 和 Harness。
 
-```mermaid
-flowchart LR
-    C[net/http + JSON] --> S[SSE stream]
-    S --> M[Model / Message]
-    M --> L[AgentLoop]
-    L --> T[ToolRegistry]
-    T --> P[Permission + coding tools]
-    L --> Q[queues / cancellation]
-    L --> SS[JSONL Session]
-    SS --> H[Harness]
-    H --> PL[Plugin / Skill / MCP / Telemetry]
+## 本阶段总目标
+
+完成本路线后，你应当能独立解释并实现下面这条链路：
+
+```text
+用户输入
+  -> Request.Messages
+  -> Model.Complete
+  -> assistant Message
+  -> ToolRegistry.Validate
+  -> Tool.Execute
+  -> RoleTool Message
+  -> 下一轮 Model.Complete
+  -> final Message
+  -> Session.Save
 ```
 
-## 阶段清单
+这里的 `Model` 是模型服务的边界，`AgentLoop` 是控制流，`Harness` 是生命周期和组合层。三者故意分开，方便测试，也避免把 HTTP 细节塞进每个 Tool。
 
-| 页面 | 代码结果 |
-| --- | --- |
-| Go 01–02 | `HTTPModel`、SSE delta 和 ScriptedModel |
-| Go 03–05 | `Tool`、schema gate、read/write/edit/grep/shell |
-| Go 06–08 | Agent Loop、事件、并行、retry、`context.Context` abort |
-| Go 09–11 | JSONL Session、估算压缩、steering/follow-up |
-| Go 12–14 | explicit plugin、Skill metadata、stdio JSON-RPC MCP |
-| Go 15 | `Harness` 组合和 Telemetry recorder |
+## 这条路线完成什么
 
-运行：
+- 用 `net/http` 和 `encoding/json` 发送 OpenAI-compatible Chat Completions 请求。
+- 用 `bufio.Scanner` 解析 SSE 的 `data:` 行、delta 和 `[DONE]`。
+- 用 Go `interface` 表达 Tool，用 `json.RawMessage` 保留尚未解析的参数。
+- 在真正产生副作用前执行名称、JSON object 和 required 字段检查。
+- 运行有限的 `AgentLoop`，处理顺序或并行 Tool Call。
+- 用 `context.Context` 传播超时和取消，用有限次数的指数退避处理临时错误。
+- 将文件、编辑、搜索和 shell 包装为同一种 Tool，并通过 workspace policy 限制它们。
+- 用 `ScriptedModel` 在没有 API key 的情况下测试每一个边界。
+- 组合 Session、compaction、steering/follow-up、插件、Skill、MCP 和 Telemetry。
+
+## 本路线不完成什么
+
+这不是生产级沙箱，也不是完整 Pi `harness.v2.md` 的 durable implementation。示例没有实现跨进程锁、operation intent/result ledger、崩溃后 exactly-once 外部副作用、远程响应恢复或完整 MCP capability negotiation。
+
+`PermissionPolicy` 只是路径和危险命令的教学门。它不能替代容器、操作系统账户、网络隔离、CPU/内存限制或人工审批。不要在真实 home 目录和生产凭据上运行 shell 示例。
+
+## 前置知识
+
+你需要知道：
+
+1. Go 的包、函数、struct、指针和方法。
+2. `error` 返回值和 `defer` 的基本用法。
+3. JSON 对象、数组和 HTTP status code。
+4. 终端中执行 `go test` 和 `go run`。
+
+不要求先学 Web 框架。示例只用标准库，因为我们要看清 HTTP、Reader、Context 和 goroutine 的边界。
+
+## 目录和运行入口
+
+```text
+examples/go-agent/
+├── cmd/agent/main.go                 # CLI 与离线 demo
+├── internal/agent/model.go           # Model、HTTP JSON、SSE
+├── internal/agent/tool.go            # ToolDefinition、Registry、schema gate
+├── internal/agent/loop.go            # AgentLoop、retry、parallel、事件
+├── internal/agent/agent.go            # running 状态与三类队列
+├── internal/agent/builtin_tools.go    # read/write/edit/grep/shell
+├── internal/agent/session.go          # JSONL session 与 compaction
+├── internal/agent/plugin.go           # 显式插件 registry
+├── internal/agent/skill.go            # SKILL.md discovery
+├── internal/agent/mcp.go              # newline-delimited JSON-RPC client
+├── internal/agent/telemetry.go        # 简单 recorder
+└── internal/agent/*_test.go            # fake server 与 ScriptedModel 测试
+```
+
+在仓库根目录执行：
 
 ```bash
 cd ai-agent-learning/examples/go-agent
@@ -40,4 +82,116 @@ go vet ./...
 go run ./cmd/agent --demo
 ```
 
-每个阶段先读对应教材，再读测试；测试使用 `ScriptedModel`，不需要 API key。
+预期 demo 输出包含：
+
+```text
+ tool[calculator]> 5
+ assistant> 2 + 3 = 5
+ final> 2 + 3 = 5
+```
+
+`tool[...]` 和 `assistant>` 来自 `main.go` 注册的事件回调；`final>` 是 Harness 在运行返回后打印的最终消息。demo 使用 `ScriptedModel`，不会访问网络。
+
+## 阶段地图
+
+| 阶段 | 先回答的问题 | 主要文件 | 通过标准 |
+| --- | --- | --- | --- |
+| Go 01 | HTTP 请求到底发送了什么？ | `model.go` | fake server 收到 JSON、认证和 model id |
+| Go 02 | 网络 chunk 与语义 delta 有何不同？ | `model.go` | SSE 拼接、坏流和取消测试 |
+| Go 03 | 模型看到的 Tool 与执行对象是什么关系？ | `tool.go` | schema gate 拒绝坏参数 |
+| Go 04 | 谁决定下一轮模型请求？ | `loop.go` | calculator 两轮闭环 |
+| Go 05 | 文件和 shell 如何受控？ | `builtin_tools.go` | workspace、输出上限、错误路径 |
+| Go 06 | 一次请求的内部 Message 怎么表示？ | `model.go` | provider-neutral payload |
+| Go 07 | 重试和取消如何互不混淆？ | `loop.go` | backoff 可取消，max attempts 有界 |
+| Go 08 | 如何观察而不改变状态？ | `loop.go`、`telemetry.go` | 事件顺序可断言 |
+| Go 09 | 进程退出后如何继续？ | `session.go` | JSONL save/load |
+| Go 10 | Context 超长怎么办？ | `session.go` | compaction 保留尾部 |
+| Go 11 | 运行中输入何时生效？ | `agent.go` | steering/follow-up/next-run 边界 |
+| Go 12 | 不改核心如何加 Tool？ | `plugin.go` | interface + registry |
+| Go 13 | 为什么不把所有技能塞进 prompt？ | `skill.go` | metadata 发现、正文按需读取 |
+| Go 14 | 另一个进程如何提供 Tool？ | `mcp.go` | JSON-RPC request/response id |
+| Go 15 | 谁负责把部件接起来？ | `harness.go` | prompt、保存、遥测和恢复边界 |
+
+## Go 与 Pi 的关系
+
+Pi 研究基线是 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- Pi `packages/ai/src/types.ts` 的统一消息和流事件，对应这里的 `Message`、`Response` 和 `StreamingModel`。
+- Pi `packages/ai/src/models.ts` 的 Provider/Model 边界，对应这里的 `Model` 与 `HTTPModel`。
+- Pi `packages/agent/src/agent-loop.ts` 的 assistant step、Tool Call、结果回传，对应这里的 `AgentLoop.Run`。
+- Pi `packages/agent/src/agent.ts` 管理运行状态、steering/follow-up 和 abort；这里的 `Agent` 是缩小版。
+- Pi `packages/coding-agent/src/core/tools/` 将 read/edit/write/bash 接到 Coding Agent；这里用 `builtin_tools.go` 展示同一边界。
+- Pi `packages/coding-agent/src/core/agent-session.ts` 承担更完整的 Session 和资源组合；这里的 `Harness` 只做教学级组合。
+
+这些是 file + symbol + commit 的对照，不是说两个实现拥有相同功能。先写缩小版，才能看出 Pi 为什么还需要 provider adapter、session tree、extension runner 和 compaction policy。
+
+## 代码阅读方法
+
+每页都先看接口，再看调用方，最后看测试。遇到一个函数，按四个问题阅读：
+
+1. 输入由谁创建？
+2. 函数是否改变状态或产生副作用？
+3. 错误是返回、转成 Tool Result，还是触发取消？
+4. 结果下一步被谁消费？
+
+例如不要只看 `tool.Execute` 的函数体。你还要沿着 `AgentLoop.Run -> executeBatch -> executeOne -> Registry.Validate` 追踪，确认参数在何时被校验、错误如何回到下一轮。
+
+## 增量实现纪律
+
+每完成一个阶段，先运行本阶段命令，再进入下一个阶段。不要同时加入 HTTP、并行、权限和持久化；否则失败时不知道哪个边界坏了。
+
+建议每次改动只回答一个问题：
+
+- 加入字段前，先写一个失败测试。
+- 加入并行前，先证明顺序要求。
+- 加入取消前，先让 fake model 阻塞。
+- 加入持久化前，先定义坏行和部分结果的语义。
+
+## 最后的检查表
+
+在声称 Go 版本完成前，逐项确认：
+
+- [ ] `go test ./...` 通过。
+- [ ] `go test -race ./...` 通过，尤其是 parallel Tool 和队列。
+- [ ] `go vet ./...` 通过。
+- [ ] demo 使用 fake model，不需要密钥。
+- [ ] HTTP/SSE 测试覆盖成功、错误、坏 JSON 和取消。
+- [ ] Tool 测试证明 invalid arguments 不会进入执行函数。
+- [ ] Loop 测试覆盖 final、multiple calls、unknown Tool、max steps。
+- [ ] Session 测试覆盖保存、恢复和 compaction。
+- [ ] 代码中的 `PermissionPolicy` 注明不是 sandbox。
+- [ ] 与 Pi 的对应关系使用固定 commit，而不是不稳定行号。
+
+## 本页实验：画出你自己的边界
+
+### 目标
+
+把一个“Agent”拆成 Model、Loop、Tool 和 Harness 四层。
+
+### 准备
+
+打开 `model.go`、`tool.go`、`loop.go` 和 `harness.go`，运行一次 `go test ./...`。
+
+### 步骤
+
+1. 在测试中找到第一次 `ScriptedModel.Complete` 调用。
+2. 记录 request 中的 messages 和 tools。
+3. 找到 assistant Tool Call 进入 `Registry.Validate` 的位置。
+4. 找到 Tool Result 被转换为 `RoleTool` 的位置。
+5. 找到 Session 保存发生在 Loop 之外的位置。
+
+### 观察点
+
+模型只产生 `ToolCall` 数据；Registry 和 Tool 才检查并执行；Harness 决定 Session 何时保存。
+
+### 预期结果
+
+你可以用一句话说明每层职责，而不是把所有行为归到“模型”。
+
+### 思考题
+
+如果把 Session.Save 放进 `AgentLoop.Run`，Loop 会不会同时知道 JSONL、数据库和远程存储？如果两个 Tool 写同一个文件，`Parallel` 还能安全吗？
+
+## 下一步
+
+按顺序阅读 Go 01 到 Go 08。每一页都包含当前代码的最小片段、失败 trace、测试理由和 Pi/Java 对照。完成前半段后，再进入 Session、Compaction 和 Harness 的后半段。

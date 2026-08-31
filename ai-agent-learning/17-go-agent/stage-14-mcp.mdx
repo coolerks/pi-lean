@@ -1,12 +1,342 @@
 ---
-title: "Go 14：MCP"
-description: "通过 newline JSON-RPC 把外部 Tool 适配进 Registry。"
+title: "Go 14：MCP、JSON-RPC 与 stdio Client"
+description: "从 newline-delimited JSON-RPC 开始，把远端工具安全适配到本地 Registry。"
 ---
 
-# Go 14：MCP
+# Go 14：MCP、JSON-RPC 与 stdio Client
 
-`McpClient` 处理 `tools/list`、`tools/call` 和 request id；返回的远端定义映射为本地 `Tool`，执行时再写回 JSON-RPC。Pi Core 当前不是默认内建 MCP；这里用最小 client 讲协议边界。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-模拟 calculator server，测试乱序 id、error response、断线、超时和恶意 schema。生产 client 还要 initialize、传输认证、并发 dispatcher、权限和重连策略。
+- 解释 JSON-RPC request、response、notification、id、method 和 params。
+- 读懂 `MCPClient.Call` 的写入、读取、id 匹配和错误路径。
+- 说明 `tools/list` 如何转成 `RemoteTool`。
+- 说明 `tools/call` 的结果如何回到 Agent Loop。
+- 明确当前示例缺少 initialize、并发 dispatcher、认证、超时和重连。
+
+## 输入、增加的能力与明确不做什么
+
+输入是上一阶段本地 `Tool` interface 和 JSON 编码。本阶段新增 newline-delimited JSON-RPC stdio client、`ListTools`、`RemoteTool` 和 `StartStdioMCP`。
+
+本阶段不使用 MCP SDK，不实现完整 MCP capability negotiation，不假定 Pi Core 默认内建 MCP，也不把远端 Tool schema 当成权限授予。示例 client 适合单请求串行学习，不能直接用于生产多路复用。
+
+## 前置 Go 知识
+
+需要理解：
+
+- `io.Reader`/`io.WriteCloser` 是 transport 端口；
+- `bufio.Reader.ReadBytes` 按分隔符读取；
+- `json.RawMessage` 保存任意 result；
+- mutex 可以让一个简化 client 串行发请求；
+- `exec.Command` 启动子进程并接 stdin/stdout。
+
+## 问题场景：把远端工具当本地函数
+
+错误思路：
+
+```text
+model -> RemoteTool.Execute -> 直接调用数据库
+```
+
+实际链路是：
+
+```text
+LLM
+-> Agent Loop
+-> RemoteTool
+-> MCP Client
+-> JSON-RPC stdin/stdout
+-> MCP Server
+-> 外部服务
+```
+
+失败 trace：
+
+```text
+Client 发 id=1 tools/call
+-> Server 返回 id=2 的通知/其他响应
+-> Client 不检查 id
+-> 把错误结果配给当前 call
+-> 模型得到错误 tool result
+```
+
+request id 是配对证据。当前示例检查 `response.ID != id` 并跳过不匹配行，但这只是串行教学策略；生产 dispatcher 应把响应交给等待对应 id 的调用。
+
+## JSON-RPC 最小结构
+
+```go
+type rpcMessage struct {
+    JSONRPC string          `json:"jsonrpc"`
+    ID      int             `json:"id,omitempty"`
+    Method  string          `json:"method,omitempty"`
+    Params  json.RawMessage `json:"params,omitempty"`
+    Result  json.RawMessage `json:"result,omitempty"`
+    Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+    Code    int    `json:"code"`
+    Message string `json:"message"`
+}
+```
+
+输入是 request 或 response 字段；输出是一种统一 envelope；状态变化无；失败点是同时出现 result/error、id 类型不支持、JSON-RPC 版本错误或缺字段。当前代码没有完整验证 `JSONRPC == "2.0"`，是明确简化。
+
+request：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+```
+
+response：
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+```
+
+notification 没有 id，不应被当成一次等待 response 的调用。当前 `rpcMessage.ID` 是 int，不能表达所有 JSON-RPC id 类型。
+
+## MCPClient.Call 的顺序
+
+```go
+func (c *MCPClient) Call(ctx context.Context, method string, params any) (json.RawMessage, error)
+```
+
+第一步规范化 nil context：
+
+```go
+if ctx == nil { ctx = context.Background() }
+if err := ctx.Err(); err != nil { return nil, err }
+```
+
+输入是 context、method、params；输出是 result 或取消错误；状态变化无；失败点是调用已经被取消。
+
+第二步获得 mutex 并分配 id：
+
+```go
+c.mu.Lock()
+defer c.mu.Unlock()
+if c.read == nil || c.write == nil {
+    return nil, errors.New("MCP client is closed")
+}
+id := c.nextID
+c.nextID++
+```
+
+输入是 client 状态；输出是唯一递增 id；状态变化是 nextID 增加；失败点是 client 已 Close。mutex 使当前 client 同时只处理一个调用。
+
+第三步编码并写一行：
+
+```go
+request := rpcMessage{JSONRPC: "2.0", ID: id, Method: method, Params: encodedParams}
+payload, err := json.Marshal(request)
+if err != nil { return nil, err }
+if _, err := c.write.Write(append(payload, '\n')); err != nil {
+    return nil, err
+}
+```
+
+输入是 method/params；输出是 newline JSON；状态变化是 server 收到请求；失败点是参数不能 JSON 编码或 pipe write 失败。
+
+第四步读 response 并匹配 id：
+
+```go
+for {
+    if err := ctx.Err(); err != nil { return nil, err }
+    line, err := c.read.ReadBytes('\n')
+    if err != nil { return nil, err }
+    var response rpcMessage
+    if err := json.Unmarshal(line, &response); err != nil {
+        return nil, fmt.Errorf("decode MCP response: %w", err)
+    }
+    if response.ID != id { continue }
+    if response.Error != nil {
+        return nil, fmt.Errorf("MCP error %d: %s", response.Error.Code, response.Error.Message)
+    }
+    return response.Result, nil
+}
+```
+
+输入是 pipe 行；输出是指定 id 的 raw result；状态变化是调用从 pending 到 complete/error；失败点是断线、坏 JSON、MCP error、context cancel。因为读操作阻塞在 `ReadBytes`，context 取消不一定能立即打断底层 Reader；这是生产缺口。
+
+## tools/list 到 RemoteTool
+
+```go
+func (c *MCPClient) ListTools(ctx context.Context) ([]Tool, error) {
+    result, err := c.Call(ctx, "tools/list", map[string]any{})
+    // decode tools: name, description, inputSchema
+    // create RemoteTool for each named tool
+}
+```
+
+输入是 MCP server 的 tool catalogue；输出是本地 `[]Tool`；状态变化是调用方可以把远端定义注册到 Registry；失败点是 response 不是预期对象、tool name 为空、schema 恶意或不支持。
+
+当前代码跳过空 name，保留 `inputSchema`。它没有检查 schema 是否 object、是否过大、是否包含危险 metadata；Registry 的 required gate 可以工作，但 PermissionPolicy 仍要由调用方加上。
+
+## RemoteTool.Execute 到 tools/call
+
+```go
+func (t RemoteTool) Execute(ctx context.Context, arguments json.RawMessage) (ToolResult, error) {
+    var args map[string]any
+    if err := json.Unmarshal(arguments, &args); err != nil {
+        return ToolResult{}, err
+    }
+    result, err := t.client.Call(ctx, "tools/call", map[string]any{
+        "name": t.name, "arguments": args,
+    })
+    if err != nil { return ToolResult{}, err }
+    // decode content and isError
+}
+```
+
+输入是本地 Tool Call 的 JSON arguments；输出是本地 `ToolResult`；状态变化是远端 server 执行可能的副作用；失败点是参数不是 object、transport error、远端 error、result JSON 无效。
+
+当前代码把返回 content 中 `type == "text"` 的文本串联，并复制 `isError`。图片、资源、结构化 content 和 server metadata 会被丢弃，不能写成完整 MCP content 支持。
+
+Agent Loop 再把它转成 `RoleTool` message，带原始 `ToolCallID`。对模型来说它看起来像本地 Tool，但事实是一次跨进程调用。
+
+## StartStdioMCP
+
+```go
+func StartStdioMCP(command string, args ...string) (*MCPClient, error) {
+    process := exec.Command(command, args...)
+    stdin, err := process.StdinPipe()
+    stdout, err := process.StdoutPipe()
+    if err := process.Start(); err != nil { return nil, err }
+    return NewMCPClient(stdout, stdin, func() error {
+        _ = stdin.Close()
+        _ = stdout.Close()
+        return process.Wait()
+    }), nil
+}
+```
+
+输入是 command 和 args；输出是连接到子进程 stdio 的 client；状态变化是子进程启动；失败点是 pipe、start、stdout 污染、server 退出和 close 阻塞。
+
+调用方必须保证 server stdout 只输出 JSON-RPC。日志应写 stderr，否则一行普通日志就会让 client decode 失败。
+
+## 当前生产缺口
+
+当前教育 client 明确缺少：
+
+1. MCP `initialize` 与 protocol version 协商；
+2. capabilities、resources、prompts 的发现；
+3. concurrent request dispatcher，而不是 mutex 串行读；
+4. notification 路由；
+5. read deadline 和 process timeout；
+6. server stderr 采集和退出诊断；
+7. schema 大小、名称和权限校验；
+8. 认证、远程 HTTP transport 和 TLS；
+9. server crash 后重连；
+10. request cancellation 对阻塞 read 的可靠打断；
+11. tool result 的图片/资源/structured content；
+12. 审计日志和 secret redaction。
+
+因此“支持 MCP”必须拆成协议覆盖和生产可靠性，不能只看 `tools/call` 能否返回一次。
+
+## Pi 的真实边界
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+当前 Pi Core 的默认 `packages/ai`/`packages/agent` 路径不是一个内建 MCP manager。MCP 可以作为外部协议或 Extension 接入；教程不从类名推测核心能力。对照资料：
+
+- `packages/coding-agent/src/core/extensions/`：扩展加载和运行边界；
+- `packages/agent/src/agent-loop.ts`：本地 Agent Tool 执行；
+- `packages/agent/src/harness/`：durable Harness 设计入口，但不是 MCP 实现；
+- MCP 官方规范：initialize、tools/list、tools/call 和 transport 版本应以当前规范为准。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run TestMCPClientListsAndCallsRemoteTool
+go test -race ./...
+```
+
+预期 MCP 测试通过，race 无报告。测试使用 `net.Pipe` 模拟双方，不创建真实子进程，不访问网络。
+
+完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+demo 不启用 MCP，仍输出 calculator 5 和 final 5。这样可以把 MCP 测试和默认离线 demo 分开。
+
+## 测试设计
+
+`TestMCPClientListsAndCallsRemoteTool` 启动一个 `net.Pipe` server goroutine：
+
+1. 收到 `tools/list` 返回 remote_add；
+2. 收到 `tools/call` 返回 text；
+3. Client 把 remote definition 转成 Tool；
+4. Execute 发送第二个 JSON-RPC；
+5. 测试断言 result 内容，并 Close pipe。
+
+补充测试应覆盖：
+
+- response id 不匹配后继续读取；
+- error response 转成包含 code/message 的 error；
+- malformed JSON；
+- server EOF；
+- context 在发送前取消；
+- RemoteTool 非 object arguments；
+- `isError=true` 仍作为 ToolResult 返回，而不是 transport error；
+- 输入 schema 缺失或过大；
+- stderr 日志不污染 stdout。
+
+每个测试都要说明“是否可能已经发生远端副作用”。transport error 不等于 server 没执行。
+
+## Java 对照
+
+Java `McpClient` 使用 `Process`、`BufferedReader`、`ObjectMapper`、`AtomicInteger`/同步锁完成同样边界。Go `io.Reader` 对应 Java `Reader`，`json.RawMessage` 对应 `JsonNode`。
+
+| 协议概念 | Go | Java |
+| --- | --- | --- |
+| request id | `nextID int` | `AtomicInteger` 或同步计数器 |
+| newline read | `ReadBytes` | `readLine` |
+| transport | `io.WriteCloser` | `OutputStream/Writer` |
+| cancel | `context.Context` | token + process destroy 策略 |
+| RemoteTool | `Tool` interface | `Tool` interface |
+
+两种实现都应先写一个 calculator fake，再补 initialize、并发和超时；不要一开始用 SDK 隐藏 JSON-RPC。
+
+## 实验：手写 calculator MCP server
+
+### 目标
+
+从 request id 到 Tool Result，观察远端工具如何伪装成本地 Tool。
+
+### 准备
+
+打开 `mcp.go`、`mcp_test.go` 和 `tool.go`。使用 `net.Pipe`，不要先启动真实 server。
+
+### 步骤
+
+1. 让 fake server 读取 `tools/list`，返回 name、description 和 inputSchema。
+2. 调用 `ListTools`，打印生成的 Definition。
+3. 给 RemoteTool 一个 JSON object arguments。
+4. 让 server 回复与请求 id 相同的 `tools/call` result。
+5. 检查 `ToolResult.Content` 和 `IsError`。
+6. 回复错误 id，确认串行 client 继续读取。
+7. 让 server EOF，观察 error。
+8. 设计生产 dispatcher 如何保存 pending id。
+
+### 观察点
+
+Agent 只知道 Tool interface；MCP Client 负责协议；Server 才接触远端服务。request id 连接一次调用，但不能证明外部副作用已持久化。
+
+### 预期结果
+
+你能画出 `LLM -> AgentLoop -> RemoteTool -> MCPClient -> server -> external service`，并列出当前 client 不能提供的生产保证。
+
+### 思考题
+
+如果 server 收到 request 后执行成功但 response 丢失，应该自动重试吗？如果两个调用并发，为什么不能简单跳过不匹配 response？权限策略应放在 RemoteTool、MCP Client 还是 Harness？
+
+## 小结与下一阶段
+
+MCP 是协议边界，不是权限边界，也不是自动可靠的远程函数调用。Go 示例用 newline JSON-RPC、递增 id、tools/list、tools/call 和 RemoteTool 教会最小链路，同时明确缺少初始化协商、并发 dispatcher、认证、超时、重连和完整 content。
+
+下一阶段把所有部件组合成 Go 15 Harness，并验证 session reload、权限、Telemetry 和教学实现与 durable v2 设计之间的差距。

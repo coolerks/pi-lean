@@ -1,12 +1,241 @@
 ---
-title: "Go 12：Plugin Registry"
-description: "用 interface、显式注册和 Close 生命周期实现插件。"
+title: "Go 12：Plugin Interface 与显式 Registry"
+description: "用 interface、显式装配和逆序 Close 建立可测试的 Go 插件边界。"
 ---
 
-# Go 12：Plugin Registry
+# Go 12：Plugin Interface 与显式 Registry
 
-Go 版不强行复刻 Node 动态 import，而使用 `Plugin.Register(*Registry)` 和 `Plugin.Close()`。调用方显式装配依赖，易测试、易交叉编译；代价是没有自动发现。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-实现一个注册 `count` Tool 的插件，测试重复名称、注册失败和关闭顺序；需要自动发现时再设计约定目录或独立进程协议。
+- 解释插件解决的是扩展和生命周期问题，不是把所有逻辑塞进 Agent。
+- 读懂 Go 的 `Plugin`、`PluginManager` 和 `Registry`。
+- 比较显式注册、Go 原生 `plugin` 和独立进程三种方案。
+- 测试插件注册失败、重复 Tool 名称和逆序关闭。
+- 判断插件、Hook、Event、Skill 与 MCP 的边界。
+
+## 输入、增加的能力与明确不做什么
+
+输入是可注册 Tool 的 Registry 和 Go interface。本阶段新增 `Plugin` interface、`PluginManager.Load`、`Close` 和一个测试插件。
+
+本阶段不实现动态下载、不加载不可信 `.so`，不承诺插件隔离，也不把插件错误吞成成功。当前实现采用显式装配，插件代码与主进程同一信任边界运行。
+
+## 前置 Go 知识
+
+需要理解：
+
+- interface 满足是隐式的；
+- 指针接收者可能影响 interface 满足；
+- registry 是名称到实现的映射；
+- `defer` 和逆序 close 用于释放资源；
+- constructor/loader 的失败应返回 error。
+
+## 问题场景：为了加一个 Tool 修改核心 Loop
+
+坏设计：
+
+```text
+在 AgentLoop 里写死 if name == "review" { ... }
+-> 每新增 Tool 都修改 Loop
+-> 测试要启动全部能力
+-> 插件无法独立关闭
+```
+
+更好的设计是 Loop 只依赖 Registry，插件在装配阶段注册 Tool：
+
+```text
+创建 registry
+-> plugin.Register(registry)
+-> AgentLoop 使用 registry
+-> run 结束后 plugin.Close()
+```
+
+插件是扩展点，Registry 是能力目录，Tool 才是具体副作用。
+
+## Plugin interface
+
+```go
+type Plugin interface {
+    Name() string
+    Register(*Registry) error
+    Close() error
+}
+```
+
+输入是插件实例、Registry；输出是名称、注册错误和关闭错误；状态变化是插件从未加载变为已注册；失败点是 nil plugin、注册重复、注册中途失败或 Close 失败。Registry 为 nil 是当前调用方未满足的前置条件，现实现不会把它转换成 error，插件注册时可能 panic。
+
+`Name` 用于诊断，不是权限。插件名称本身不能让它获得 shell、网络或文件权限。
+
+## PluginManager.Load
+
+```go
+func (m *PluginManager) Load(plugin Plugin, registry *Registry) error {
+    if plugin == nil {
+        return fmt.Errorf("plugin cannot be nil")
+    }
+    if err := plugin.Register(registry); err != nil {
+        return fmt.Errorf("register plugin %q: %w", plugin.Name(), err)
+    }
+    m.plugins = append(m.plugins, plugin)
+    return nil
+}
+```
+
+输入是 Plugin 和 Registry；输出是 nil 或带插件名的 wrapped error；状态变化是成功注册后 manager 记录插件；失败点是 `Register` 返回 error。
+
+关键顺序：只有 `Register` 成功，插件才 append 到 manager。失败插件不会进入之后的 Close 列表。当前 manager 本身没有 mutex，因此应在启动装配阶段使用，不要让多个 goroutine 同时 Load。
+
+## Close 为什么逆序
+
+```go
+func (m *PluginManager) Close() error {
+    for index := len(m.plugins) - 1; index >= 0; index-- {
+        if err := m.plugins[index].Close(); err != nil {
+            return fmt.Errorf("close plugin %q: %w", m.plugins[index].Name(), err)
+        }
+    }
+    return nil
+}
+```
+
+输入是已加载插件列表；输出是第一个关闭错误或 nil；状态变化是资源按依赖相反顺序释放；失败点是某插件 Close 失败导致后续插件可能未关闭。
+
+这是简单且可解释的实现。生产版本应收集所有 close errors，或定义“失败后是否继续关闭”的策略，不能让资源泄露成为隐式行为。
+
+## Registry 是插件边界，不是权限边界
+
+`Registry.Register` 检查空名和重复名：
+
+```go
+definition := tool.Definition()
+if definition.Name == "" { return errors.New("tool name cannot be empty") }
+if _, exists := r.tools[definition.Name]; exists {
+    return fmt.Errorf("tool %q is already registered", definition.Name)
+}
+r.tools[definition.Name] = tool
+```
+
+输入是 Tool；输出是成功或冲突 error；状态变化是 name 到 Tool 的映射增加；失败点是空名、重复名。nil registry 当前未检查，访问其 map 时可能 panic，而不是返回结构化 error；这是应由生产版 API 补上的前置校验。
+
+注册成功不表示模型可以绕过 Policy。Harness 仍应在 Tool 执行前做 schema、path、command 和审批检查。
+
+## 三种插件方案
+
+| 方案 | 优点 | 风险/代价 | 本示例选择 |
+| --- | --- | --- | --- |
+| 显式 interface 注册 | 简单、可测试、跨平台 | 没有自动发现 | 是 |
+| Go `plugin` | 看似动态加载 | 平台/版本限制，隔离弱 | 否 |
+| 独立进程协议 | 可隔离、可重启 | 需要协议、超时和进程管理 | MCP/外部服务可用 |
+
+Go 原生 `plugin` 不应该被当成 Node dynamic import 的直接替代。插件信任模型和故障边界比“是否动态”更重要。
+
+## Plugin、Hook、Event、Skill、MCP
+
+- Plugin：装配和生命周期单位，可以注册 Tool 或事件处理器。
+- Hook：某个流程点的拦截 callback，例如 before Tool/after Tool。
+- Event：已经发生或正在观察的事实通知。
+- Skill：按需加载的指令/资源，不天然执行函数。
+- MCP：跨进程/远程工具资源的协议。
+
+一个 Plugin 可以注册 Hook 或 MCP client，但它们不是同一个概念。把插件直接等同于权限审批会形成危险信任错误。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run TestSkillDiscoveryAndPluginRegistration
+go vet ./...
+```
+
+预期插件注册测试通过，vet 无输出。完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+demo 当前显式注册 `CalculatorTool`，不是从目录动态加载插件；预期仍是 calculator 5 和 final 5。
+
+## 测试设计
+
+至少覆盖：
+
+1. `Load(nil, registry)` 返回 `plugin cannot be nil`；
+2. Register 返回 error 时 manager 不记录插件；
+3. 两个插件注册同名 Tool 时第二个失败；
+4. Close 按加载逆序调用；
+5. Close error 是否阻止后续 close（记录当前策略）；
+6. Plugin 注册的 Tool 仍经过 Registry.Validate 和 Policy。
+
+当前 `TestSkillDiscoveryAndPluginRegistration` 用 `testPlugin` 注册 `countingTool`，验证 manager 后 Registry 能查到 `count`，再执行 Close。测试替身不加载真实动态库。
+
+建议为逆序 close 写一个 append order slice：
+
+```text
+Load A -> Load B -> Close B -> Close A
+```
+
+代码块的输入是插件序列，输出是 close 序列，状态变化是资源依赖逆序释放，失败点是中间 close error。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/extensions/loader.ts`：发现和加载扩展。
+- `packages/coding-agent/src/core/extensions/runner.ts`：Extension 生命周期、事件和 Tool hooks。
+- `packages/coding-agent/src/core/extensions/types.ts`：扩展接口、context 和 Tool definition。
+- `packages/agent/src/agent.ts`：运行期间的事件/queue 边界。
+
+Pi 使用运行时 TypeScript Extension；Go 示例选择显式 `Register`，保留“核心依赖接口、扩展负责装配”的设计思想，不声称 API 兼容。
+
+## Java 对照
+
+Java 侧的 `AgentPlugin`、`PluginManager` 和 `ServiceLoader` 对应 Go 的 Plugin interface 和显式 manager：
+
+| Go | Java |
+| --- | --- |
+| `Name()` | `name()` |
+| `Register(*Registry)` | `register(ToolRegistry)` |
+| `Close()` | `close()` |
+| 显式 `Load` | `ServiceLoader` 或显式 load |
+| error | exception |
+
+Java ServiceLoader 自动发现实现，但同样不提供 sandbox。Go 显式注册更容易控制依赖和交叉编译。
+
+## 实验：加入 review 插件
+
+### 目标
+
+注册一个只读 `review` Tool，不修改 AgentLoop。
+
+### 准备
+
+打开 `plugin.go`、`tool.go`、`agent_test.go`，准备一个 counting Tool。
+
+### 步骤
+
+1. 定义 `reviewPlugin`，实现 `Name`、`Register`、`Close`。
+2. 在 Register 中注册 ToolDefinition。
+3. 用 PluginManager.Load 装配。
+4. 断言 `Registry.Get("review")` 成功。
+5. 让 plugin 返回重复名，断言 Load 失败。
+6. 加载第二个插件，记录 Close 顺序。
+7. 让 Tool arguments 非法，确认 Registry gate 仍生效。
+
+### 观察点
+
+插件只负责把能力接入 registry；模型是否选择它由 definitions 决定；能否执行还要经过校验和权限。
+
+### 预期结果
+
+新增能力不需要改 Loop，失败可在装配阶段发现，Close 顺序可测试。
+
+### 思考题
+
+不可信插件是否应该在主进程运行？如果插件注册 shell Tool，Policy 的 owner 是插件还是 Harness？独立进程用 JSON-RPC 时，它更像 Plugin 还是 MCP server？
+
+## 小结与下一阶段
+
+Go 插件系统的最小可靠边界是 interface、显式 registry、加载错误和生命周期关闭。当前实现易测试、易部署，但插件与主进程同信任边界，没有隔离和自动发现。
+
+下一阶段实现 Skill discovery：把“扩展代码”与“按需加载的说明和资源”区分开，避免把所有技能全文塞入 system prompt。

@@ -9,76 +9,301 @@ description: "安装、认证、第一次 session 和常见 CLI 用法。"
 
 ## 中文导读
 
-安装、认证、第一次 session 和常见 CLI 用法。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+这是一条从安装到第一次可控 session 的操作路径，不是“安装完就把整个仓库交给模型”。先确认 Node/npm、Provider、工作目录和凭据边界，再从只读问题开始；这样每个失败都能定位到安装、认证、模型、cwd 或 Tool 执行层。
+
+本译文按源文档的标题和顺序展开。命令、路径、配置字段和 API 名称保持原样；中文说明补充“这一步改变了什么、下一步谁消费它、失败时看哪里”。Pi 的安全性还受当前源码、settings、extensions 和 project trust 影响，文档命令不会自动授予模型无限权限。
 
 ## 中文译文
 
-### 安装与卸载
+### 安装：先确认运行环境
 
-Pi 作为 npm package 分发。正常安装命令使用 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`；`--ignore-scripts` 会禁用依赖 lifecycle scripts，Pi 的普通 npm 安装不需要这些脚本。Linux/macOS 也可以运行 curl installer。卸载必须匹配安装方式：curl installer 和 npm 使用 `npm uninstall -g`，pnpm、Yarn、Bun 分别使用各自的 global remove 命令。
+Pi 以 npm package 分发。安装前确认 `node`、`npm` 和全局 PATH 属于同一套 Node 安装；否则可能出现 npm 报成功但终端找不到 `pi`。推荐的普通安装命令是：
 
-卸载只移除程序，不会清理 `~/.pi/agent/` 中的 settings、credentials、sessions 和已安装 packages。进入实际工作目录后运行 `pi`，不要在错误的父目录启动，否则 cwd 和可加载的项目资源都会改变。
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
 
-### 认证
+`-g` 把命令安装到全局目录，`--ignore-scripts` 禁止依赖 lifecycle scripts 在安装阶段执行。Pi 的普通 npm 安装不需要这些脚本，因此这个选项减少了安装期的隐式执行；它不是运行时沙箱，也不会禁止之后的 shell Tool。
 
-Subscription provider 在 Pi 中通过 `/login` 选择，例如 Claude Pro/Max、ChatGPT Plus/Pro（Codex）和 GitHub Copilot。API-key provider 可以在启动前设置 `ANTHROPIC_API_KEY` 等环境变量，也可以用 `/login` 将 key 保存到 `~/.pi/agent/auth.json`。认证方式、环境变量和 cloud provider 的细节应继续查看 Providers 页面；不要把 key 写进 project instructions 或提交到仓库。
+安装后先检查版本和帮助，而不是立即让模型改文件：
 
-### 第一次 session
+```bash
+node --version
+npm --version
+pi --help
+pi --version
+```
 
-第一次输入可以是“总结仓库并告诉我如何运行检查”。默认暴露给模型的四个工具是 `read`、`write`、`edit` 和 `bash`；`grep`、`find`、`ls` 等只读工具可以通过 tool options 开启。工具在当前 cwd 运行，write/edit/bash 可能修改本地文件，因此应先用 git checkpoint 或其他回滚办法。
+`pi --help` 主要验证可执行入口和参数解析，`pi --version` 验证 PATH 找到的确实是目标版本。若 `npm install` 成功但 `pi` 不存在，检查 npm 的 global prefix 是否在 PATH，优先修正环境，不要重复安装多个 Node 版本。
 
-### 项目指令与资源
+> 译者注：`--ignore-scripts` 只作用于 npm 安装生命周期；它既不影响模型生成，也不影响 Pi 运行时执行用户明确允许的 Tool。安装安全和运行安全是两条边界。
 
-在项目中创建 `AGENTS.md` 可以声明工作规则。Pi 还会读取 `~/.pi/agent/AGENTS.md`、父目录和当前目录的 `AGENTS.md` 或 `CLAUDE.md`；同目录的 `AGENTS.override.md` 会替代普通指令。修改这些文件后重启 Pi 或运行 `/reload`。这类 context files 与 project-local extensions、skills、prompts 的 trust 规则不同，不能只凭文件名推断加载结果。
+### 卸载：程序和数据是两件事
 
-### 常见操作
+卸载要使用安装 Pi 的同一个包管理器：
 
-在编辑器输入 `@` 可以模糊搜索文件，也可以用 `pi @README.md "Summarize this"` 传入文件；支持的终端还可粘贴或拖入图片。交互模式中的 `!command` 会把输出送进模型，`!!command` 只运行命令而不加入模型 Context。`/model`、`/thinking`、Shift+Tab 和模型选择器用于切换模型及 thinking level；`Ctrl+S` 的含义取决于当前选择器。
+```bash
+# curl installer 或 npm install -g
+npm uninstall -g @earendil-works/pi-coding-agent
 
-Session 会自动保存：`pi -c` 继续最近 session，`pi -r` 浏览旧 session，`--name` 设置显示名称，`--session` 打开指定路径或 id；交互中还可以使用 `/resume`、`/new`、`/tree`、`/fork` 和 `/clone`。一次性任务使用 `-p`，stdin 管道和 `@screenshot.png` 也可以作为输入；`--mode json` 输出事件，`--mode rpc` 用于进程集成。
+# pnpm
+pnpm remove -g @earendil-works/pi-coding-agent
 
-> 译者注：`!` 与 `!!` 的差异是“是否把结果加入下一次 Model Context”，不是“是否执行命令”。两者都应当遵守同一权限和 sandbox 边界。
+# Yarn
+yarn global remove @earendil-works/pi-coding-agent
 
-### 下一步
+# Bun
+bun uninstall -g @earendil-works/pi-coding-agent
+```
 
-完成第一轮后，按顺序阅读 Using Pi、Providers、Settings、Keybindings 和 Pi Packages；平台问题再查看 Windows、Termux、tmux、Terminal Setup 与 Shell Aliases。完整的 JSONL Session 结构见 Session Format。
+卸载程序不会删除 `~/.pi/agent/` 下的 settings、credentials、sessions 和已安装 Pi packages。保留数据便于重新安装后继续工作，但也意味着“卸载”不等于“清除凭据”。需要清理时，先备份要保留的 session，再逐项确认路径和文件权限；不要把未知目录交给递归删除命令。
 
-## 章节对照
+### 启动：cwd 决定项目上下文
 
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Quickstart | Quickstart |
-| Install | Install |
-| Uninstall | Uninstall |
-| curl installer or npm install -g | curl installer or npm install -g |
-| pnpm | pnpm |
-| Yarn | Yarn |
-| Bun | Bun |
-| Authenticate | Authenticate |
-| Option 1: subscription login | Option 1: subscription login |
-| Option 2: API key | Option 2: API key |
-| First session | First session |
-| Give pi project instructions | Give pi project instructions |
-| Project Instructions | Project Instructions |
-| Common things to try | Common things to try |
-| Reference files | Reference files |
-| Run shell commands | Run shell commands |
-| Switch models | Switch models |
-| Continue later | Continue later |
-| Non-interactive mode | Non-interactive mode |
-| Next steps | Next steps |
+进入目标项目目录，然后启动：
 
-## 使用建议
+```bash
+cd /path/to/project
+pi
+```
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+Pi 的当前工作目录（cwd）会影响相对路径、可发现的 `AGENTS.md`、skills、extensions 和 shell 命令。启动前可以执行：
 
-<Note>
+```bash
+pwd
+ls
+```
 
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+在 monorepo 根目录和某个子包目录启动，模型看到的项目指令和文件范围可能不同。`read("README.md")` 也会相对于 cwd 解析；如果模型说找不到文件，先检查 cwd，不要立刻改配置。
 
-</Note>
+### 认证选项一：subscription provider
+
+启动 Pi 后运行：
+
+```text
+/login
+```
+
+在选择器中选择 Provider。内置 subscription login 包括 Claude Pro/Max、ChatGPT Plus/Pro（Codex）和 GitHub Copilot。这里的 login 是 Provider 自己的认证流程，Agent Loop 仍然只收到统一的 model 能力，不应把 OAuth token 拼进 prompt。
+
+认证成功的最小验证是选择一个模型并发只读请求，例如“列出仓库顶层文件但不要修改”。如果登录选择器能打开但请求失败，分别检查 Provider、model、网络和权限，不要把所有错误都归因于 TUI。
+
+### 认证选项二：API key
+
+也可以在启动前通过环境变量提供 key：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+pi
+```
+
+另一种方式是执行 `/login`，选择 API-key provider，让 Pi 将 key 保存到 `~/.pi/agent/auth.json`。环境变量适合临时 shell，auth file 适合持久配置；两者都不应写入 `AGENTS.md`、源码、session 导出或 git。
+
+```bash
+printf '%s\n' "$ANTHROPIC_API_KEY" | wc -c
+```
+
+上面的检查只能确认变量是否存在，不能把值打印到日志。所有 Provider、环境变量和云厂商配置见 `providers.md` 对应的中文参考页。
+
+> 译者注：认证成功只说明 Provider 可以拿到凭据，不说明模型有权读取任意文件。凭据解析、工具权限和项目可信度是不同阶段。
+
+### 第一个 session：先理解默认工具
+
+Pi 启动后输入一条请求并按 Enter：
+
+```text
+Summarize this repository and tell me how to run its checks.
+```
+
+默认给模型的四个工具是：
+
+| Tool | 作用 | 典型副作用 |
+| --- | --- | --- |
+| `read` | 读取文件 | 通常只读，但可能暴露敏感内容 |
+| `write` | 创建或覆盖文件 | 写入文件 |
+| `edit` | 对文件打补丁 | 修改已有文件 |
+| `bash` | 执行 shell 命令 | 可能读写文件、联网或启动进程 |
+
+额外的只读工具 `grep`、`find`、`ls` 可以通过 tool options 开启。当前 Tool definitions 会告诉模型能调用什么，但模型返回 Tool Call 不等于执行成功；真正的校验、权限和执行由 Runtime 完成。
+
+Pi 在当前工作目录运行，`write`、`edit` 和 `bash` 可能改变文件。首次练习最好在临时 git 分支或可恢复目录中进行：
+
+```bash
+git status --short
+git switch -c pi-learning
+pi
+```
+
+这里的分支只是回滚手段，不是 Pi 的必需依赖。不要让测试 prompt 指向含有生产密钥的 home 目录。
+
+### 项目指令：让模型知道本仓库规则
+
+Pi 在启动时加载 context files。可以在项目中创建 `AGENTS.md`：
+
+```markdown
+# Project Instructions
+
+- Run `npm run check` after code changes.
+- Do not run production migrations locally.
+- Keep responses concise.
+```
+
+Pi 会加载全局 `~/.pi/agent/AGENTS.md`，以及父目录和当前目录中的 `AGENTS.md` 或 `CLAUDE.md`。如果某目录存在 `AGENTS.override.md`，该目录使用它替代 `AGENTS.md` 或 `CLAUDE.md`。
+
+修改 context file 后重启 Pi 或运行 `/reload`：
+
+```text
+/reload
+```
+
+不要把 `AGENTS.md` 当成安全策略。它是给模型和 Runtime 的上下文输入；真正的写文件、执行命令和网络权限仍需由 Tool 与宿主策略限制。优先在指令中写可验证规则（命令、目录、禁止项），不要写“请小心”这种无法测试的愿望。
+
+> 译者注：父目录指令会影响子项目，这解释了“我没有在当前目录写这条规则，模型为什么仍然遵守”。排查时要沿目录树检查加载来源，并用 `/reload` 确认新内容进入当前 session。
+
+### 常见操作一：引用文件
+
+在编辑器中输入 `@` 可模糊搜索文件，也可以从命令行显式传入：
+
+```bash
+pi @README.md "Summarize this"
+pi @src/app.ts @src/app.test.ts "Review these together"
+```
+
+命令行传入的文件会成为本次 prompt 的输入；它不是把文件永久写入 session 的独立数据库。文件内容仍可能很大或含有秘密，传入之前要审查路径。
+
+支持的终端可用 Ctrl+V 粘贴图片（Windows 是 Alt+V），也可把图片拖入终端。图片能力取决于终端协议和 Provider 的输入能力；终端能显示图片不等于模型能理解图片。
+
+### 常见操作二：运行 shell 命令
+
+交互模式输入：
+
+```text
+!npm run lint
+```
+
+命令输出会发送给模型。输入双感叹号：
+
+```text
+!!npm run lint
+```
+
+命令仍然执行，但输出不会加入模型 Context。两者的区别是上下文可见性，不是执行权限：它们都必须经过同一个宿主安全边界。
+
+一个适合教学的实验是先运行 `!!pwd`，再运行 `!pwd`，比较 UI 和下一轮模型请求中的差异。不要用 `!rm`、`!git push` 或带密钥的命令做第一次实验。
+
+### 常见操作三：切换 model 和 thinking
+
+使用 `/model` 或 Ctrl+L 选择当前 session 的 model。模型选择器中按 Ctrl+S，把高亮模型保存为启动默认值。使用 `/thinking` 选择 thinking level；该选择器中按 Ctrl+S 保存启动默认值。Shift+Tab 循环 thinking level，Ctrl+P / Shift+Ctrl+P 循环 scoped models。
+
+“当前 session 的模型”和“启动默认模型”不是同一个状态。只在当前任务临时切换时不要按保存键；选择器中的 Ctrl+S 含义取决于当前选择器，不能凭键名推断行为。
+
+### 常见操作四：稍后继续
+
+Session 会自动保存：
+
+```bash
+pi -c                  # 继续最近 session
+pi -r                  # 浏览以前的 sessions
+pi --name "my task"    # 启动时设置显示名称
+pi --session <path|id> # 打开指定 session
+```
+
+进入 Pi 后还可以使用 `/resume`、`/new`、`/tree`、`/fork` 和 `/clone` 管理 session。`/tree` 用于在已有消息树中导航，`/fork` 产生隔离分支；它们不是简单地复制一份 `List<Message>`，因为 session 还保存 parent、配置和元数据。
+
+### 非交互模式：把 Pi 接入脚本
+
+一次性 prompt 可以这样运行：
+
+```bash
+pi -p "Summarize this codebase"
+cat README.md | pi -p "Summarize this text"
+pi -p @screenshot.png "What's in this image?"
+```
+
+`--mode json` 输出 JSON event，适合日志或测试；`--mode rpc` 用于进程集成。非交互模式减少 TUI 参与，但不应绕过认证、Tool allowlist、cwd 和超时。管道输入也可能携带秘密，CI 日志必须脱敏。
+
+> 译者注：`-p` 表示一次 prompt，不代表“无状态”。如果 cwd、环境变量和 session 参数相同，运行仍可能读取本地资源；自动化脚本应显式设定工作目录和输出边界。
+
+### 下一步阅读
+
+完成第一次只读 session 后，按这个顺序继续：
+
+1. `usage.md`：交互模式、slash commands、session、context files 和 CLI 参考。
+2. `providers.md`：认证、环境变量、model metadata 和云 Provider。
+3. `settings.md`：全局与项目配置的优先级。
+4. `keybindings.md`：快捷键和自定义 action。
+5. `packages.md`：共享 extensions、skills、prompts 和 themes。
+
+平台差异再阅读 `windows.md`、`termux.md`、`tmux.md`、`terminal-setup.md` 和 `shell-aliases.md`。
+
+## 实验：完成一次安全的首次运行
+
+### 目标
+
+在不修改真实仓库、不泄露 key 的前提下，验证安装、认证、cwd、只读 Tool、session 恢复和 JSON event。
+
+### 准备
+
+创建临时目录并写入一个无敏感内容的 README：
+
+```bash
+sandbox=$(mktemp -d)
+printf '# Learning\ncheck: go test ./...\n' > "$sandbox/README.md"
+cd "$sandbox"
+```
+
+不要把真实 home、SSH key 或生产仓库作为实验目录。
+
+### 步骤
+
+1. 运行 `node --version`、`npm --version` 和 `pi --version`。
+2. 用 `/login` 或测试 Provider 完成认证；不把 key 打印出来。
+3. 输入“只读取 README，不要修改任何文件”。
+4. 用 `!!pwd` 验证命令执行，但不把输出放入 Context。
+5. 用 `@README.md` 请求摘要，比较显式文件输入和 `read` Tool。
+6. 退出后运行 `pi -c`，确认 session 可以继续。
+7. 在 shell 中运行 `pi -p "列出 README 的标题" --mode json`，把输出重定向到临时日志。
+8. 删除临时目录，检查 git 或当前工作区没有意外变更。
+
+### 观察点
+
+记录每一步的输入、是否需要模型请求、是否改变 session、是否产生文件副作用。特别区分 `!command` 和 `!!command` 的 Context 差异，以及 `/model` 临时选择和 Ctrl+S 保存默认值的差异。
+
+### 常见故障定位
+
+| 现象 | 先检查 | 不要先做什么 |
+| --- | --- | --- |
+| `pi: command not found` | global prefix、PATH、Node 版本 | 重复安装多个包管理器 |
+| 登录成功但请求失败 | Provider、model、网络、额度 | 把 key 写入 prompt |
+| 找不到项目文件 | `pwd`、cwd、文件权限 | 让模型猜绝对路径 |
+| 修改后规则不生效 | `/reload`、目录层级、override | 直接重启并丢失观察信息 |
+| TUI 按键异常 | terminal setup、tmux、能力检测 | 硬编码随机快捷键 |
+
+### 思考题
+
+1. 为什么卸载 Pi 后 credentials 仍然存在？如果要交接机器，应该分别清理什么？
+2. `!npm test` 和 `!!npm test` 都执行命令时，为什么模型下一轮看到的 Context 不同？
+3. `AGENTS.md` 能否替代 shell sandbox？为什么？
+4. 一次 `pi -p` 失败时，哪些状态可能已经持久化？怎样用 session 和日志回答这个问题？
+5. 你会为 CI 脚本选择交互模式、`--mode json` 还是 `--mode rpc`？请说明事件消费方。
+
+> 译者注：官方 Quickstart 的目标是让用户尽快开始，但工程学习应把“能够运行”与“能够解释状态和副作用”分开。后续教材会从 Agent Loop、Session 和 Harness 继续拆解。
+
+## 与 Go、Java 和 Pi 的对照
+
+| Quickstart 能力 | Pi 位置 | Go 示例 | Java 示例 |
+| --- | --- | --- | --- |
+| HTTP/Provider | `packages/ai/src/models.ts`、`packages/ai/src/api/` | `HTTPModel`、`context.Context` | `HttpModel`、`HttpClient` |
+| session | `AgentSession`、`SessionManager` | `Session` JSONL | `Session` JSONL + Jackson |
+| Tool | coding-agent tools | `Tool`、`Registry` | `Tool`、`ToolRegistry` |
+| cancellation | `AbortController`/signal | `context.Context` | `CancellationToken` + interruption |
+| JSON event | coding-agent modes | `Event` callback | `EventSink` listener |
+
+> 译者注：Pi 的 Quickstart 只展示用户入口；Go/Java 教学实现将 Provider、Loop、Tool、Session 分成可测试接口，目的不是复刻 UI，而是让每个状态转换都能被断言。
+
+## 小结
+
+安装解决的是可执行入口；认证解决的是 Provider 凭据；cwd 决定文件和项目上下文；Tool 负责真实副作用；session 负责稍后恢复；`--mode json`/`rpc` 负责程序集成。完成这几个边界实验后，再进入 `usage.md` 和 Agent Loop 源码会更容易。
 
 ## 完整原文对照
 

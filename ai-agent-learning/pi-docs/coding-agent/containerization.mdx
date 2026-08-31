@@ -13,27 +13,125 @@ description: "使用 Gondolin、Docker 或 OpenShell 运行 Coding Agent。"
 
 ## 中文译文
 
-Pi 默认以进程权限运行。要控制它能写哪些目录、能访问哪些资源，有两种边界：把整个 `pi` 放进隔离环境，或让宿主上的 `pi` 保留 UI/认证，只把 Tool 执行路由进隔离环境。Extension 运行在 `pi` 所在的位置；宿主上的其他自定义 Extension Tool 不会因为某个路由 Extension 而自动获得隔离。
+### 先确定隔离对象
 
-| 方案 | 隔离对象 | 适用场景 | 关键风险 |
+Pi 默认继承启动它的操作系统权限。要控制它能写哪些目录、能访问哪些网络和凭据，官方文档给出两种基本模式：
+
+1. 把整个 `pi` 进程放进隔离环境；
+2. 让宿主上的 `pi` 保留认证和 UI，只把工具执行路由进隔离环境。
+
+选择前先回答三个问题：模型 API key 在哪里解析？内置 Tool 在哪里执行？自定义 Extension 是否也会经过同一个边界？第三个问题最容易被忽略：Extension 总是在 `pi` 进程所在位置运行。宿主 Pi 配了 tool-routing extension，并不意味着另一个自定义 extension tool 自动进入 VM。
+
+| 方案 | 隔离对象 | 更适合 | 关键注意 |
 | --- | --- | --- | --- |
-| Gondolin Extension | 内置 Tools 和 `!` 命令 | 本地 micro-VM，认证留在宿主 | 仍需审查 Extension 和挂载目录 |
-| Plain Docker | 整个 `pi` 进程 | 简单本地容器 | API key 会进入容器 |
-| OpenShell | 整个 `pi` 进程 | 受策略控制的本地/远程 sandbox | 需要 active gateway |
+| Gondolin Extension | 内置 tools 与 `!` commands | 本地 micro-VM，同时让认证留宿主 | 必须审查 Extension 与 mount |
+| Plain Docker | 整个 `pi` process | 简单、可重复的本地容器 | Provider API key 进入 container |
+| OpenShell | 整个 `pi` process | 有 filesystem/process/network policy 的 sandbox | 必须有 active gateway |
 
-### Gondolin
+“在容器里”不是自动的安全证明。挂载宿主 cwd 会让容器内的写入直接修改宿主；挂载宿主 `~/.pi/agent` 会把 settings、sessions 和 auth 暴露给容器。隔离边界必须连同 volumes、network、credentials、资源限制一起审计。
 
-Gondolin 是本地 Linux micro-VM。复制 `packages/coding-agent/examples/extensions/gondolin` 到 `~/.pi/agent/extensions/gondolin`，安装依赖后从项目目录用 `pi -e` 启动。Extension 把宿主 cwd 挂载到 VM 的 `/workspace`，覆盖 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls`，并把用户的 `!` 命令也路由进去；`/workspace` 的改动会写回宿主。要求 Node.js >= 23.6.0 和 QEMU。VM 隔离的是工具执行，不是宿主上未经路由的 Extension 代码。
+### Gondolin：宿主 UI、VM 工具
 
-### Plain Docker
+Gondolin 是本地 Linux micro-VM。它适合让宿主 Pi 处理认证和交互，而把 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 与用户 `!` commands 路由到 VM。
 
-Dockerfile 使用 `node:24-bookworm-slim`，安装 `bash`、`ca-certificates`、`git`、`ripgrep`，再全局安装 Pi；容器内工作目录为 `/workspace`。运行时 `-v "$PWD:/workspace"` 会让容器对 `/workspace` 的写入直接影响宿主，`-v pi-agent-home:/root/.pi/agent` 则让 settings/session 保留在命名 volume。不要挂载宿主 `~/.pi/agent`，除非接受把宿主 credentials 和 sessions 暴露给容器。`-e ANTHROPIC_API_KEY` 的含义是显式把凭据传入容器，不能把“在容器里”误当成 secret isolation。
+安装示例：
 
-### OpenShell
+```bash
+cp -R packages/coding-agent/examples/extensions/gondolin ~/.pi/agent/extensions/gondolin
+cd ~/.pi/agent/extensions/gondolin
+npm install --ignore-scripts
+```
 
-OpenShell 通过 gateway 管理带 filesystem、process、network、credential 和 inference policy 的 sandbox。先用 `openshell gateway add <gateway-url> --name <name>` 注册并用 `gateway select` 选择，再用 `openshell sandbox create --name pi-sandbox --from pi -- pi` 运行。远程 gateway 不会把宿主项目 bind-mount 进去；应在 sandbox 内 clone，或使用 `sandbox upload/download` 传输文件。若配置 inference routing，sandbox 内可访问 `https://inference.local`，gateway 向上游注入 Provider credentials，Pi 则改用相应 OpenAI/Anthropic-compatible endpoint。
+从要挂载的项目启动：
 
-> 译者注：容器、micro-VM 和策略 sandbox 是执行边界，不是 prompt 中的一句“不要执行危险命令”。生产配置还要限制网络、资源、凭据和挂载，并审查每个 Extension。
+```bash
+cd /path/to/project
+pi -e ~/.pi/agent/extensions/gondolin
+```
+
+运行链路是：宿主 Pi 收到模型的 tool call，Extension 将调用转成 VM 请求，VM 内执行后返回结果，`/workspace` 的文件改动通过共享挂载写回宿主。这里的 `/workspace` 是一个文件边界，不是只读快照；要防止恶意或误操作修改宿主，必须把 mount 改成只读或再加 PermissionPolicy。
+
+要求是 Node.js >= 23.6.0（因为 `@earendil-works/gondolin` 的运行时要求）以及 QEMU。QEMU 的安装由平台 package manager 负责。VM 只隔离被路由的操作；没有被 extension 接管的工具和 extension code 仍在宿主运行。
+
+> 译者注：Gondolin 的核心价值不是“更换一个 Tool 名称”，而是把 effect boundary 放到另一个执行环境。Java 可以把它类比为一个受策略控制的外部 process，Go 则可以把 Tool interface 的 Execute 实现换成 RPC client；两者都不能只在 prompt 中承诺安全。
+
+### Plain Docker：整进程容器
+
+`Dockerfile.pi` 的每一行都有边界含义：
+
+```dockerfile
+FROM node:24-bookworm-slim
+
+RUN apt-get update \\
+  && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep \\
+  && rm -rf /var/lib/apt/lists/*
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+WORKDIR /workspace
+ENTRYPOINT ["pi"]
+```
+
+`node:24-bookworm-slim` 是运行时基线；安装 `git`、`ripgrep` 等是因为 Coding Agent 的工具会调用它们；`--ignore-scripts` 避免安装阶段执行依赖 lifecycle scripts；`WORKDIR` 决定相对路径；`ENTRYPOINT` 让容器启动时直接进入 Pi。
+
+构建和启动：
+
+```bash
+docker build -t pi-sandbox -f Dockerfile.pi .
+
+docker run --rm -it \\
+  -e ANTHROPIC_API_KEY \\
+  -v "$PWD:/workspace" \\
+  -v pi-agent-home:/root/.pi/agent \\
+  pi-sandbox
+```
+
+`-e ANTHROPIC_API_KEY` 是明确把环境变量传入 container，不能误称为 secret isolation。`$PWD` mount 让项目文件写穿；named volume 只保存容器自己的 settings/sessions。若换成 `-v "$HOME/.pi/agent:/root/.pi/agent"`，容器将读取宿主 credentials 和 sessions，通常扩大了信任范围。
+
+Docker 模式的测试顺序建议是：先使用没有 API key 的 `--help`，再用 fake endpoint；确认 `/workspace` 写权限和 network policy 后，最后才传真实 key。不要将 key 写入 Dockerfile、image layer、命令历史或 telemetry。
+
+### OpenShell：策略控制的 sandbox
+
+OpenShell 支持 filesystem、process、network、credential 和 inference 控制，sandbox 可以由本地 gateway（Docker、Podman、VM）或远程 Kubernetes gateway 提供。每个 sandbox 必须有 active gateway：
+
+```bash
+openshell gateway add <gateway-url> --name <name>
+openshell gateway select <name>
+openshell sandbox create --name pi-sandbox --from pi -- pi
+```
+
+在这个模式里整个 `pi` 进程在 sandbox 内运行，所以内置 tools、`!` commands 和 extension tools 都在 OpenShell 边界内。远程 gateway 不会把宿主项目自动 bind-mount；需要在 sandbox 内 clone，或传输文件：
+
+```bash
+openshell sandbox upload pi-sandbox ./repo /workspace
+openshell sandbox download pi-sandbox /workspace/repo ./repo-out
+```
+
+如果启用了 inference routing，代码可以调用 `https://inference.local`，gateway 负责向上游注入 Provider credentials。Pi 仍需配置匹配的 OpenAI-compatible 或 Anthropic-compatible endpoint。要明确记录：文件隔离、模型请求路由和凭据注入是三个不同策略。
+
+### 故障、安全与 Go/Java 对照
+
+| 事故 | 可能原因 | 检查 |
+| --- | --- | --- |
+| 文件没有写回宿主 | 远程 sandbox 没有 bind mount | 使用 upload/download 或正确 volume |
+| 容器拿到宿主 session | 挂载了 `~/.pi/agent` | 改用 named volume 和最小 credentials |
+| 自定义 tool 仍在宿主 | 只路由了内置 tool | 为每个 extension tool 单独审计 |
+| 模型请求失败 | gateway/endpoint/network policy | 先测 fake endpoint 与 DNS |
+| shell 仍能破坏项目 | workspace 可写且无 command policy | 加 allowlist、用户审批、readonly mount |
+
+Java 的 `ProcessBuilder` 或 Go 的 `exec.CommandContext` 只是启动进程，不等于 sandbox。真实系统还需要最小权限用户、CPU/内存/时间限制、网络 egress policy、secret redaction 和审计日志。
+
+### 实验
+
+1. 用 Docker `--help` 验证镜像入口，不传 key。
+2. 将 workspace 改为只读，观察 `write` 和 `edit` 的错误是否能清楚返回。
+3. 建立 named volume，确认 session 与宿主 auth 的边界。
+4. 为一个自定义 Extension Tool 写清楚它运行在宿主还是 sandbox。
+5. 模拟远程 OpenShell，把文件 upload 到 `/workspace`，在 host 检查 download 结果。
+6. 写一个 threat model：文件、shell、网络、凭据和 extension code 各自的 trust boundary 是什么？
+
+### 小结
+
+Gondolin、Docker 和 OpenShell 都能提供隔离，但隔离对象和凭据位置不同。决定安全性的不是方案名，而是 process、filesystem、network、credential、extension 和 mount 的完整组合。
 
 ## 章节对照
 

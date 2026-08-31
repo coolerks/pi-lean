@@ -5,10 +5,284 @@ description: "从 net/http 和 encoding/json 发出一次非流式模型请求�
 
 # Go 01：最小 LLM Client
 
-`HTTPModel.Complete` 只处理一次 OpenAI-compatible Chat Completions 请求：构造 JSON、设置 `Authorization` 和 `Content-Type`、绑定 `context.Context`、检查 HTTP 状态、解码 assistant message。它不负责 Tool 执行，也不把 Provider 错误伪装成最终回答。
+## 本阶段完成什么
 
-## 实验
+本阶段只做一次请求：把 `Message` 编码成 JSON，发送到一个 OpenAI-compatible Chat Completions endpoint，再把第一条 assistant message 解码回来。
 
-用 `httptest.Server` 返回成功、429、500、空 choices 和 malformed JSON；断言错误含状态但不含 API key。默认测试使用 `ScriptedModel`，真实 API 只通过环境变量配置。
+完成后你可以回答：
 
-对应代码：`examples/go-agent/internal/agent/model.go` 的 `Model`、`HTTPModel.Complete`。
+- HTTP body 中的 `model`、`messages` 和 `tools` 从哪里来？
+- `Authorization` header 由谁设置？
+- 429、500、坏 JSON 和空 `choices` 为什么都不能当作正常回答？
+- `context.Context` 如何终止一个正在等待的 HTTP 请求？
+
+## 本阶段不完成什么
+
+这里不解析 SSE，不执行 Tool，不重试，也不保存 Session。不要把一次 `Complete` 调用误称为 Agent；它还没有第二轮请求，也没有状态转移。
+
+## 前置知识
+
+需要知道 Go 的 `struct`、JSON tag、接口方法、`error` 返回值和 `httptest.Server`。不需要 API key：测试服务器会在本机返回固定响应。
+
+## 从调用者开始
+
+`Model` 是 Loop 依赖的最小接口：
+
+```go
+// internal/agent/model.go
+ type Model interface {
+    Complete(context.Context, Request) (Response, error)
+}
+```
+
+这里的 `context.Context` 是第一个参数，表示 deadline、取消信号和请求范围；`Request` 是已经组装好的内部消息；`Response` 是 provider-neutral 结果。接口让 `AgentLoop` 不必知道 HTTP client 的具体类型。
+
+当前代码的 `HTTPModel` 字段是：
+
+```go
+type HTTPModel struct {
+    Client  *http.Client
+    URL     string
+    APIKey  string
+    ModelID string
+}
+```
+
+`Client` 允许测试注入 `server.Client()`；为空时使用 `http.DefaultClient`。`URL` 是完整 endpoint，不由模型猜测；`APIKey` 只在运行时传入；`ModelID` 进入 JSON 的 `model` 字段。
+
+## 一次完整请求
+
+下面是 `HTTPModel.Complete` 的教学版骨架。它与当前 `model.go` 的控制顺序一致，省略了 `chatResponse` 结构的定义：
+
+```go
+func (m *HTTPModel) Complete(ctx context.Context, request Request) (Response, error) {
+    payload := m.payload(request, false)
+    body, err := json.Marshal(payload)
+    if err != nil {
+        return Response{}, err
+    }
+
+    req, err := http.NewRequestWithContext(
+        ctx, http.MethodPost, m.URL, bytes.NewReader(body),
+    )
+    if err != nil {
+        return Response{}, err
+    }
+    m.addHeaders(req)
+
+    client := m.Client
+    if client == nil {
+        client = http.DefaultClient
+    }
+    response, err := client.Do(req)
+    if err != nil {
+        return Response{}, err
+    }
+    defer response.Body.Close()
+
+    if response.StatusCode < 200 || response.StatusCode >= 300 {
+        message, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
+        return Response{}, fmt.Errorf(
+            "model request failed (%s): %s",
+            response.Status,
+            strings.TrimSpace(string(message)),
+        )
+    }
+
+    var decoded chatResponse
+    if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
+        return Response{}, fmt.Errorf("decode model response: %w", err)
+    }
+    return decoded.response()
+}
+```
+
+### 逐段解释
+
+1. `payload` 把内部 Request 转成 provider 的 JSON 形状；这一层是 adapter，不是 Loop。
+2. `json.Marshal` 失败时不能发送半截 body。当前字段通常可编码，但保留错误边界很重要。
+3. `NewRequestWithContext` 把取消信号连接到网络请求；只在函数里检查 Context，而不把它传给 `http.NewRequest`，取消就无法真正中止连接。
+4. `addHeaders` 设置 `Content-Type: application/json`，并在 API key 非空时设置 `Authorization: Bearer ...`。
+5. `client.Do` 返回网络错误时没有 HTTP response；应直接返回 error。
+6. `defer response.Body.Close()` 防止连接和 body 泄漏。
+7. 只有 2xx 才尝试解码成功结构；429/500 的 body 会被限制在 16 KiB，避免错误响应无限增长。
+8. `json.Decoder` 读取 response body；格式错误要保留原始错误上下文。
+9. `decoded.response()` 还要检查 `choices` 是否为空，再选择第一条结果。
+
+## 请求 JSON 的形状
+
+`payload` 将一条内部消息转成 Chat Completions 的消息数组：
+
+```go
+func (m *HTTPModel) payload(request Request, stream bool) map[string]any {
+    messages := make([]map[string]any, 0, len(request.Messages))
+    for _, message := range request.Messages {
+        entry := map[string]any{
+            "role": string(message.Role),
+            "content": message.Content,
+        }
+        if message.ToolCallID != "" {
+            entry["tool_call_id"] = message.ToolCallID
+        }
+        if message.ToolName != "" {
+            entry["name"] = message.ToolName
+        }
+        messages = append(messages, entry)
+    }
+    payload := map[string]any{
+        "model": m.ModelID,
+        "messages": messages,
+    }
+    if stream {
+        payload["stream"] = true
+    }
+    return payload
+}
+```
+
+这段最小片段没有包含 Tool Calls 的序列化；完整代码还会把 assistant 的 `ToolCalls` 编成 `tool_calls` 数组。注意 `map[string]any` 是动态 JSON 组装边界，不代表项目到处都该用 `any`。
+
+## 响应与错误
+
+当前响应只取第一条 choice：
+
+```go
+func (r chatResponse) response() (Response, error) {
+    if len(r.Choices) == 0 {
+        return Response{}, errors.New("model response has no choices")
+    }
+    choice := r.Choices[0]
+    return Response{
+        Message: Message{
+            Role: RoleAssistant,
+            Content: choice.Message.Content,
+            ToolCalls: convertCalls(choice.Message.ToolCalls),
+            Timestamp: time.Now(),
+        },
+        StopReason: choice.FinishReason,
+        Usage: Usage{
+            InputTokens: r.Usage.PromptTokens,
+            OutputTokens: r.Usage.CompletionTokens,
+            TotalTokens: r.Usage.TotalTokens,
+        },
+    }, nil
+}
+```
+
+`stop_reason` 和 `usage` 是控制/诊断字段，不应拼进 assistant 文本。空 `choices` 常见于代理或错误 mock；如果返回一个空 `Response`，上层会把“没有回答”误认为正常结束。
+
+## 失败 trace：429 与超时
+
+429 的处理顺序应该是：
+
+```text
+HTTP 429
+ -> 读取有限错误 body
+ -> 返回 model request failed (429 ...)
+ -> 本阶段不重试
+```
+
+重试属于 Go 07；本阶段先让错误可见，避免把“请求失败”和“模型回答了错误文本”混为一谈。
+
+超时的 trace 是：
+
+```text
+context.WithTimeout
+ -> NewRequestWithContext
+ -> client.Do 等待
+ -> deadline exceeded
+ -> return error
+```
+
+调用者可以这样设置超时：
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+response, err := model.Complete(ctx, request)
+```
+
+如果服务在 2 秒内没有返回，`http.Client` 会收到取消信号。这个取消不是杀死 goroutine；底层 transport 和调用方都必须正确响应。
+
+## 测试：为什么使用 fake HTTP server
+
+`model_test.go` 的 `TestHTTPModelCompleteAndStream` 使用 `httptest.NewServer`。handler 断言：
+
+1. header 是 `Bearer test-key`。
+2. body 是 JSON，并包含 user message。
+3. 非 stream 请求返回 assistant `hello`、finish reason 和 usage。
+4. 同一个 model 的 stream 分支另行返回 SSE。
+
+测试 server 比真实 provider 更好，因为它不收费、可重复、能精确控制坏响应。真实 provider 的认证、限流和模型版本不应该成为单元测试前置条件。
+
+还要读 `TestHTTPModelRejectsResponseWithoutChoices`：它返回 `{"choices":[]}`，断言错误含 `no choices`。这个测试保护的是响应契约，不是业务文案。
+
+## 运行方式
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run TestHTTPModel
+go test ./...
+go vet ./...
+```
+
+本阶段预期看到 HTTP tests `ok`。完整 demo 要到 Go 04/15 才有意义；如果现在运行 `go run ./cmd/agent --demo`，它会同时走后续阶段已经写好的 Tool 和 Harness。
+
+## 与 Pi 对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/ai/src/types.ts` 的 `Context`、`AssistantMessage`、`Usage` 是更丰富的 provider-neutral 类型。
+- `packages/ai/src/models.ts` 的 model/provider dispatch 对应这里 `Model` 与 `HTTPModel` 的边界。
+- `packages/ai/src/api/openai-completions.ts` 处理具体 provider payload，而不是让 Loop 直接拼原始 JSON。
+- `packages/ai/src/utils/provider-retry.ts` 说明 retry 应位于 provider 请求边界，而不是散落在 Tool 中。
+
+这里的代码只覆盖 OpenAI-compatible 形状；Pi 还要处理 Anthropic、Google、Responses API、thinking block、图片和更完整的 stream event。
+
+## Java 对照
+
+Go 的 `context.Context` 类似 Java 调用链中的 cancellation token 加 `HttpClient.send` 的超时设置；两者都表达取消意图，不保证远端已经停止计费。
+
+| Go | Java 21 | 责任 |
+| --- | --- | --- |
+| `http.NewRequestWithContext` | `HttpRequest` + timeout | 绑定请求和取消 |
+| `json.Marshal` | Jackson `ObjectMapper` | 编码 body |
+| `http.Client.Do` | `HttpClient.send` | 发 HTTP |
+| `json.Decoder` | `readTree`/`treeToValue` | 解码 |
+| `error` | checked/unchecked exception | 传播失败 |
+
+Go 的 `interface` 是隐式满足；Java 的 `Model` 需要 `implements`。两种语言都应该让测试 fake 实现同一个 Model 边界，而不是 mock 每个 HTTP 内部调用。
+
+## 实验：观察一次真实 JSON
+
+### 目标
+
+确认 Message 到 HTTP body 的映射，以及失败状态不会产生伪造 assistant 文本。
+
+### 准备
+
+打开 `model.go` 和 `model_test.go`，运行 `go test ./... -run TestHTTPModel`。
+
+### 步骤
+
+1. 在 fake handler 中打印请求 method、URL、headers 和 body。
+2. 把响应 status 改成 429，确认 `Complete` 返回 error。
+3. 把响应改成 `{"choices":[]}`，确认触发 no-choices error。
+4. 用 `context.WithTimeout` 和一个阻塞 handler 测试 deadline。
+5. 删除 `defer response.Body.Close()`，用连接/资源检查说明它为何必须存在。
+
+### 观察点
+
+HTTP status 是 transport 层事实；JSON 中的 finish reason 是模型协议事实；assistant content 才是展示文本。三者不能互换。
+
+### 预期结果
+
+成功响应得到 `Message{Role: RoleAssistant, Content: "hello"}`；错误响应得到 Go error，API key 不出现在错误字符串中。
+
+### 思考题
+
+如果 provider 返回 200 但 body 是 HTML，应该把它当最终答案吗？为什么把 retry 放在 `HTTPModel` 或 Loop 其中一层会影响 telemetry 和错误语义？
+
+## 小结与下一阶段
+
+Go 01 建立了唯一的模型边界：`Model.Complete(ctx, request)`。它负责一次请求的 HTTP、JSON、认证、状态和响应契约，不负责循环。下一阶段把同一 endpoint 的 `stream: true` 改成 SSE 消费，并区分“TCP chunk”“SSE data 行”和“语义 delta”。

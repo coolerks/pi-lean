@@ -1,12 +1,256 @@
 ---
-title: "Go 13：Skill Discovery"
-description: "只在启动时暴露 metadata，按需读取 SKILL.md。"
+title: "Go 13：Skill Discovery 与 Progressive Disclosure"
+description: "扫描 SKILL.md metadata，按需读取正文，并建立安全的技能资源边界。"
 ---
 
-# Go 13：Skill Discovery
+# Go 13：Skill Discovery 与 Progressive Disclosure
 
-`DiscoverSkills` 扫描目录并解析 `name`、`description`、`path`；系统提示只放短 metadata，模型需要时再由 read/资源工具获取完整内容。这是 progressive disclosure，能避免 50 个 Skill 全文占满 context。
+## 学习目标
 
-## 实验
+完成本阶段后，你应该能够：
 
-加入缺 name、重复 name、路径越界和带脚本 Skill，定义拒绝或告警策略；不要因为 Skill 是文本就默认可信。
+- 解释 Skill 与 Tool、Plugin、MCP、System Prompt 的差别。
+- 读懂 `DiscoverSkills`、`ReadSkill` 和 frontmatter parser。
+- 说明为什么启动时只放 name/description，而不是所有正文。
+- 测试缺失字段、未闭合 frontmatter 和资源安全问题。
+- 设计按需加载但不默认信任的 Skill 系统。
+
+## 输入、增加的能力与明确不做什么
+
+输入是一个包含 `SKILL.md` 的本地目录。本阶段新增 metadata discovery、Skill 结构和按需正文读取。
+
+本阶段不执行 Skill 中的脚本，不自动把正文当成 system prompt，不实现 YAML 完整规范，也不提供目录隔离。`ReadSkill` 只读 path；调用方仍需做路径权限、内容大小、脚本审批和 prompt injection 处理。
+
+## 前置 Go 知识
+
+需要掌握：
+
+- `filepath.WalkDir` 遍历目录；
+- `os.ReadFile` 读取文件；
+- `bufio.Scanner` 按行解析；
+- `strings.Cut` 拆分 key/value；
+- error wrapping 追加路径上下文。
+
+## 问题场景：把 50 个 Skill 全文塞入 prompt
+
+假设：
+
+```text
+50 个 Skill × 每个 2000 token = 100000 token
+```
+
+启动时把全部正文写入 system prompt 会导致：
+
+- 大量 token 成本和更小的有效 Context Window；
+- 模型注意力被不相关说明占用；
+- 恶意 Skill 可以在每次请求中注入指令；
+- 修改一个 Skill 需要重新构造全部上下文。
+
+progressive disclosure 的做法是：先发布短目录，模型判断需要后，再读取一个 Skill 的正文和资源。
+
+## Skill 的领域模型
+
+```go
+type Skill struct {
+    Name        string
+    Description string
+    Path        string
+}
+```
+
+输入是 frontmatter 和文件路径；输出是 metadata；状态变化是 discovery 结果进入 Harness 的 Skill registry；失败点是 name/description 缺失、路径错误或 metadata 解析失败。
+
+`Path` 是内部资源定位，不是给模型的任意 shell 参数。若把它直接交给不受控的 `read`，需要先确认它落在允许的 skills root。
+
+## DiscoverSkills：只加载 metadata
+
+```go
+func DiscoverSkills(root string) ([]Skill, error) {
+    var skills []Skill
+    err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+        if walkErr != nil { return walkErr }
+        if entry.IsDir() || entry.Name() != "SKILL.md" { return nil }
+        content, err := os.ReadFile(path)
+        if err != nil { return err }
+        name, description, err := parseSkillFrontmatter(string(content))
+        if err != nil { return fmt.Errorf("%s: %w", path, err) }
+        skills = append(skills, Skill{Name: name, Description: description, Path: path})
+        return nil
+    })
+    return skills, err
+}
+```
+
+输入是 skills root；输出是 `[]Skill` 或包含路径的 error；状态变化是内存列表增加；失败点是目录权限、坏 frontmatter、文件读取失败。
+
+当前实现遍历所有子目录，但没有排序、重复 name 检查、符号链接策略和大小上限。生产实现必须定义这些行为，否则同名 Skill 的选择会依赖文件系统顺序。
+
+## parseSkillFrontmatter：一个有意简化的 parser
+
+```go
+scanner := bufio.NewScanner(strings.NewReader(content))
+if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "---" {
+    return "", "", fmt.Errorf("missing frontmatter")
+}
+values := map[string]string{}
+closed := false
+for scanner.Scan() {
+    line := strings.TrimSpace(scanner.Text())
+    if line == "---" { closed = true; break }
+    key, value, ok := strings.Cut(line, ":")
+    if ok { values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), "\"'") }
+}
+if !closed { return "", "", fmt.Errorf("unterminated frontmatter") }
+if values["name"] == "" || values["description"] == "" {
+    return "", "", fmt.Errorf("frontmatter requires name and description")
+}
+return values["name"], values["description"], nil
+```
+
+输入是文件文本；输出是两个必填字符串；状态变化无；失败点是首行不是 `---`、没有结束标记、缺字段。
+
+它不是完整 YAML parser：嵌套对象、冒号、列表、多行 scalar 和类型都没有完整支持。教学代码故意让 metadata 边界显而易懂，生产系统应使用受限 schema 或可信 parser。
+
+## ReadSkill：第二阶段加载
+
+```go
+func ReadSkill(skill Skill) (string, error) {
+    content, err := os.ReadFile(skill.Path)
+    if err != nil { return "", err }
+    return string(content), nil
+}
+```
+
+输入是已发现的 Skill；输出是完整文本或 read error；状态变化是调用方 context 增加正文；失败点是文件被删除、路径越界、内容过大或正文包含恶意指令。
+
+`ReadSkill` 没有检查 `skill.Path` 是否仍在 root 内，也没有大小上限。这是明确的教学缺口，不能把 discovery 成功解释成安全加载。
+
+## Skill、Tool、Plugin、MCP 的区别
+
+| 对象 | 模型看到什么 | 谁产生副作用 |
+| --- | --- | --- |
+| Skill | metadata/按需文本 | Tool 或脚本运行时 |
+| Tool | definition + arguments schema | Tool executor |
+| Plugin | 代码注册/生命周期 | 主进程或隔离进程 |
+| MCP | 远端 tool/resource protocol | MCP server |
+
+Skill 可以教模型如何使用 `read`；它不能仅凭文本让 Runtime 获得 write 权限。一个 Plugin 可以发现 Skill，一个 MCP server 也可以提供资源，但这些组合关系不改变边界。
+
+## 安全边界
+
+至少检查：
+
+1. skills root 是否可信；
+2. Skill name 是否唯一、是否包含路径分隔符；
+3. `Path` 是否在 root 内；
+4. metadata 和正文是否有大小上限；
+5. Skill 引用的脚本是否需要审批；
+6. 正文是否可能覆盖更高优先级 system/policy；
+7. 资源是否要脱敏；
+8. 加载事件是否写入 telemetry。
+
+这套 Go 示例只做必填 metadata 检查。PermissionPolicy 保护 workspace 工具，不自动保护 skills root 和 prompt 内容。
+
+## 运行命令与预期结果
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run TestSkillDiscoveryAndPluginRegistration
+go vet ./...
+```
+
+预期测试通过，vet 无输出。完整 demo：
+
+```bash
+go run ./cmd/agent --demo
+```
+
+demo 不自动发现 Skill；它只演示 Harness 和 calculator。Skill discovery 需要在测试或你自己的调用方中显式执行。
+
+## 测试设计
+
+当前 `TestSkillDiscoveryAndPluginRegistration` 创建临时 `review/SKILL.md`：
+
+```text
+---
+name: review
+description: review code
+---
+# Details
+```
+
+断言 `DiscoverSkills` 得到一个 name 为 review 的 Skill。测试不读取真实 home，也不执行 Skill 脚本。
+
+补充测试应覆盖：
+
+- 缺少首行 marker；
+- 没有第二个 `---`；
+- 缺 name；
+- 缺 description；
+- 多个 Skill 同名；
+- 非 UTF-8 或超长文件；
+- Skill 路径在允许 root 之外；
+- `ReadSkill` 文件被删除；
+- 正文只作为数据传给后续模型，不自动执行。
+
+每个测试都应说明输入、返回值和是否发生文件读取/执行。尤其要断言坏 metadata 不会出现在 system prompt。
+
+## 与 Pi 源码对照
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+- `packages/coding-agent/src/core/skills.ts`：`loadSkillsFromDir`、`formatSkillsForPrompt`、`loadSkills`。
+- `packages/coding-agent/src/core/resource-loader.ts`：资源目录和项目上下文加载。
+- `packages/coding-agent/src/core/system-prompt.ts`：将可用能力描述组装进 system prompt。
+- `packages/coding-agent/docs/skills.md`：Skill、`SKILL.md` 和调用方式。
+
+Pi 的 Skill loader 还涉及 frontmatter、资源和命令环境；Go 版本保留 discovery + read 两个关键边界，不声称协议兼容。
+
+## Java 对照
+
+| Go | Java |
+| --- | --- |
+| `filepath.WalkDir` | `Files.walk` |
+| `bufio.Scanner` | `BufferedReader` |
+| `strings.Cut` | `indexOf`/substring 或 YAML parser |
+| `Skill` struct | `record Skill` |
+| `ReadSkill` | `Files.readString` |
+
+Go 版本默认显式返回 error；Java 版本的 `SkillDiscovery` 抛出带路径信息的异常。两者都应该让 metadata discovery 与正文加载分开。
+
+## 实验：用 token 预算比较两种加载策略
+
+### 目标
+
+量化 progressive disclosure 对 Context Window 的影响，并检查 Skill 文本不是权限。
+
+### 准备
+
+创建 50 个临时 Skill，每个正文约 2000 token 的估算文本；只使用 `DiscoverSkills`，不要执行脚本。
+
+### 步骤
+
+1. 只统计 name + description 的字节/token 估算。
+2. 再读取所有正文并统计总量。
+3. 比较启动 prompt 的成本。
+4. 选一个 Skill 调用 `ReadSkill`。
+5. 对正文中的“请执行危险命令”做字符串检查。
+6. 证明 Policy 仍然在 Tool 执行前生效。
+
+### 观察点
+
+metadata 目录很小，正文成本按需产生；正文可以包含指令，但不能绕过 Tool Registry 和 PermissionPolicy。
+
+### 预期结果
+
+只在需要时读取正文，默认 Context 更小；任何 shell/write 行为仍需工具和权限层批准。
+
+### 思考题
+
+同名 Skill 应该拒绝还是按优先级覆盖？Skill 版本如何固定？如果 Skill 引用一个脚本，应该当作 Tool、Plugin 还是不可信资源？
+
+## 小结与下一阶段
+
+Skill 是渐进加载的工作方法和资源集合。Go 版本把 discovery、frontmatter、按需读取和错误边界拆开，但没有自动脚本执行、完整 YAML、安全隔离或版本锁定。
+
+下一阶段从 newline-delimited JSON-RPC 开始实现最小 MCP client，学习远端 Tool 如何进入本地 Registry。

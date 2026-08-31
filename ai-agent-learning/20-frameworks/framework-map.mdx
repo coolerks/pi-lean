@@ -1,31 +1,369 @@
 ---
-title: "最后再看 Agent Framework"
-description: "用已掌握的 Harness 分层阅读主流框架，而不是背 API。"
+title: "框架地图：它替你隐藏了哪一层"
+description: "完成底层实现后，用统一问题拆解 Spring AI、LangChain4j、LangChain、LangGraph、Eino、Google ADK 和 OpenAI Agents SDK。"
 ---
 
-# 最后再看 Agent Framework
+# 框架地图：它替你隐藏了哪一层
 
-只有完成 Go/Java 基础实现后，再看 Spring AI、LangChain4j、LangChain、LangGraph、Eino、Google ADK、OpenAI Agents SDK 等活跃项目。版本和功能变化很快，阅读时以项目当前官方文档为准。
+这一页放在 Go/Java 实现之后。目的不是教你调用某个框架的 API，而是训练一种反向阅读能力：当代码写成 `agent.invoke()`、`graph.invoke()` 或 `runner.run()` 时，你要能追问它里面是否包含 Model adapter、Context、Tool executor、状态机、持久化、MCP、RAG 和 Telemetry。
 
-## 统一提问
+框架版本变化很快。下文只建立概念映射，不把产品宣传当成实现事实；真正选型时，应打开对应版本的官方文档、源码和测试。
+
+## 学习目标
+
+完成本页后，你应该能够：
+
+1. 用本课程的 Harness 分层阅读任意 Agent Framework。
+2. 区分框架明确提供的能力、可选集成和仍由应用负责的部分。
+3. 解释“支持 memory”不一定等于 durable Session，“支持 tool”不一定等于安全执行。
+4. 为同一任务设计一个小验证实验，检查框架是否支持恢复、取消、重试和幂等。
+5. 根据团队语言、部署方式、数据边界和可审计要求做出可解释的选择。
+
+## 统一坐标系
+
+先固定我们要比较的 Harness 模块：
 
 ```text
-它替我实现了哪一层？
-Tool abstraction / model adapter / memory / agent loop / workflow
-MCP / RAG / observability / persistence / permissions
-哪些边界仍由我的应用负责？
+P  ModelProvider / ModelRegistry
+C  PromptBuilder / ContextManager
+S  MessageStore / SessionManager
+T  ToolRegistry / ToolExecutor
+L  AgentLoop / workflow state machine
+Q  Queue / steering / follow-up / cancellation
+R  RetryPolicy / budget / termination
+A  Permission / approval / sandbox
+K  Compaction / memory / retrieval
+X  Plugin / extension / lifecycle
+M  MCP client / server integration
+O  EventBus / Telemetry / tracing
+G  Configuration / CLI / deployment
 ```
 
-## 典型映射
+“框架提供 P”可能只表示它封装了 HTTP client；“框架提供 S”可能只表示内存 history；“框架提供 A”可能只是一个 callback。必须再问数据在哪里、谁拥有状态、进程重启会发生什么。
 
-| 能力 | 框架常见提供物 | 仍需自己判断 |
+## 从一条请求开始
+
+所有框架都可以先还原成这个问题：
+
+```text
+user prompt
+  -> configuration resolves model and tools
+  -> context/prompt is assembled
+  -> provider returns text or ToolCall
+  -> schema and permission are checked
+  -> executor performs effect
+  -> ToolResult becomes next context
+  -> loop continues or terminates
+  -> state/event/persistence is updated
+```
+
+失败 trace 更有价值：
+
+```text
+ToolCall(edit) generated
+  -> process crashes after file write
+  -> framework restarts
+  -> does it know intent/result/terminal?
+  -> if not, it cannot prove whether edit is safe to repeat
+```
+
+如果文档只展示 happy path，就不能据此宣称框架解决了 crash recovery。
+
+## 能力映射总表
+
+| Harness 能力 | 常见框架抽象 | 需要继续验证 |
 | --- | --- | --- |
-| Model | client、message、stream adapter | provider 兼容、重试、成本、取消 |
-| Tool | schema 注解/registry | 参数和权限、幂等、并行依赖 |
-| Loop | agent executor/graph | 终止、max steps、错误和恢复 |
-| Workflow | graph/state machine | durable state、版本、重放 |
-| Memory | history/vector store | 数据边界、隐私、压缩、召回评估 |
-| MCP/RAG | connector/retriever | trust、租户过滤、结果注入 |
-| Observability | callback/tracing integration | 脱敏、采样、成本归因 |
+| P Provider | Chat model、client、model bean | API 适配、认证、usage、流、重试 |
+| C Context | prompt template、messages、state | 输入优先级、裁剪、敏感数据、token 预算 |
+| S Session | memory、checkpoint、thread | durable backend、版本、分支、恢复点 |
+| T Tool | function/tool schema、注解、registry | schema runtime gate、权限、超时、幂等 |
+| L Loop | agent executor、graph、runner | max steps、终止、错误、重放 |
+| Q Queue | event、interrupt、human input | turn 边界、并发、abort 与 steering 区别 |
+| R Retry | retry middleware、policy | 429 与副作用错误是否分开 |
+| A Permission | approval callback、guard | OS sandbox、网络、路径、secret |
+| K Context memory | summary、vector store、retriever | memory 与 session 的边界、召回质量 |
+| X Plugin | component、callback、middleware | 发现、版本、隔离、生命周期 |
+| M MCP | connector、tool provider、server | initialize、capability、transport、权限 |
+| O Observability | callback、tracer、metrics | prompt 脱敏、cost、关联 id、采样 |
+| G Config/UI | application config、server/CLI | 配置优先级、部署、租户隔离 |
 
-框架减少样板，不会自动知道你的生产权限、数据保留或副作用语义。
+这个表是问题清单，不是能力认证表。只有读到官方实现和测试，才能把“已提供”改成具体结论。
+
+## Spring AI
+
+### 它通常解决什么
+
+Spring AI 面向 Java/Spring 应用提供模型、消息、tool calling、流式响应和 Spring 生态集成。它适合把 ModelProvider、配置和应用生命周期接入已有 Spring Boot 系统。Tool 的 bean、函数或注解形式可以减少手写 JSON schema 和 HTTP adapter 的样板。
+
+### 不要自动推出什么
+
+“有 `@Tool`”不等于执行一定经过生产权限层；“有 chat memory”不等于重启后能恢复完整 session tree；“有 observation”不等于 prompt 和 tool output 已安全脱敏。数据库事务、跨进程 single writer、外部 API 幂等和 sandbox 仍需应用设计。
+
+### 对 Harness 的映射
+
+```text
+P: ChatClient/model integrations
+C: prompt template + messages
+T: tool/function calling
+O: Spring observation integration
+G: beans/properties/Boot lifecycle
+S/L/A/K/X: 取决于具体模块和应用配置，不能只看 starter 名称
+```
+
+### 验证实验
+
+让一个 Tool 在调用外部 HTTP 服务后故意抛异常，并模拟进程重启。检查：请求是否有 operation id、重启是否重复 HTTP effect、memory 是否保存工具结果、trace 是否记录 secret。再把同一个 Tool 配成 deny policy，确认拒绝发生在执行前而不是执行后。
+
+## LangChain4j
+
+### 它通常解决什么
+
+LangChain4j 用 Java interface、模型集成、AiServices、tools、memory、retrieval 和 agent 相关抽象连接 Java 应用。它对 Java 开发者的价值是把 `Tool`、chat memory、embedding store 等部件组合成熟悉的类型和 builder。
+
+### 关键追问
+
+需要检查 AiServices 的调用到底是一次模型请求，还是包含多轮 tool loop；memory 是内存对象、持久化 store 还是仅由应用注入；tool exception 是返回给模型、抛给调用者还是由 retry middleware 处理；并行 tool 是否保持 source order；取消是否到达 HTTP client 和工具线程。
+
+### 对 Harness 的映射
+
+```text
+P: ChatLanguageModel / streaming model integrations
+C: system/user messages + memory + prompt templates
+T/L: tools + AI service/agent orchestration
+K: embedding/retrieval integrations
+M: MCP integrations（以当前版本文档为准）
+O: listeners/instrumentation
+S/A/X: 仍需由应用选择 backend、权限和插件隔离
+```
+
+### 验证实验
+
+定义一个 `edit` Tool 和一个只读 `read` Tool。记录每次模型请求、tool call、tool result 和线程 id；在 `edit` 执行前让 approval 拒绝。然后令模型连续返回两个 tool call，再比较并行配置下 result 的消息顺序。最后杀掉进程，确认 memory 是否能恢复到明确边界。
+
+## LangChain
+
+这里的 LangChain 指其 Python/JavaScript 生态中的 model、messages、tools、retrievers、agents 和 runnable 抽象，不把某一个版本 API 当成永久接口。
+
+### 它通常解决什么
+
+LangChain 提供模型/消息统一抽象、tool schema、agent 创建器、retriever、prompt template、middleware/callback 和生态集成。它可以替 P、C、T 的大量协议胶水，并让 RAG、MCP 或 tracing 接入更快。
+
+### 不能从高层调用推出什么
+
+`create_agent` 或类似 helper 的 loop 终止条件、tool exception 语义、并行策略和消息投影都必须通过文档与源码确认。Retriever 返回的文字不是权限证明；memory 的实现可能只是对话历史；callback 事件可能是 observed 而非 persisted。Python/JavaScript 的 async cancellation 也不自动取消已经发送的远端请求。
+
+### 对 Harness 的映射
+
+```text
+P/C/T: model, messages, prompt, tool abstractions
+L/R/Q: agent middleware/executor，具体行为依版本
+K: retriever/vector store
+M: MCP integration
+O: callbacks/tracing integrations
+S/A/G: backend、授权、租户和 durable recovery 多由应用决定
+```
+
+### 验证实验
+
+建立 `ScriptedModel` 或 fake chat model，第一轮返回 unknown tool，第二轮返回 final；断言 loop 是抛异常还是生成 controlled ToolResult。再用 context overflow 和 max step 进行故障注入，检查是否有无限 retry。对 retriever 注入另一个租户的相同关键词，确认 metadata filter 在模型看到结果前执行。
+
+## LangGraph
+
+### 它通常解决什么
+
+LangGraph 把 Agent 工作流表达为 graph/state machine，节点读取 state、执行工作并返回 state update。它更接近 Harness 的 L 层和显式状态编排，而不只是一个“自动调用工具”的 helper。持久化、interrupt、human-in-the-loop 和 checkpoint 等能力需要结合当前版本 backend 验证。
+
+### 它改变了什么
+
+在普通 Agent Loop 中，下一步常由模型决定；在 graph 中，边和节点可以把流程、人工审批、重试和回退写成结构。这样更容易画出状态，但 graph checkpoint 仍不自动等于外部 effect 的 exactly-once。节点在 checkpoint 前已发送邮件时，恢复仍需 operation id 和幂等策略。
+
+### 对 Harness 的映射
+
+```text
+L: graph nodes/edges/state transitions
+S: checkpoint/thread persistence
+Q: interrupt/resume/human input
+R: retry policy or node retry
+C/T: node state and tools
+A: application guards/approval
+O: streaming/events/tracing
+P/K/M: integrations or application components
+```
+
+### 验证实验
+
+画一个 `read → approve → edit → test` graph。在 approve 节点暂停，重启后只恢复到该节点。再在 edit 节点 effect 后、checkpoint 前注入 crash；如果只能从节点开头重跑，必须给 edit 增加 idempotency key 或 reconciliation，而不是把 checkpoint 名称当作事务证明。
+
+## Eino
+
+### 它通常解决什么
+
+Eino 面向 Go，提供 model、message、tool、workflow/graph、retrieval 和组件编排抽象。它可以帮助 Go 应用少写 Provider adapter 和流程连接代码，但 Go 的 context 取消、goroutine 生命周期和资源关闭仍要由应用正确管理。
+
+### 对 Go Harness 的映射
+
+```text
+P: model/provider components
+C: messages/templates/state
+T: tool component and invoker
+L: chain/graph/workflow
+K: retriever/index integrations
+M/O: current integrations and callbacks
+Q/R/A/S: 需要检查具体 component 是否只是接口，还是包含可持久化实现
+```
+
+### 验证实验
+
+用 Go fake model 建立一条 `calculator` workflow，令 tool 阻塞并调用 `context.Cancel`. 断言 goroutine 退出、HTTP request 收到 context、事件只发布一次。把 session writer 在第 N 次写入后设为失败，确认 workflow 不会只返回 final text 而掩盖 persistence error。对并行 tool 检查 result 顺序和共享文件依赖。
+
+## Google ADK
+
+### 它通常解决什么
+
+Google ADK 面向 Agent、tool、模型、session/state、multi-agent 和部署/运行时集成。它可以减少模型调用、工具注册、会话和多 Agent 协作的样板，具体语言和版本能力应以官方文档为准。
+
+### 关键追问
+
+“session/state”保存的是哪些字段？是否有 branch、版本、checkpoint 和恢复语义？多 Agent transfer 是普通消息还是可审计 operation？tool approval 是否在 effect 前？部署运行时如何隔离 credential、网络和 shell？streaming event 是临时 UI 事件还是 durable record？
+
+### 验证实验
+
+配置一个 parent agent 将任务交给 child agent，child 执行一个可变的 fake Tool。故意在 child effect 后让存储失败，观察 parent 重试是否会重复 child effect。再检查 trace 是否能关联 parent、child、run、tool call 和 session；如果只能看到文本日志，不能声称具备可恢复编排。
+
+## OpenAI Agents SDK
+
+### 它通常解决什么
+
+OpenAI Agents SDK 提供 agent、tool、handoff、guardrail、runner、session/context 和 tracing 等抽象，用于组织模型调用与 agent 协作。它可以替 P、部分 L、工具连接和 O 的样板；具体 provider、session backend 和 tracing 行为必须按当前版本核对。
+
+### 不能自动推出什么
+
+Guardrail 不等同于操作系统 sandbox；handoff 不等同于 durable workflow；tracing 不等于业务审计 ledger；session 不一定记录 tool effect 的 intent/result/terminal。即使 runner 能 retry，仍需问副作用是否幂等、取消是否到达工具、恢复从哪里开始。
+
+### 验证实验
+
+创建一个 `read` 和一个 `send` fake Tool，把 guardrail 配成拒绝 `send`。记录 runner 的 events 和 tracing，再让 fake model 返回两个 tool call、一次错误和一次 final。比较：guardrail 发生在 tool effect 前吗？错误是否回到模型？trace 是否包含敏感参数？进程重启是否能从明确 checkpoint 恢复？
+
+## 框架能力与真实承诺的分离
+
+下面三句话不能互相替代：
+
+```text
+框架有 Tool abstraction
+框架有一个可调用的 Tool
+框架保证该 Tool 的安全、幂等、恢复和审计
+```
+
+同样：
+
+```text
+框架有 Memory API
+框架能保存一段 history
+框架保证跨进程、版本化、可恢复的 Session tree
+```
+
+以及：
+
+```text
+框架有 tracing
+框架能输出 spans
+框架保证 prompt 脱敏、cost ledger 和 operation audit
+```
+
+选型文档必须把“框架保证”与“应用组合”分别写出来。没有证据时使用“需要验证”，不要使用“自动支持”。
+
+## 选型决策矩阵
+
+| 问题 | 倾向优先检查 |
+| --- | --- |
+| Java/Spring 现有系统 | Spring AI、LangChain4j 的集成成本和边界 |
+| Java 需要强类型 AI service | LangChain4j 的接口和 schema 行为 |
+| Python/JS 模型与检索生态 | LangChain 的 adapters、retrievers、middleware |
+| 明确 workflow/checkpoint | LangGraph 的 graph/state/recovery 语义 |
+| Go 服务和现有 context 体系 | Eino 的组件、context 和 goroutine 边界 |
+| Google 模型/部署生态 | ADK 的 session、multi-agent、runtime |
+| OpenAI agent 协作/guardrail | Agents SDK 的 runner、handoff、tracing |
+| 不可逆副作用和严格审计 | 先验证 ledger、writer、idempotency，再看 API 便利性 |
+
+这张矩阵只能缩小候选范围，不能代替 PoC。先定义失败场景，再比较 happy path 的代码长度。
+
+## 总结性实验：框架黑盒拆解
+
+### 目标
+
+使用一个框架完成“读取两个文件、修改一个文件、运行测试”，并交出一份 Harness 审计，而不是一段能打印 final 的代码。
+
+### 准备
+
+准备四个 fake：`FakeModel`、`FakeTool`、`FailingStore`、`CollectingTelemetry`。为 `edit` 生成唯一 operation id；禁止连接真实模型、真实文件和真实 shell。
+
+### 步骤
+
+1. 记录第一次模型 request 的 system、messages、tools 和 token/usage 字段。
+2. 令模型返回 `read(a)`、`read(b)`，观察框架串行还是并行及结果顺序。
+3. 令模型返回 `edit(a)`，在 schema 通过后但 effect 前拒绝权限。
+4. 令 `edit` effect 成功后让 store 写入失败，记录框架状态。
+5. 让模型返回 endless tool calls，确认 max steps 或 budget 的终止。
+6. 发出 abort，确认 HTTP、tool、workflow 和 event handler 是否观察到取消。
+7. 重启或重新构造 runner，检查 session/checkpoint 能否说明下一步。
+8. 把 fake 设为另一个租户的数据，确认 RAG/MCP 结果有 metadata policy。
+9. 查看 tracing，确认 prompt、tool args、credentials 是否脱敏。
+10. 将结果填入下方报告模板。
+
+### 报告模板
+
+```text
+框架和版本：
+P Provider：事实 / 可选 / 未找到
+C Context：事实 / 可选 / 未找到
+S Session：backend、版本、恢复点
+T Tool：schema、timeout、permission、idempotency
+L Loop：终止条件、并行、错误
+Q Cancel/interrupt：传播到哪里
+R Retry：哪些错误可重试
+A Sandbox：框架能力还是应用责任
+K Memory/RAG：history、summary、retrieval 的差异
+M MCP：transport、initialize、capability、权限
+O Telemetry：关联 id、脱敏、cost
+crash test：故障点、恢复结果、重复副作用风险
+```
+
+### 预期结果
+
+报告至少包含三类结论：
+
+- 官方文档明确承诺的行为；
+- 源码/测试实际证明的行为；
+- 当前没有证据、必须由应用补上的行为。
+
+如果最后只得到一个高层 `invoke` 示例，实验尚未完成。
+
+## Pi 作为反向校准
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+Pi 的 `packages/ai`、`packages/agent` 和 `packages/coding-agent` 展示了 Provider、Agent Loop、Tool、Session、Extension、Skill 和 TUI/RPC 的具体边界。当前 Coding Agent 的实际主路径是 `Agent` + `AgentSession` + `SessionManager` + `ExtensionRunner`；`packages/agent/src/harness/agent-harness.ts` 仍是 scaffold。`packages/agent/docs/harness.v2.md` 是工作区的 durable 设计稿，不能拿来证明当前 runtime 已实现 operation ledger。
+
+因此本页的核心问题也适用于 Pi：
+
+- 模型返回了什么，谁执行了工具？
+- Session 保存的是 transcript 还是 effect ledger？
+- 事件代表 observed 还是 persisted？
+- abort 之后远端副作用如何处理？
+- framework helper 隐藏了哪一个状态 owner？
+
+## 结课验收清单
+
+- [ ] 能把任意框架映射到 P/C/S/T/L/Q/R/A/K/X/M/O/G。
+- [ ] 能区分 memory、checkpoint、session tree 和 operation ledger。
+- [ ] 能用 fake model 重现一次 tool loop，而不是依赖真实 API。
+- [ ] 能测试 unknown tool、invalid arguments、tool error、max steps 和 abort。
+- [ ] 能在 effect 后 store 失败时识别重复副作用风险。
+- [ ] 能问清 MCP initialize、transport、capability 和权限。
+- [ ] 能检查 tracing 是否泄漏 prompt、文件内容和 API key。
+- [ ] 能把官方承诺、源码事实和个人推断分开书写。
+- [ ] 能解释为什么框架 API 更短不代表 Harness 语义更完整。
+
+## 小结
+
+框架的价值是复用协议适配、工具抽象、状态编排和生态连接，不是替应用自动决定安全、恢复和业务幂等。完成底层 Go/Java 实现后，再用本页实验拆解框架，你看到的就不再是神秘的 `invoke`，而是一组可以验证的 Harness 模块。
