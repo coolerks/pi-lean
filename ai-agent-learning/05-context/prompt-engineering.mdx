@@ -1,0 +1,31 @@
+---
+title: "Context Engineering"
+description: "用排序、裁剪、压缩和渐进加载控制上下文质量与成本。"
+---
+
+# Context Engineering
+
+## 输入不是越多越好
+
+Context 过大会遇到窗口限制、费用、延迟和注意力分散。工程上的目标是：本轮完成任务需要什么，就以稳定顺序提供什么。
+
+| 输入 | 典型来源 | 策略 |
+| --- | --- | --- |
+| System Prompt | 宿主规则、工具说明 | 稳定、明确、避免重复 |
+| Project context | `AGENTS.md`/`CLAUDE.md` | 按目录作用域加载，避免把无关父目录全塞入 |
+| Skills | metadata 与按需 `SKILL.md` | progressive disclosure |
+| History | Session 分支路径 | 过滤 UI-only，保证 Tool Call/Result 配对 |
+| Tool Result | 文件、命令、检索结果 | 截断并标注来源和范围 |
+| User request | 当前任务 | 保留原意，不被模板静默覆盖 |
+
+## Context transform 和 compaction 不同
+
+`transformContext` 是请求前的纯投影，可以裁剪或注入；Compaction 是持久化的结构操作，会把摘要写入 Session，使重启后仍能得到同一语义。只在内存中裁剪不能解决长期恢复问题。
+
+## 缓存与顺序
+
+连续请求最好让前缀保持稳定，新消息和 Tool Result 追加在尾部。中途插入消息会使 Provider 的 prompt cache/KV cache 从插入点失效。需要改变历史时，应明确做 compaction，而不是在一个 turn 中偷偷改前缀。
+
+## 练习
+
+为 Go/Java Harness 添加 `ContextManager`：先限制工具输出，再估算 token，超过阈值保留 system、最近用户消息、最近 Tool Result，并输出“已裁剪”标记。随后实现持久化 compaction，比较两者的恢复行为。

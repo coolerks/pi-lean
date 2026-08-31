@@ -1,0 +1,225 @@
+---
+title: "Termux（Android）设置"
+description: "Android Termux 的安装、剪贴板、共享存储和故障排查。"
+---
+
+# Termux（Android）设置
+
+> 本页是 `packages/coding-agent/docs/termux.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+Android Termux 的安装、剪贴板、共享存储和故障排查。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 环境与安装
+
+Termux 同时提供 Android 终端模拟器和 Linux 用户空间，Pi 通过其中的 Node.js 运行。先从 GitHub 或 F-Droid 安装 Termux，不要使用已废弃的 Google Play 版本；需要剪贴板和设备集成时，再从同样的来源安装 Termux:API。安装顺序很重要：两个 Android 应用要配套，不能只安装 shell 命令包。
+
+在 Termux 中运行下面的安装命令：
+
+```bash
+pkg update && pkg upgrade
+pkg install nodejs termux-api git
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+mkdir -p ~/.pi/agent
+pi
+```
+
+`pkg update && pkg upgrade` 更新软件源和已装包，`nodejs` 提供 Pi 的运行时，`termux-api` 提供命令行设备接口，`git` 方便在项目中工作，最后创建 Pi 的全局配置目录。`--ignore-scripts` 关闭 npm lifecycle scripts；这能减少安装时执行第三方脚本，但不会替你批准项目内 Extension 或 Shell 操作。
+
+### 剪贴板与 Android 资源
+
+Termux 中的文本剪贴板由 `termux-clipboard-set` 和 `termux-clipboard-get` 完成，前提是 Termux:API 应用已安装。Termux 不支持图像剪贴板，因此 Ctrl+V 的图像粘贴特性不能照搬桌面终端；文本复制与图像输入是两个不同能力。
+
+建议创建 `~/.pi/agent/AGENTS.md`，把 Android 路径和命令说明作为环境 Context 告诉模型：Home 通常是 `/data/data/com.termux/files/home`，Prefix 是 `/data/data/com.termux/files/usr`，共享存储是 `/storage/emulated/0`。`termux-open-url` 打开链接，`termux-open` 打开文件，`termux-notification` 发通知，`termux-battery-status`/`termux-wifi-connectioninfo`/`termux-telephony-deviceinfo` 查询设备，`termux-share` 分享文件，`termux-toast`、`termux-vibrate`、`termux-tts-speak` 和 `termux-camera-photo` 提供设备动作。文档中的注释说明了每个命令的输出/副作用；不要把这些能力当作无需授权的普通函数。
+
+共享存储默认不是可读写的。首次访问 Downloads、Documents 等目录前执行 `termux-setup-storage`，在 Android 权限对话框中批准，然后检查 `/storage/emulated/0`。把共享存储和 Termux 私有 Home 分开看：前者受 Android storage permission 约束，后者属于应用沙箱。
+
+### 限制和故障排查
+
+- **无图像剪贴板**：API 只支持文本，图像 Ctrl+V 不会工作。
+- **部分 native binary 不可用**：Android ARM64 可能没有可选原生依赖；安装时跳过它们不表示 Pi 的核心 Node.js 已损坏。
+- **共享存储拒绝**：先运行 `termux-setup-storage`，再确认系统权限和目标路径。
+- **剪贴板不工作**：确认 Termux 与 Termux:API 都来自 GitHub/F-Droid，之后运行 `pkg install termux-api`，用 `termux-clipboard-set`/`get` 单独测试。
+- **Node.js/npm 问题**：确认 `pkg` 更新成功；仍失败时可以 `npm cache clean --force`，然后重新安装。清缓存会删除本地 npm cache，不会修复错误的 Android 权限。
+
+> 译者注：Termux API 是宿主能力，Pi 的 Tool 仍应经过 permission policy。将 `termux-camera-photo`、通知或共享文件接入 Agent 前，要明确用户授权、输出路径和敏感数据边界。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Termux (Android) Setup | Termux (Android) Setup |
+| Prerequisites | Prerequisites |
+| Installation | Installation |
+| Update packages | Update packages |
+| Install dependencies | Install dependencies |
+| Install pi | Install pi |
+| Create config directory | Create config directory |
+| Run pi | Run pi |
+| Clipboard Support | Clipboard Support |
+| Example AGENTS.md for Termux | Example AGENTS.md for Termux |
+| Agent Environment: Termux on Android | Agent Environment: Termux on Android |
+| Location | Location |
+| Opening URLs | Opening URLs |
+| Opening Files | Opening Files |
+| Clipboard | Clipboard |
+| Notifications | Notifications |
+| Device Info | Device Info |
+| Sharing | Sharing |
+| Other Useful Commands | Other Useful Commands |
+| Notes | Notes |
+| Limitations | Limitations |
+| Troubleshooting | 故障排查 |
+| Clipboard not working | Clipboard not working |
+| Permission denied for shared storage | Permission denied for shared storage |
+| Node.js installation issues | Node.js installation issues |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/termux.md)
+
+````markdown
+# Termux (Android) Setup
+
+Pi runs on Android via [Termux](https://termux.dev/), a terminal emulator and Linux environment for Android.
+
+## Prerequisites
+
+1. Install [Termux](https://github.com/termux/termux-app#installation) from GitHub or F-Droid (not Google Play, that version is deprecated)
+2. Install [Termux:API](https://github.com/termux/termux-api#installation) from GitHub or F-Droid for clipboard and other device integrations
+
+## Installation
+
+```bash
+# Update packages
+pkg update && pkg upgrade
+
+# Install dependencies
+pkg install nodejs termux-api git
+
+# Install pi
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+# Create config directory
+mkdir -p ~/.pi/agent
+
+# Run pi
+pi
+```
+
+## Clipboard Support
+
+Clipboard operations use `termux-clipboard-set` and `termux-clipboard-get` when running in Termux. The Termux:API app must be installed for these to work.
+
+Image clipboard is not supported on Termux (the `ctrl+v` image paste feature will not work).
+
+## Example AGENTS.md for Termux
+
+Create `~/.pi/agent/AGENTS.md` to help the agent understand the Termux environment:
+
+````markdown
+# Agent Environment: Termux on Android
+
+## Location
+- **OS**: Android (Termux terminal emulator)
+- **Home**: `/data/data/com.termux/files/home`
+- **Prefix**: `/data/data/com.termux/files/usr`
+- **Shared storage**: `/storage/emulated/0` (Downloads, Documents, etc.)
+
+## Opening URLs
+```bash
+termux-open-url "https://example.com"
+```
+
+## Opening Files
+```bash
+termux-open file.pdf          # Opens with default app
+termux-open --chooser image.jpg      # Choose app
+```
+
+## Clipboard
+```bash
+termux-clipboard-set "text"   # Copy
+termux-clipboard-get          # Paste
+```
+
+## Notifications
+```bash
+termux-notification -t "Title" -c "Content"
+```
+
+## Device Info
+```bash
+termux-battery-status         # Battery info
+termux-wifi-connectioninfo    # WiFi info
+termux-telephony-deviceinfo   # Device info
+```
+
+## Sharing
+```bash
+termux-share -a send file.txt # Share file
+```
+
+## Other Useful Commands
+```bash
+termux-toast "message"        # Quick toast popup
+termux-vibrate                # Vibrate device
+termux-tts-speak "hello"      # Text to speech
+termux-camera-photo out.jpg   # Take photo
+```
+
+## Notes
+- Termux:API app must be installed for `termux-*` commands
+- Use `pkg install termux-api` for the command-line tools
+- Storage permission needed for `/storage/emulated/0` access
+````
+
+## Limitations
+
+- **No image clipboard**: Termux clipboard API only supports text
+- **No native binaries**: Some optional native dependencies (like the clipboard module) are unavailable on Android ARM64 and are skipped during installation
+- **Storage access**: To access files in `/storage/emulated/0` (Downloads, etc.), run `termux-setup-storage` once to grant permissions
+
+## Troubleshooting
+
+### Clipboard not working
+
+Ensure both apps are installed:
+1. Termux (from GitHub or F-Droid)
+2. Termux:API (from GitHub or F-Droid)
+
+Then install the CLI tools:
+```bash
+pkg install termux-api
+```
+
+### Permission denied for shared storage
+
+Run once to grant storage permissions:
+```bash
+termux-setup-storage
+```
+
+### Node.js installation issues
+
+If npm fails, try clearing the cache:
+```bash
+npm cache clean --force
+```
+
+````

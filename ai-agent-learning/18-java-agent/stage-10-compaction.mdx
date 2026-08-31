@@ -1,0 +1,12 @@
+---
+title: "Java 10：Compaction"
+description: "用有界 token 估算形成摘要和 recent tail。"
+---
+
+# Java 10：Compaction
+
+`Compactor` 超过上限时保留 system、插入 summary、保留尾部消息。近似估算只用于控制，不等于 tokenizer；要保护 tool call/result 配对和关键事实。
+
+## 实验
+
+改变 maxTokens，查看摘要位置；让压缩前含 tool call，检查不会只留下孤立 `TOOL` result。

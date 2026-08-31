@@ -1,0 +1,47 @@
+---
+title: "Go 与 Java 的插件设计"
+description: "用语言习惯实现可测试的 Tool registry 和生命周期。"
+---
+
+# Go 与 Java 的插件设计
+
+## Go：显式注册
+
+```go
+type Plugin interface {
+    Name() string
+    Register(*Registry) error
+    Close() error
+}
+
+registry.Use(WeatherPlugin{})
+```
+
+宿主控制注册顺序、冲突和权限；factory 可以延迟创建资源，callback/channel 传事件。不要把未经审查的 `.so` 当作默认插件格式。
+
+## Java：interface + ServiceLoader
+
+```java
+public interface AgentPlugin {
+    String name();
+    void register(PluginContext context);
+}
+
+ServiceLoader.load(AgentPlugin.class)
+    .forEach(plugin -> plugin.register(context));
+```
+
+`META-INF/services/...` 声明实现类；ClassLoader 能提供隔离边界，但不自动提供安全沙箱。若需要真正隔离，使用独立进程和受限协议。
+
+## 共同契约
+
+| 生命周期 | Go | Java |
+| --- | --- | --- |
+| load | `Register`/factory | `ServiceLoader`/constructor |
+| register Tool | map 写入 | registry `put` |
+| event | callback/channel | Listener |
+| cancel | `context.Context` | Future/interruption |
+| failure | error 返回 | exception + policy |
+| unload | `Close` | `AutoCloseable`/manager |
+
+练习是写一个 plugin 注册 `clock` Tool，注册两次时测试冲突；让插件事件 listener 抛错，确认宿主有记录且不会静默继续执行危险操作。

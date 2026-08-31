@@ -1,0 +1,21 @@
+---
+title: "Java 03–04：Tool 与 Agent Loop"
+description: "用 interface、JsonNode 和 maxSteps 实现结构化 Tool Calling。"
+---
+
+# Java 03–04：Tool 与 Agent Loop
+
+```java
+public interface Tool {
+    ToolDefinition definition();
+    ToolResult execute(CancellationToken cancellation, JsonNode arguments) throws Exception;
+}
+```
+
+`ToolDefinition` 只给模型；`Tool` 的 `execute` 才产生副作用。`ToolRegistry.validate` 检查名称和 schema 的 required 字段后才允许执行。`AgentLoop` 把 assistant `toolCalls` 逐个或并行分派，把结果转换成 role `TOOL` 消息。
+
+`ScriptedModel` 第一轮返回 `calculator`，第二轮返回文本；测试能断言第二个 `Request` 最后一条是 Tool Result。`LoopOptions.maxSteps` 保证异常模型不会无限调用。
+
+## 错误路径
+
+unknown tool、缺参数和 execute exception 变成 error Tool Result；Provider 异常由有限 retry 处理；`CancellationToken` 在模型、Tool 和 backoff 之间传播。

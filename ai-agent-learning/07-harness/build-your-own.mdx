@@ -1,0 +1,53 @@
+---
+title: "自己定义 Harness 接口"
+description: "把设计拆成可替换、可测试的端口，而不是把所有逻辑放进一个类。"
+---
+
+# 自己定义 Harness 接口
+
+先为每个外部边界定义 port，再写默认实现。这样 `ScriptedModel` 可以替代 HTTP Provider，内存 Session 可以替代 JSONL，假的 Tool 可以替代 Shell。
+
+```text
+Model.complete(Context, Tools, Cancellation) -> AssistantMessage + Usage
+Tool.validate(arguments) -> ValidatedArguments | Error
+Tool.execute(ValidatedArguments, Cancellation) -> ToolResult
+Session.append(entry) -> EntryId
+Context.build(snapshot, resources) -> ProviderContext
+Harness.prompt(input) -> RunResult
+Harness.steer/followUp/abort() -> QueueResult
+```
+
+## 不可省略的状态
+
+一次 Tool 调用至少要有 `runId`、`step`、`toolCallId`、name、validated arguments、开始/结束事件和结果；一次 Provider request 至少要有 attempt、model/provider、usage、stop reason 和错误。只保存最后一段文本，无法解释“文件是否已写入”。
+
+## 语言映射
+
+| 端口 | Go | Java |
+| --- | --- | --- |
+| 取消 | `context.Context` | `CancellationToken` + interrupt |
+| 外部依赖 | `interface` | `interface` |
+| 事件 | callback/channel | Listener |
+| 持久化 | `encoding/json` + JSONL | Jackson + JSONL |
+| 并发 | goroutine/`WaitGroup` | `ExecutorService`/`Future` |
+| 错误 | `(value, error)` | checked/unchecked exception |
+
+## 练习：替换一个实现
+
+**目标**：让 Loop 完全不依赖 HTTP。
+
+**准备**：运行 `examples/go-agent` 或 `examples/java-agent` 的 ScriptedModel 测试。
+
+**步骤**：实现一个只返回 final text 的 FakeModel；再实现一个第一轮返回两个 Tool Call、第二轮读取 Tool Result 的 FakeModel。不要修改 Loop。
+
+**观察点**：请求历史、Tool definitions、call id、事件和 `maxSteps`。
+
+**预期结果**：换 Model 实现后 Loop 行为不变；只有 Provider adapter 测试需要改变。
+
+**思考题**：如果 `Tool.execute` 在返回前进程崩溃，Session 里需要哪条 intent 才能在重启时判断是否重放？
+
+<Warning>
+
+示例权限策略只阻止少量明显风险。生产环境还需要 OS/container sandbox、网络策略、资源限制、secret redaction 和人工审批。
+
+</Warning>

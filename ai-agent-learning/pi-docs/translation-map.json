@@ -1,0 +1,177 @@
+{
+  "commit": "853a80d26c90a14c1886f0ebb8ffaae133ca2185",
+  "sourceCount": 34,
+  "files": [
+    {
+      "source": "packages/agent/docs/harness.md",
+      "translated": "ai-agent-learning/pi-docs/agent/harness.mdx",
+      "title": "AgentHarness 实现规范"
+    },
+    {
+      "source": "packages/agent/docs/harness.v2.md",
+      "translated": "ai-agent-learning/pi-docs/agent/harness-v2.mdx",
+      "title": "Durable AgentHarness 设计",
+      "sourceStatus": "workspace-untracked"
+    },
+    {
+      "source": "packages/agent/docs/search.md",
+      "translated": "ai-agent-learning/pi-docs/agent/search.mdx",
+      "title": "Session Search"
+    },
+    {
+      "source": "packages/agent/docs/telemetry-schema.md",
+      "translated": "ai-agent-learning/pi-docs/agent/telemetry-schema.mdx",
+      "title": "Pi Agent Telemetry Schemas"
+    },
+    {
+      "source": "packages/coding-agent/docs/compaction.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/compaction.mdx",
+      "title": "Compaction 与 Branch Summarization"
+    },
+    {
+      "source": "packages/coding-agent/docs/containerization.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/containerization.mdx",
+      "title": "容器化"
+    },
+    {
+      "source": "packages/coding-agent/docs/custom-provider.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/custom-provider.mdx",
+      "title": "自定义 Provider"
+    },
+    {
+      "source": "packages/coding-agent/docs/development.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/development.mdx",
+      "title": "开发 Pi"
+    },
+    {
+      "source": "packages/coding-agent/docs/environment-variables.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/environment-variables.mdx",
+      "title": "环境变量"
+    },
+    {
+      "source": "packages/coding-agent/docs/extensions.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/extensions.mdx",
+      "title": "Extensions"
+    },
+    {
+      "source": "packages/coding-agent/docs/index.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/index.mdx",
+      "title": "Pi 文档"
+    },
+    {
+      "source": "packages/coding-agent/docs/json.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/json.mdx",
+      "title": "JSON Event Stream Mode"
+    },
+    {
+      "source": "packages/coding-agent/docs/keybindings.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/keybindings.mdx",
+      "title": "Keybindings"
+    },
+    {
+      "source": "packages/coding-agent/docs/llama-cpp.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/llama-cpp.mdx",
+      "title": "llama.cpp"
+    },
+    {
+      "source": "packages/coding-agent/docs/models.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/models.mdx",
+      "title": "自定义 Models"
+    },
+    {
+      "source": "packages/coding-agent/docs/packages.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/packages.mdx",
+      "title": "Pi Packages"
+    },
+    {
+      "source": "packages/coding-agent/docs/prompt-templates.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/prompt-templates.mdx",
+      "title": "Prompt Templates"
+    },
+    {
+      "source": "packages/coding-agent/docs/providers.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/providers.mdx",
+      "title": "Providers"
+    },
+    {
+      "source": "packages/coding-agent/docs/quickstart.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/quickstart.mdx",
+      "title": "快速开始"
+    },
+    {
+      "source": "packages/coding-agent/docs/rpc.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/rpc.mdx",
+      "title": "RPC Mode"
+    },
+    {
+      "source": "packages/coding-agent/docs/sdk.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/sdk.mdx",
+      "title": "SDK"
+    },
+    {
+      "source": "packages/coding-agent/docs/security.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/security.mdx",
+      "title": "安全"
+    },
+    {
+      "source": "packages/coding-agent/docs/session-format.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/session-format.mdx",
+      "title": "Session File Format"
+    },
+    {
+      "source": "packages/coding-agent/docs/sessions.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/sessions.mdx",
+      "title": "Sessions"
+    },
+    {
+      "source": "packages/coding-agent/docs/settings.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/settings.mdx",
+      "title": "Settings"
+    },
+    {
+      "source": "packages/coding-agent/docs/shell-aliases.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/shell-aliases.mdx",
+      "title": "Shell Aliases"
+    },
+    {
+      "source": "packages/coding-agent/docs/skills.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/skills.mdx",
+      "title": "Skills"
+    },
+    {
+      "source": "packages/coding-agent/docs/terminal-setup.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/terminal-setup.mdx",
+      "title": "Terminal Setup"
+    },
+    {
+      "source": "packages/coding-agent/docs/termux.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/termux.mdx",
+      "title": "Termux（Android）设置"
+    },
+    {
+      "source": "packages/coding-agent/docs/themes.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/themes.mdx",
+      "title": "Themes"
+    },
+    {
+      "source": "packages/coding-agent/docs/tmux.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/tmux.mdx",
+      "title": "tmux 设置"
+    },
+    {
+      "source": "packages/coding-agent/docs/tui.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/tui.mdx",
+      "title": "TUI Components"
+    },
+    {
+      "source": "packages/coding-agent/docs/usage.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/usage.mdx",
+      "title": "使用 Pi"
+    },
+    {
+      "source": "packages/coding-agent/docs/windows.md",
+      "translated": "ai-agent-learning/pi-docs/coding-agent/windows.mdx",
+      "title": "Windows 设置"
+    }
+  ]
+}

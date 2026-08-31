@@ -1,0 +1,36 @@
+---
+title: "调试一次 Tool Call"
+description: "不依赖真实模型，使用 faux provider 观察 Pi 的完整生命周期。"
+---
+
+# 调试一次 Tool Call
+
+## 准备
+
+使用仓库已有的 faux provider/test harness，不需要 API key。先读 `packages/agent/test/agent-loop.test.ts`、`packages/agent/test/agent.test.ts` 和 `packages/coding-agent/test` 中相关测试，确认测试使用的 stream 事件形状。
+
+## 观察点
+
+<Steps>
+  <Step title="注册">
+    在 `packages/coding-agent/src/core/tools/index.ts` 观察 `createCodingTools` 返回 definition 与 executor。
+  </Step>
+  <Step title="模型响应">
+    在 `streamAssistantResponse` 的 `done` 分支观察最终 `AssistantMessage`；记录 `content` 中的 `id/name/arguments`。
+  </Step>
+  <Step title="准备和验证">
+    在 `prepareToolCall` 观察 lookup、`prepareArguments`、schema validation、`beforeToolCall`。
+  </Step>
+  <Step title="执行和回传">
+    在 `executePreparedToolCall` 和 `createToolResultMessage` 观察 signal、result、`isError`、`toolCallId`。
+  </Step>
+  <Step title="下一轮">
+    检查 `currentContext.messages` 和下一次 `convertToLlm` 输入，确认 Tool Result 已配对。
+  </Step>
+</Steps>
+
+调试日志只能临时添加，完成后撤销；更好的方式是写事件 sink 和断言。断点不应打印 API key、完整 prompt 中的凭据或用户私密文件。
+
+## 修改实验
+
+把 `toolExecution` 设为 `sequential`，再换回 `parallel`；保留同一 faux script，比较 execution end 事件和 result message 顺序。

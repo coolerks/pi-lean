@@ -1,0 +1,463 @@
+---
+title: "Settings"
+description: "模型、UI、网络、压缩、重试、工具和资源设置。"
+---
+
+# Settings
+
+> 本页是 `packages/coding-agent/docs/settings.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+模型、UI、网络、压缩、重试、工具和资源设置。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+Pi 使用 JSON 设置文件，项目设置会覆盖全局设置：全局文件是 `~/.pi/agent/settings.json`，项目文件是 `.pi/settings.json`。可以直接编辑，也可以在交互模式使用 `/settings`；`/model` 或 `/thinking` 中按 `Ctrl+S` 会保存启动默认值。嵌套对象按字段合并，而不是用项目对象把整个全局对象清空。
+
+### Project Trust 与模型
+
+含有 project-local settings、资源、`.agents/skills` 或扩展的目录，在交互启动时可能要求信任；决定保存在 `~/.pi/agent/trust.json`。`defaultProjectTrust` 可取 `ask`、`always`、`never`，`--approve`/`-a` 和 `--no-approve`/`-na` 只覆盖当前命令；`-p`、`--mode json`、`--mode rpc` 不弹交互提示。`/trust` 保存决定，但当前 Session 不会自动 reload。`pi config` 和 package 命令遵循同一规则，`pi update` 不提示。
+
+模型设置是 `defaultProvider`、`defaultModel`、`defaultThinkingLevel`、按 `provider/modelId` 配置的 `modelThinkingLevels`、隐藏输出用的 `hideThinkingBlock`、缓存提示 `showCacheMissNotices` 和各 Thinking Level 的 `thinkingBudgets`。`thinkingBudgets` 的值是 token 数；只有 Provider/compat 声明支持时才会传给 OpenAI-compatible API。
+
+### UI、网络与诊断
+
+UI 设置包括 `theme`、`externalEditor`、`quietStartup`、`collapseChangelog`、`doubleEscapeAction`、`treeFilterMode`、`editorPaddingX`、`outputPad`、`autocompleteMaxVisible`、`showHardwareCursor`、`tuiMode`、`fullscreenExitOutput`、`fullscreenScrollbar` 和 `fullscreenCopyOnSelect`。`defaultProjectTrust` 只允许放在全局设置；`enableInstallTelemetry` 是匿名安装/更新 ping，`enableAnalytics` 是实验性 analytics 同意，`trackingId` 由此产生。`externalEditor` 会按 `$VISUAL`、`$EDITOR`、Windows Notepad 或其他平台 `nano` 解析；VS Code 要写 `code --wait`。
+
+`enableInstallTelemetry` 不会关闭版本检查；`PI_SKIP_VERSION_CHECK=1` 关闭更新检查，`--offline` 或 `PI_OFFLINE=1` 关闭启动网络操作。`httpProxy` 是全局 HTTP proxy，并会映射为 `HTTP_PROXY`/`HTTPS_PROXY`。warning 设置目前包括 `warnings.anthropicExtraUsage`，用于提示订阅认证可能产生额外费用。
+
+### Compaction、Retry 与消息投递
+
+`compaction.enabled` 控制自动压缩，`compaction.reserveTokens` 为回复保留空间，`compaction.keepRecentTokens` 控制摘要保留的尾部。`branchSummary.reserveTokens` 为分支摘要保留空间，`branchSummary.skipPrompt` 跳过 `/tree` 摘要确认。Agent-level retry 的 `retry.enabled`、`retry.maxRetries`、`retry.baseDelayMs` 与 Provider-level `retry.provider.timeoutMs`、`retry.provider.maxRetries`、`retry.provider.maxRetryDelayMs` 必须分开理解；后者设为非零可能使 SDK 在 Pi 看到 out-of-usage-limit 之前自行重试。
+
+`steeringMode` 与 `followUpMode` 都可取 `all` 或 `one-at-a-time`。多传输 Provider 还可用 `transport` 的 `sse`、`websocket`、`websocket-cached`、`auto`，以及 `httpIdleTimeoutMs` 和 `websocketConnectTimeoutMs`。重试、退避和取消必须有上限，不能靠 settings 允许无限请求。
+
+### Terminal、Shell、Tools 与 Session
+
+Terminal 相关字段为 `terminal.showImages`、`terminal.imageWidthCells`、`terminal.clearOnShrink`、`terminal.hyperlinks`、`terminal.images`、`terminal.trueColor`，图像字段为 `images.autoResize` 和 `images.blockImages`。Shell 字段为 `shellPath`、`shellCommandPrefix` 和 argv 数组 `npmCommand`；Windows JSON 路径使用 `/` 或双反斜杠。`npmCommand` 会影响所有 package-manager 操作，而不是只影响安装。
+
+`defaultTools` 选择内置工具 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find`、`ls`；空数组表示不启用内置工具但保留扩展/SDK 工具。命令行的 `--tools` 是严格 allowlist，`--no-tools` 关闭全部，`--no-builtin-tools` 关闭默认内置工具，`--exclude-tools` 再过滤。`sessionDir` 指定 Session 目录，优先级是 `--session-dir`、`PI_CODING_AGENT_SESSION_DIR`、设置文件字段；`enabledModels` 控制 `Ctrl+P` 的模型轮换。
+
+### Markdown 与 Resources
+
+`markdown.codeBlockIndent` 控制代码块缩进，`markdown.mermaid` 可取 `off`、`final` 或 `streaming`。资源字段包括 `packages`、`extensions`、`skills`、`prompts`、`themes` 和 `enableSkillCommands`；路径相对全局设置目录或 `.pi`，支持绝对路径、`~`、glob 排除 `!pattern`、强制包含 `+path` 和排除 `-path`。`packages` 可用字符串加载全部资源，也可用对象分别筛选 `skills`、`extensions`、`prompts` 和 `themes`。
+
+> 译者注：项目覆盖和 Project Trust 是两层不同机制。设置合并决定“值是什么”，信任决定“项目资源是否能被加载/执行”。Go/Java 配置可分别映射为全局 defaults 与 project override DTO；权限策略不能因为配置来自 JSON 就默认可信。
+
+**配置实验**：先用全局 `compaction.reserveTokens` 和项目 `compaction.keepRecentTokens` 验证嵌套合并，再设置 `defaultTools: []` 和 `--tools read` 比较 allowlist；在非交互模式用 `--approve`/`--no-approve` 观察 project resources 是否进入 Context，并检查设置中没有凭据。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Settings | Settings |
+| Project Trust | 项目可信度 |
+| All Settings | All Settings |
+| Model & Thinking | 模型与 Thinking |
+| UI & Display | UI 与显示 |
+| Telemetry and update checks | Telemetry and update checks |
+| Network | Network |
+| Warnings | Warnings |
+| Compaction | Compaction |
+| Branch Summary | Branch Summary |
+| Retry | Retry |
+| Message Delivery | Message Delivery |
+| Terminal & Images | Terminal & Images |
+| Shell | Shell |
+| Tools | Tools |
+| Sessions | Sessions |
+| Model Cycling | Model Cycling |
+| Markdown | Markdown |
+| Resources | Resources |
+| Example | Example |
+| Project Overrides | Project Overrides |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/settings.md)
+
+````markdown
+# Settings
+
+Pi uses JSON settings files with project settings overriding global settings.
+
+| Location | Scope |
+|----------|-------|
+| `~/.pi/agent/settings.json` | Global (all projects) |
+| `.pi/settings.json` | Project (current directory) |
+
+Edit directly or use `/settings` for common options. To save startup model defaults interactively, use `/model` and press Ctrl+S on the desired model. To save the startup thinking level, use `/thinking` and press Ctrl+S.
+
+## Project Trust
+
+On interactive startup, pi asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.pi/agent/trust.json`. Trusting a project allows pi to load `.pi/settings.json` and `.pi` resources, install missing project packages, and execute project extensions.
+
+Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore those project resources, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
+
+If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.pi/agent/settings.json`, or change it with `/settings`.
+
+`pi config` and package commands use the same project trust flow, except `pi update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+
+Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.pi/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
+
+## All Settings
+
+### Model & Thinking
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `defaultProvider` | string | - | Startup provider (e.g., `"anthropic"`, `"openai"`; saved with Ctrl+S in `/model`, or edited manually) |
+| `defaultModel` | string | - | Startup model ID (saved with Ctrl+S in `/model`, or edited manually) |
+| `defaultThinkingLevel` | string | - | Startup thinking level (saved with Ctrl+S in `/thinking`, or edited manually): `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
+| `modelThinkingLevels` | object | - | Per-model startup thinking levels keyed by `"provider/modelId"`; configure from `/settings` → Default thinking level per model or edit manually |
+| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
+| `showCacheMissNotices` | boolean | `false` | Show transcript notices for significant prompt-cache misses and compaction or branch-summary usage |
+| `thinkingBudgets` | object | - | Custom token budgets per thinking level. Anthropic, Google, and Bedrock use these natively. OpenAI-compatible models use them when `compat.thinkingTokenBudgetField` (or `supportsThinkingTokenBudget`) is set. |
+
+#### thinkingBudgets
+
+```json
+{
+  "thinkingBudgets": {
+    "minimal": 1024,
+    "low": 4096,
+    "medium": 10240,
+    "high": 32768
+  }
+}
+```
+
+### UI & Display
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `theme` | string | `"dark"` | Theme name (`"dark"`, `"light"`, or custom) |
+| `externalEditor` | string | `$VISUAL`, then `$EDITOR`, then Notepad on Windows or `nano` elsewhere | Command for Ctrl+G external editor; takes precedence over environment variables |
+| `quietStartup` | boolean | `false` | Hide startup header |
+| `defaultProjectTrust` | string | `"ask"` | Fallback project trust behavior: `"ask"`, `"always"`, or `"never"`. Global setting only |
+| `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
+| `enableInstallTelemetry` | boolean | `true` | Send an anonymous install/update version ping after first install or changelog-detected updates. This does not control update checks |
+| `enableAnalytics` | boolean | `false` | Opt-in analytics data sharing. Currently only asked for during the experimental first-time setup (`PI_EXPERIMENTAL=1`) |
+| `trackingId` | string | - | Analytics tracking identifier, generated when `enableAnalytics` is turned on |
+| `doubleEscapeAction` | string | `"tree"` | Action for double-escape: `"tree"`, `"fork"`, or `"none"` |
+| `treeFilterMode` | string | `"default"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
+| `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
+| `outputPad` | number | `1` | Horizontal padding for user messages, assistant messages, and thinking (0 or 1) |
+| `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
+| `showHardwareCursor` | boolean | `false` | Show the terminal cursor while TUI positions it for IME support |
+| `tuiMode` | string | `"regular"` | Interactive TUI mode: `"regular"` or experimental `"fullscreen"`. Changes from `/settings` apply immediately; `--tui-mode` overrides this setting at startup |
+| `fullscreenExitOutput` | string | `"transcript"` | Fullscreen exit output: `"transcript"` prints the final transcript and resume hint, while `"resume-hint"` restores the previous screen and prints only the resume hint. Has no effect in regular TUI mode |
+| `fullscreenScrollbar` | string | `"auto"` | Fullscreen transcript scrollbar: `"auto"` shows it temporarily while scrolling, `"always"` reserves the rightmost column and keeps it visible, and `"hidden"` hides it. Has no effect in regular TUI mode |
+| `fullscreenCopyOnSelect` | boolean | `true` | Automatically copy selected text in fullscreen mode. When disabled, selections stay highlighted and `Ctrl+X` copies the active selection |
+
+For VS Code, include `--wait` so pi resumes after the editor exits:
+
+```json
+{
+  "externalEditor": "code --wait"
+}
+```
+
+### Telemetry and update checks
+
+`enableInstallTelemetry` only controls the anonymous install/update ping to `https://pi.dev/api/report-install`. Opting out of telemetry does not disable update checks; Pi can still fetch `https://pi.dev/api/latest-version` to look for the latest version.
+
+Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--offline` or `PI_OFFLINE=1` to disable all startup network operations described here, including update checks, package update checks, and install/update telemetry.
+
+### Network
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `httpProxy` | string | - | HTTP proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY`. Global setting only. |
+
+```json
+{
+  "httpProxy": "http://127.0.0.1:7890"
+}
+```
+
+### Warnings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `warnings.anthropicExtraUsage` | boolean | `true` | Show a warning when Anthropic subscription auth may use paid extra usage |
+
+```json
+{
+  "warnings": {
+    "anthropicExtraUsage": false
+  }
+}
+```
+
+### Compaction
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `compaction.enabled` | boolean | `true` | Enable auto-compaction |
+| `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
+| `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  }
+}
+```
+
+### Branch Summary
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `branchSummary.reserveTokens` | number | `16384` | Tokens reserved for branch summarization |
+| `branchSummary.skipPrompt` | boolean | `false` | Skip "Summarize branch?" prompt on `/tree` navigation (defaults to no summary) |
+
+### Retry
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `retry.enabled` | boolean | `true` | Enable automatic agent-level retry on transient errors |
+| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
+| `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
+| `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
+| `retry.provider.maxRetries` | number | `0` | Provider/SDK retry attempts |
+| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
+
+When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs`, the request fails immediately with an informative error instead of waiting silently. Set it to `0` to disable the limit.
+
+Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explicitly needed. Setting it above `0` can make SDK/provider retries handle out-of-usage-limit errors before Pi sees them, which may block the agent until the provider quota resets in some circumstances.
+
+```json
+{
+  "retry": {
+    "enabled": true,
+    "maxRetries": 3,
+    "baseDelayMs": 2000,
+    "provider": {
+      "timeoutMs": 3600000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 60000
+    }
+  }
+}
+```
+
+### Message Delivery
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `steeringMode` | string | `"one-at-a-time"` | How steering messages are sent: `"all"` or `"one-at-a-time"` |
+| `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
+| `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"` |
+| `httpIdleTimeoutMs` | number | `300000` | HTTP header/body idle timeout in milliseconds, also used by providers with explicit stream idle timeouts. Set to `0` to disable. |
+| `websocketConnectTimeoutMs` | number | `15000` | WebSocket connect/open handshake timeout in milliseconds for providers that support WebSocket transports. Set to `0` to disable. |
+
+### Terminal & Images
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `terminal.showImages` | boolean | `true` | Show images in terminal (if supported) |
+| `terminal.imageWidthCells` | number | `60` | Preferred inline image width in terminal cells |
+| `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when content shrinks (can cause flicker) |
+| `terminal.hyperlinks` | boolean or `"auto"` | `"auto"` | Override OSC 8 hyperlink support (advanced, JSON-only) |
+| `terminal.images` | string or boolean | `"auto"` | Override image protocol support with `"kitty"`, `"iterm2"`, `false`, or `"auto"` (advanced, JSON-only) |
+| `terminal.trueColor` | boolean or `"auto"` | `"auto"` | Override truecolor support (advanced, JSON-only) |
+| `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max. Applies to `@file` attachments, `read`, and images returned by tools |
+| `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
+
+### Shell
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `shellPath` | string | - | Custom shell path (e.g., for Cygwin on Windows); supports a leading `~` for the home directory |
+| `shellCommandPrefix` | string | - | Prefix for every bash command (e.g., `"shopt -s expand_aliases"`) |
+| `npmCommand` | string[] | - | Command argv used for npm package lookup/install operations (e.g., `["mise", "exec", "node@20", "--", "npm"]`) |
+
+Windows paths in JSON must use forward slashes or escaped backslashes:
+
+```json
+{
+  "shellPath": "C:/Program Files/Git/bin/bash.exe"
+}
+```
+
+```json
+{
+  "shellPath": "C:\\Program Files\\Git\\bin\\bash.exe"
+}
+```
+
+```json
+{
+  "npmCommand": ["mise", "exec", "node@20", "--", "npm"]
+}
+```
+
+`npmCommand` is used for all npm package-manager operations, including installs, uninstalls, and dependency installs inside git packages. User-scoped npm packages install under `~/.pi/agent/npm/`; project-scoped npm packages install under `.pi/npm/`. Use argv-style entries exactly as the process should be launched. When `npmCommand` is configured, git package dependency installs use plain `install` to avoid npm-specific flags in wrappers or alternate package managers.
+
+### Tools
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `defaultTools` | string[] | - | Built-in tools enabled initially. When omitted, Pi uses its standard defaults |
+
+`defaultTools` selects the built-in tools enabled at startup. Extension and SDK custom tools remain enabled. Available built-ins are `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, and `ls`:
+
+```json
+{
+  "defaultTools": ["bash", "edit", "write"]
+}
+```
+
+On Windows, select `powershell` instead of `bash`, or include both:
+
+```json
+{
+  "defaultTools": ["read", "powershell", "edit", "write"]
+}
+```
+
+An empty array starts with no built-in tools while preserving extension and SDK custom tools. `--tools` replaces this behavior with a strict allowlist for all tools, `--no-tools` disables all tools, and `--no-builtin-tools` disables the built-in defaults. `--exclude-tools` filters the resulting list. A project `defaultTools` array replaces the global array.
+
+### Sessions
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
+
+```json
+{ "sessionDir": ".pi/sessions" }
+```
+
+When multiple sources specify a session directory, precedence is `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, then `sessionDir` in settings.json.
+
+### Model Cycling
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabledModels` | string[] | - | Model patterns for Ctrl+P cycling (same format as `--models` CLI flag) |
+
+```json
+{
+  "enabledModels": ["claude-*", "gpt-4o", "gemini-2*"]
+}
+```
+
+### Markdown
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `markdown.codeBlockIndent` | string | `"  "` | Indentation for code blocks |
+| `markdown.mermaid` | string | `"streaming"` | Mermaid rendering mode: `"off"`, `"final"`, or `"streaming"` |
+
+### Resources
+
+These settings define where to load extensions, skills, prompts, and themes from.
+
+Paths in `~/.pi/agent/settings.json` resolve relative to `~/.pi/agent`. Paths in `.pi/settings.json` resolve relative to `.pi`. Absolute paths and `~` are supported.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `packages` | array | `[]` | npm/git packages to load resources from |
+| `extensions` | string[] | `[]` | Local extension file paths or directories |
+| `skills` | string[] | `[]` | Local skill file paths or directories |
+| `prompts` | string[] | `[]` | Local prompt template paths or directories |
+| `themes` | string[] | `[]` | Local theme file paths or directories |
+| `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
+
+Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
+
+#### packages
+
+String form loads all resources from a package:
+
+```json
+{
+  "packages": ["pi-skills", "@org/my-extension"]
+}
+```
+
+Object form filters which resources to load:
+
+```json
+{
+  "packages": [
+    {
+      "source": "pi-skills",
+      "skills": ["brave-search", "transcribe"],
+      "extensions": []
+    }
+  ]
+}
+```
+
+See [packages.md](packages.md) for package management details.
+
+## Example
+
+```json
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-20250514",
+  "defaultThinkingLevel": "medium",
+  "modelThinkingLevels": {
+    "anthropic/claude-sonnet-4-20250514": "high"
+  },
+  "theme": "dark",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 3
+  },
+  "enabledModels": ["claude-*", "gpt-4o"],
+  "warnings": {
+    "anthropicExtraUsage": true
+  },
+  "packages": ["pi-skills"]
+}
+```
+
+## Project Overrides
+
+Project settings (`.pi/settings.json`) override global settings. Nested objects are merged:
+
+```json
+// ~/.pi/agent/settings.json (global)
+{
+  "theme": "dark",
+  "compaction": { "enabled": true, "reserveTokens": 16384 }
+}
+
+// .pi/settings.json (project)
+{
+  "compaction": { "reserveTokens": 8192 }
+}
+
+// Result
+{
+  "theme": "dark",
+  "compaction": { "enabled": true, "reserveTokens": 8192 }
+}
+```
+
+````

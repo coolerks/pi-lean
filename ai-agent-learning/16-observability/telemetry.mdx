@@ -1,0 +1,29 @@
+---
+title: "Telemetry 与 Observability"
+description: "记录 Agent 的延迟、用量、工具、重试、取消和压缩。"
+---
+
+# Telemetry 与 Observability
+
+## 为什么需要
+
+只看最终回答无法解释“为什么慢、花了多少钱、哪一个 Tool 失败、重试了几次、用户何时 abort”。Agent 一次运行是多阶段工作：Provider、Tool、队列、compaction 和 Session 都需要关联 id。
+
+## Pi 的入口
+
+`packages/telemetry/src/index.ts` 提供通用 telemetry 类型/上下文；`packages/coding-agent/src/core/telemetry.ts` 和 AgentSession 将运行数据接入应用。`packages/ai/src/types.ts` 的 `Usage` 明确 input/output/cache/reasoning/cost；不要把 Tool 自己上报的 usage 误当成主 LLM usage。
+
+## 建议事件字段
+
+| 事件 | 字段 |
+| --- | --- |
+| run | runId、sessionId、lane、model、provider、start/end |
+| llm request | attempt、latency、TTFT、stopReason、usage、responseId |
+| tool | toolCallId、name、duration、isError、outputBytes |
+| retry | reason、attempt、delay、retryable |
+| control | abort、steer、follow-up、queue depth |
+| compaction | reason、before/after tokens、duration、outcome |
+
+## 日志 vs Trace
+
+日志是离散文本/事件；Trace 是有 parent-child 关系的运行树。两者都不能默认记录完整 prompt、Tool 参数或文件内容，避免敏感数据泄露；保留 hash、长度和 redacted metadata 通常更安全。

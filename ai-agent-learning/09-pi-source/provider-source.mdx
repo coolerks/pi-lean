@@ -1,0 +1,34 @@
+---
+title: "精读 pi-ai Provider 层"
+description: "从统一 Model 和 Stream 追到厂商 API 适配。"
+---
+
+# 精读 `pi-ai` Provider 层
+
+**文件**：`packages/ai/src/types.ts`、`models.ts`、`providers/all.ts`、`api/*.ts`；**symbol**：`Model`、`Provider`、`Models`、`ProviderStreams`、`AssistantMessageEventStream`；**commit**：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+## 数据流
+
+```text
+AgentLoop Context
+ -> Models.streamSimple(model, context, options)
+ -> provider 根据 model.api 选择 adapter
+ -> adapter 转换 Message/Tool/Thinking
+ -> HTTP/SDK stream
+ -> AssistantMessageEventStream
+ -> AgentLoop
+```
+
+`ProviderStreams` 统一要求 `stream`/`streamSimple`，能力允许时可有 `fetchDeferred`/`cancelDeferred`。`Model` 保存 provider/model id、api、contextWindow、maxTokens、cost、reasoning 和 input 能力。
+
+## 为什么 adapter 必要
+
+OpenAI Responses 的 output item、Anthropic content block、Google parts 不同；它们的 tool-call 增量、thinking replay、stop reason、缓存字段也不一致。统一层把差异限制在 `src/api/`，上层只处理 `AssistantMessage` 和 `AssistantMessageEvent`。
+
+## 当前 provider 列表
+
+`providers/all.ts` 的 `builtinProviders()` 明确列出构建时支持的 provider 工厂，包括 OpenAI/Anthropic/Google/Bedrock、OpenRouter、Mistral、xAI、DeepSeek、Qwen/Xiaomi 等。列表不是可用凭证清单；认证由 runtime/environment 解决。
+
+## 实验
+
+阅读一个 `openai-*` adapter 和 `anthropic-messages.ts` 的同一段：比较 system、tool schema、stream delta、usage 和 stop reason 的转换。用 faux provider 测试，不把 API key 写进测试。

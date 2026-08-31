@@ -1,0 +1,61 @@
+---
+title: "Shell Aliases"
+description: "Shell alias 配置参考。"
+---
+
+# Shell Aliases
+
+> 本页是 `packages/coding-agent/docs/shell-aliases.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+Shell alias 配置参考。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+Pi 的 Shell Tool 以非交互方式运行 `bash -c`。这种 shell 默认不会展开 alias，所以你在交互式 shell 中定义的 alias 不会自动出现在 Pi 的命令环境里。
+
+要启用 alias，在 `~/.pi/agent/settings.json` 配置 `shellCommandPrefix`。示例先执行 `shopt -s expand_aliases`，再用 `eval` 从 `~/.zshrc` 读取 alias 行；如果你使用 Bash 或其他 shell，应把路径改为对应的 `~/.bashrc` 等文件。前缀会影响 Pi 启动的 Shell Tool 命令，不等于把完整交互式 shell 配置无条件复制进每条命令。
+
+执行前检查被读取配置文件的来源。不要从不受信任仓库的脚本中拼接 prefix，也不要让 alias 绕过 Tool 的 permission、timeout 或 output limit；alias 只是 shell 展开规则，不是 sandbox。
+
+> 译者注：`shopt`、`eval` 和 alias 是 Bash 行为，不能直接搬到 PowerShell。跨平台配置应为不同 shell 分别定义 prefix，并用最小化的可信配置文件。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Shell Aliases | Shell Aliases |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/shell-aliases.md)
+
+````markdown
+# Shell Aliases
+
+Pi runs bash in non-interactive mode (`bash -c`), which doesn't expand aliases by default.
+
+To enable your shell aliases, add to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "shellCommandPrefix": "shopt -s expand_aliases\neval \"$(grep '^alias ' ~/.zshrc)\""
+}
+```
+
+Adjust the path (`~/.zshrc`, `~/.bashrc`, etc.) to match your shell config.
+
+````

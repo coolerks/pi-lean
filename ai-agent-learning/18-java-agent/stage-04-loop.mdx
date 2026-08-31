@@ -1,0 +1,10 @@
+---
+title: "Java 04：Agent Loop"
+description: "用有限 step 的 model → tool → result 循环实现 Agent。"
+---
+
+# Java 04：Agent Loop
+
+`AgentLoop.run` 保存 `List<Message>`，每一步调用 `Model.complete`；assistant 有 tool calls 时执行、追加 `TOOL` 消息，再发下一次 request；无 tool call 时结束。`LoopOptions.maxSteps` 是硬上限。
+
+`ScriptedModel` 第一轮返回调用、第二轮返回文本；测试检查第二次 request 的最后一条消息和最终答案，而不是访问真实 Provider。

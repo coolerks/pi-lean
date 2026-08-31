@@ -1,0 +1,18 @@
+---
+title: "Go 04：Agent Loop"
+description: "把 Model、Tool Registry 和消息历史连接成有限循环。"
+---
+
+# Go 04：Agent Loop
+
+`AgentLoop.Run` 的一次 step 是：构造 `Request` → 完成 Model → 追加 assistant → 判断 `ToolCalls` → 执行 batch → 追加 `RoleTool`。没有 tool call 时返回 final；达到 `MaxSteps`、取消或 Provider 错误时退出。
+
+```text
+for step < MaxSteps:
+    assistant = model.Complete(ctx, request)
+    append assistant
+    if no calls: return final
+    append executeTools(ctx, calls)
+```
+
+对应测试：`agent_test.go` 的 `TestToolCallIsExecutedAndReturnedToModel`、`TestRetryAndMaxSteps`。

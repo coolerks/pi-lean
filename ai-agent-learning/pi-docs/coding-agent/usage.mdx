@@ -1,0 +1,432 @@
+---
+title: "使用 Pi"
+description: "交互模式、斜杠命令、队列、Session、CLI 参数和设计原则。"
+---
+
+# 使用 Pi
+
+> 本页是 `packages/coding-agent/docs/usage.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+交互模式、斜杠命令、队列、Session、CLI 参数和设计原则。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 交互界面与编辑器
+
+交互界面分成四个区域：启动头显示快捷键、已加载的 context files、prompt templates、Skills 和 Extensions；消息区显示 user/assistant 消息、Tool Call、Tool Result、通知、错误和 Extension UI；编辑器是输入区域，其边框颜色表示当前 thinking level；页脚显示 cwd、Session 名称、token/cache、成本、Context 使用量和当前 model。页脚统计还包括工具上报的 usage 和摘要生成成本。执行 `/settings` 或 Extension UI 时，编辑器会暂时让位给内置界面。
+
+编辑器支持 `@` 模糊查找项目文件，Tab 路径补全，Shift+Enter（Windows Terminal 也可 Ctrl+Enter）输入多行；Ctrl+X 在 `/tree` 中复制选中消息，否则复制最近 assistant 消息。Ctrl+V/Alt+V 或拖拽可以插入图片，Ctrl+G 打开 `externalEditor`、`$VISUAL`、`$EDITOR`，Windows 回退到 Notepad，其他平台回退到 `nano`。`!command` 执行命令并把输出加入下一次 Context，`!!command` 执行但不加入 Context；这两个前缀都仍是有副作用的 Shell 操作，不是安全绕过。
+
+### 斜杠命令
+
+在编辑器输入 `/` 会打开补全。认证使用 `/login`、`/logout`；`/model`、`/thinking`、`/scoped-models` 选择模型和 thinking；`/settings` 修改主题、消息投递和传输设置；`/llama` 管理 llama.cpp router。Session 使用 `/resume`、`/new`、`/name`、`/session`、`/tree`、`/trust`、`/fork`、`/clone`；`/compact` 压缩旧上下文，`/copy` 复制回答，`/export`/`/import` 导出或恢复 JSONL，`/share` 创建私有 GitHub gist。`/reload` 重新加载 keybindings、Extensions、Skills、prompts、themes 和 context files，`/hotkeys`、`/changelog` 查询信息，`/quit` 退出。
+
+Extension 可以注册自己的 command；Skill 通过 `/skill:name` 使用，prompt template 通过 `/templatename` 展开。命令名不是权限授权：例如 `/reload` 可能加载项目资源，仍要遵循 project trust。
+
+### Message Queue：Steering 与 Follow-up
+
+Agent 工作时按 Enter 会排入 steering，当前 assistant turn 的 Tool Calls 完成后投递；Alt+Enter 排入 follow-up，等 Agent 完成全部工作后投递。Escape 中止运行并把已排队消息恢复到编辑器，Alt+Up 将队列内容取回。Windows Terminal 默认把 Alt+Enter 用于全屏，需要按 Terminal Setup 文档重新映射。`steeringMode` 和 `followUpMode` 可以在 Settings 中配置。
+
+这一区分了“改变当前工作方向”和“等当前工作完成后追加任务”。Abort 是取消运行，不等于再发送一条用户消息；队列消费点由 Agent Loop 决定，不能把新文本直接插入正在发送的 Provider request。
+
+### Session 与导出
+
+Session 自动保存到 `~/.pi/agent/sessions/`，按工作目录组织。`pi -c` 继续最近 Session，`pi -r` 浏览并选择，`--session <path|id>` 打开指定文件/ID，`--fork <path|id>` 从它创建新文件；`--no-session` 关闭持久化，`--name <name>` 设置启动名称。交互命令 `/session` 显示文件、ID、消息数、token 和成本；`/tree` 在当前 JSONL 树中跳转，`/fork` 从较早 user message 创建新 Session，`/clone` 复制当前活动分支，`/compact` 释放 Context。
+
+`/export [file]` 导出 HTML；`/share` 上传私有 GitHub gist。Session 含有 prompt、Tool、文件路径和可能的凭据关联信息，分享前要先检查脱敏。开源研究可以参考 `badlogic/pi-share-hf` 的外部发布工具，但它不改变 Pi 的本地保存语义。
+
+### Context files、System Prompt 与 Project Trust
+
+启动时 Pi 从 `~/.pi/agent/AGENTS.md`、当前目录向上遍历的父目录、当前目录读取 `AGENTS.md` 或 `CLAUDE.md`。同目录存在 `AGENTS.override.md` 时，它替代该目录的普通文件；其他目录的 context files 仍按层级叠加。用 `--no-context-files` 或 `-nc` 可关闭。`.pi/SYSTEM.md`（项目）和 `~/.pi/agent/SYSTEM.md`（全局）替换默认 System Prompt；`APPEND_SYSTEM.md` 则追加而不替换。
+
+交互启动时，如果项目包含 project-local settings/resources/`.agents/skills` 且当前目录或父目录没有 trust 记录，Pi 会询问是否信任。信任后可加载 `.pi/settings.json`、`.pi` resources、缺失的 project packages 并执行 project Extensions。询问前只加载 context files、用户/全局 Extensions 和 CLI `-e` Extensions，它们可处理 `project_trust` 事件；项目 Extension、项目 package Extension 和项目 settings 要在信任之后才加载。切换到尚未解决信任的其他 cwd Session 时也遵循这个分界。
+
+`-p`、`--mode json`、`--mode rpc` 不弹交互提示，使用全局 `defaultProjectTrust`：`ask`（默认）和 `never` 不加载未批准项目资源，`always` 自动信任；`--approve`/`-a` 和 `--no-approve`/`-na` 只覆盖当前运行。`pi config` 和 package 命令使用同一 trust 流程，但 `pi update` 永不询问。交互中的 `/trust` 只写 `~/.pi/agent/trust.json`，不会热重载当前 Session，修改后应重启 Pi。
+
+### CLI 参考与运行模式
+
+基本形式是 `pi [options] [--] [@files...] [messages...]`。默认是 interactive mode；`-p`/`--print` 输出后退出；`--mode json` 输出 JSON lines 事件；`--mode rpc` 通过 stdin/stdout 做 RPC；`--export <in> [out]` 导出 Session。Print mode 也会读取管道 stdin，例如 `cat README.md | pi -p "Summarize this text"`。
+
+模型选项包括 `--provider`、`--model`（支持 `provider/id` 和可选 `:<thinking>`）、`--api-key`、`--thinking`、`--models` 和 `--list-models`。Session 选项包括 `-c`、`-r`、`--session`、`--fork`、`--session-dir`、`--no-session`、`--name`。Tool 选项包括 `--tools`/`-t` allowlist、`--exclude-tools`/`-xt`、`--no-builtin-tools`/`-nbt` 和 `--no-tools`/`-nt`；内置集合实际包含 `read`、`bash`、Windows 上的 `powershell`、`edit`、`write`、`grep`、`find`、`ls`。
+
+资源选项 `-e`/`--extension`、`--skill`、`--prompt-template`、`--theme` 都可重复；对应 `--no-extensions`、`--no-skills`、`--no-prompt-templates`、`--no-themes` 和 `--no-context-files` 用于关闭发现。`--system-prompt` 替换默认 prompt，`--append-system-prompt` 追加；`--tui-mode` 选择 `regular` 或实验性 `fullscreen`，`--use-theme` 只改变本次启动初始主题；`--verbose`、`--approve`、`--no-approve`、`--help` 和 `--version` 是其他常用选项。
+
+Fullscreen 模式让 transcript 在终端 viewport 内滚动，把队列、working 状态、Extension widgets、editor 和 footer 固定在底部；regular 模式使用终端自身 scrollback。Kitty/Ghostty 等支持 Kitty graphics 的终端可以显示 inline image；iTerm2 fullscreen 由于协议无法删除/裁剪应用滚动中的 image，会显示占位文本。`fullscreenCopyOnSelect`、terminal setup 和默认值应结合当前 Settings 页面检查。
+
+### 文件参数、示例与设计取舍
+
+在参数前加 `@` 将文件放进当前 user message，例如 `pi @README.md "Summarize this"`；图片也可作为 `@screenshot.png`。以 `--` 结束 option parsing 后，剩余内容按 prompt 或文件参数解释。只读检查可用 `--tools read,grep,find,ls -p "Review the code"`，禁用单个资源用 `--exclude-tools ask_question`。
+
+Pi 故意保持 core 小，把 workflow-specific 行为放到 Extensions、Skills、prompt templates 和 packages 中。Pi Core 默认不内建 MCP、sub-agents、permission popups、plan mode、to-dos 或 background bash；这些能力可以由 Extension/package、container 或 tmux 提供。这是架构边界，不是说这些能力不能实现。学习者应先理解 Agent Loop/Harness，再判断某个扩展替自己增加了哪一层。
+
+> 译者注：`--no-*` 关闭的是资源发现，不等于阻止模型生成字符串；Tool allowlist、project trust、sandbox 和人工审批需要在 Runtime 中分别实现。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Using Pi | Using Pi |
+| Interactive Mode | Interactive Mode |
+| Editor Features | Editor Features |
+| Slash Commands | Slash Commands |
+| Message Queue | Message Queue |
+| Sessions | Sessions |
+| Context Files | Context Files |
+| System Prompt Files | System Prompt Files |
+| Project Trust | 项目可信度 |
+| Exporting and Sharing Sessions | Exporting and Sharing Sessions |
+| CLI Reference | CLI Reference |
+| Package Commands | Package Commands |
+| Modes | Modes |
+| Model Options | Model Options |
+| Session Options | Session Options |
+| Tool Options | Tool Options |
+| Resource Options | Resource Options |
+| Other Options | Other Options |
+| File Arguments | File Arguments |
+| Examples | Examples |
+| Interactive with initial prompt | Interactive with initial prompt |
+| Non-interactive | Non-interactive |
+| Prompt beginning with a dash | Prompt beginning with a dash |
+| Non-interactive with piped stdin | Non-interactive with piped stdin |
+| Named one-shot session | Named one-shot session |
+| Different model | Different model |
+| Model with provider prefix | Model with provider prefix |
+| Model with thinking level shorthand | Model with thinking level shorthand |
+| Limit model cycling | Limit model cycling |
+| Read-only mode | Read-only mode |
+| Disable one extension or built-in tool while keeping the rest available | Disable one extension or built-in tool while keeping the rest available |
+| Design Principles | Design Principles |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/usage.md)
+
+````markdown
+# Using Pi
+
+This page collects day-to-day usage details that do not fit on the quickstart page.
+
+## Interactive Mode
+
+<p align="center"><img src="images/interactive-mode.png" alt="Interactive Mode" width="600"></p>
+
+The interface has four main areas:
+
+- **Startup header** - shortcuts, loaded context files, prompt templates, skills, and extensions
+- **Messages** - user messages, assistant responses, tool calls, tool results, notifications, errors, and extension UI
+- **Editor** - where you type; border color indicates the current thinking level
+- **Footer** - working directory, session name, token/cache usage, cost, context usage, and current model. Totals include assistant responses, usage reported by tools, and summary generation.
+
+The editor can be replaced temporarily by built-in UI such as `/settings` or by custom extension UI.
+
+### Editor Features
+
+| Feature | How |
+|---------|-----|
+| File reference | Type `@` to fuzzy-search project files |
+| Path completion | Press Tab to complete paths |
+| Multi-line input | Shift+Enter, or Ctrl+Enter on Windows Terminal |
+| Copy response | Ctrl+X copies the selected message in `/tree`; otherwise it copies the last assistant message, or the active fullscreen text selection when `fullscreenCopyOnSelect` is disabled |
+| Images | Paste with Ctrl+V, Alt+V on Windows, or drag into the terminal |
+| Shell command | `!command` runs and sends output to the model |
+| Hidden shell command | `!!command` runs without sending output to the model |
+| External editor | Ctrl+G opens `externalEditor`, `$VISUAL`, `$EDITOR`, Notepad on Windows, or `nano` elsewhere |
+
+See [Keybindings](keybindings.md) for all shortcuts and customization.
+
+## Slash Commands
+
+Type `/` in the editor to open command completion. Extensions can register custom commands, skills are available as `/skill:name`, and prompt templates expand via `/templatename`.
+
+| Command | Description |
+|---------|-------------|
+| `/login`, `/logout` | Manage OAuth or API-key credentials |
+| [`/llama`](llama-cpp.md) | Download, load, and unload llama.cpp router models |
+| `/model` | Switch models; Ctrl+S in the picker saves the startup default |
+| `/thinking` | Switch thinking level; Ctrl+S in the picker saves the startup default |
+| `/scoped-models` | Enable/disable models for Ctrl+P cycling |
+| `/settings` | Theme, message delivery, transport, and other preferences |
+| `/resume` | Pick from previous sessions |
+| `/new` | Start a new session |
+| `/name <name>` | Set session display name |
+| `/session` | Show session file, ID, messages, tokens, and cost |
+| `/tree` | Jump to any point in the session and continue from there |
+| `/trust` | Save project trust decision for future sessions |
+| `/fork` | Create a new session from a previous user message |
+| `/clone` | Duplicate the current active branch into a new session |
+| `/compact [prompt]` | Manually compact context, optionally with custom instructions |
+| `/copy` | Copy last assistant message to clipboard |
+| `/export [file]` | Export session to HTML or JSONL |
+| `/import <file>` | Import and resume a session from a JSONL file |
+| `/share` | Upload as private GitHub gist with shareable HTML link |
+| `/reload` | Reload keybindings, extensions, skills, prompts, themes, and context files |
+| `/hotkeys` | Show all keyboard shortcuts |
+| `/changelog` | Display version history |
+| `/quit` | Quit pi |
+
+## Message Queue
+
+You can submit messages while the agent is still working:
+
+- **Enter** queues a steering message, delivered after the current assistant turn finishes executing its tool calls.
+- **Alt+Enter** queues a follow-up message, delivered after the agent finishes all work.
+- **Escape** aborts and restores queued messages to the editor.
+- **Alt+Up** retrieves queued messages back to the editor.
+
+On Windows Terminal, Alt+Enter is fullscreen by default. Remap it as described in [Terminal setup](terminal-setup.md) if you want pi to receive the shortcut.
+
+Configure delivery in [Settings](settings.md) with `steeringMode` and `followUpMode`.
+
+## Sessions
+
+Sessions are saved automatically to `~/.pi/agent/sessions/`, organized by working directory.
+
+```bash
+pi -c                  # Continue most recent session
+pi -r                  # Browse and select a session
+pi --no-session        # Ephemeral mode; do not save
+pi --name "my task"    # Set session display name at startup
+pi --session <path|id> # Use a specific session file or session ID
+pi --fork <path|id>    # Fork a session into a new session file
+```
+
+Useful session commands:
+
+- `/session` shows the current session file and ID.
+- `/tree` navigates the in-file session tree and can summarize abandoned branches.
+- `/fork` creates a new session from an earlier user message.
+- `/clone` duplicates the current active branch into a new session file.
+- `/compact` summarizes older messages to free context.
+
+See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
+
+## Context Files
+
+Pi loads `AGENTS.md` or `CLAUDE.md` at startup from:
+
+- `~/.pi/agent/AGENTS.md` for global instructions
+- parent directories, walking up from the current working directory
+- the current directory
+
+If a directory contains `AGENTS.override.md`, Pi loads it instead of `AGENTS.md` or `CLAUDE.md` from that directory. Context files from other directories still layer normally.
+
+Use context files for project conventions, commands, safety rules, and preferences. Disable loading with `--no-context-files` or `-nc`.
+
+### System Prompt Files
+
+Replace the default system prompt with:
+
+- `.pi/SYSTEM.md` for a project
+- `~/.pi/agent/SYSTEM.md` globally
+
+Append to the default prompt without replacing it with `APPEND_SYSTEM.md` in either location.
+
+### Project Trust
+
+On interactive startup, pi asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.pi/agent/trust.json`. Trusting a project allows pi to load `.pi/settings.json` and `.pi` resources, install missing project packages, and execute project extensions.
+
+Before the trust decision, pi loads only context files, user/global extensions, and CLI `-e` extensions so they can handle the `project_trust` event. Project-local extensions, project package-managed extensions, and project settings are loaded only after the project is trusted. This split also applies when switching to a session from a different cwd whose trust has not been resolved in the current process.
+
+Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore those project resources, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
+
+If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.pi/agent/settings.json`, or change it with `/settings`.
+
+`pi config` and package commands use the same project trust flow, except `pi update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+
+Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.pi/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
+
+
+## Exporting and Sharing Sessions
+
+Use `/export [file]` to write a session to HTML.
+
+Use `/share` to upload a private GitHub gist with a shareable HTML link.
+
+If you use pi for open source work and want to publish sessions for model, prompt, tool, and evaluation research, see [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). It publishes sessions to Hugging Face datasets.
+
+## CLI Reference
+
+```bash
+pi [options] [--] [@files...] [messages...]
+```
+
+### Package Commands
+
+```bash
+pi install <source> [-l]     # Install package, -l for project-local
+pi remove <source> [-l]      # Remove package
+pi uninstall <source> [-l]   # Alias for remove
+pi update [source|self|pi]   # Update pi only, or one package source
+pi update --all              # Update pi and packages; reconcile pinned git refs
+pi update --extensions       # Update packages only; reconcile pinned git refs
+pi update --models           # Refresh model catalogs only
+pi update --self             # Update pi only
+pi update --extension <src>  # Update one package
+pi list                      # List installed packages
+pi config                    # Enable/disable package resources
+```
+
+These commands manage pi packages and `pi update` can update the pi CLI installation. To uninstall pi itself, see [Quickstart](quickstart.md#uninstall). `pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
+
+See [Pi Packages](packages.md) for package sources and security notes.
+
+### Modes
+
+| Flag | Description |
+|------|-------------|
+| default | Interactive mode |
+| `-p`, `--print` | Print response and exit |
+| `--mode json` | Output all events as JSON lines; see [JSON mode](json.md) |
+| `--mode rpc` | RPC mode over stdin/stdout; see [RPC mode](rpc.md) |
+| `--export <in> [out]` | Export a session to HTML |
+
+In print mode, pi also reads piped stdin and merges it into the initial prompt:
+
+```bash
+cat README.md | pi -p "Summarize this text"
+```
+
+### Model Options
+
+| Option | Description |
+|--------|-------------|
+| `--provider <name>` | Provider, such as `anthropic`, `openai`, or `google` |
+| `--model <pattern>` | Model pattern or ID; supports `provider/id` and optional `:<thinking>` |
+| `--api-key <key>` | API key, overriding environment variables |
+| `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
+| `--list-models [search]` | List available models |
+
+### Session Options
+
+| Option | Description |
+|--------|-------------|
+| `-c`, `--continue` | Continue the most recent session |
+| `-r`, `--resume` | Browse and select a session |
+| `--session <path\|id>` | Use a specific session file or partial UUID |
+| `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
+| `--session-dir <dir>` | Custom session storage directory |
+| `--no-session` | Ephemeral mode; do not save |
+| `--name <name>`, `-n <name>` | Set session display name at startup |
+
+### Tool Options
+
+| Option | Description |
+|--------|-------------|
+| `--tools <list>`, `-t <list>` | Allowlist specific built-in, extension, and custom tools |
+| `--exclude-tools <list>`, `-xt <list>` | Disable specific built-in, extension, and custom tools |
+| `--no-builtin-tools`, `-nbt` | Disable built-in tools but keep extension/custom tools enabled |
+| `--no-tools`, `-nt` | Disable all tools |
+
+Built-in tools: `read`, `bash`, `powershell` (Windows), `edit`, `write`, `grep`, `find`, `ls`.
+
+### Resource Options
+
+| Option | Description |
+|--------|-------------|
+| `-e`, `--extension <source>` | Load an extension from path, npm, or git; repeatable |
+| `--no-extensions` | Disable extension discovery |
+| `--skill <path>` | Load a skill; repeatable |
+| `--no-skills` | Disable skill discovery |
+| `--prompt-template <path>` | Load a prompt template; repeatable |
+| `--no-prompt-templates` | Disable prompt template discovery |
+| `--theme <path>` | Load a theme; repeatable |
+| `--no-themes` | Disable theme discovery |
+| `--no-context-files`, `-nc` | Disable `AGENTS.md` and `CLAUDE.md` discovery |
+
+Combine `--no-*` with explicit flags to load exactly what you need, ignoring settings. Example:
+
+```bash
+pi --no-extensions -e ./my-extension.ts
+```
+
+### Other Options
+
+| Option | Description |
+|--------|-------------|
+| `--system-prompt <text>` | Replace default prompt; context files and skills are still appended |
+| `--append-system-prompt <text>` | Append to system prompt |
+| `--tui-mode <mode>` | TUI mode: `regular` (default) or experimental `fullscreen` |
+| `--use-theme <name[/name]>` | Set the initial interactive theme for this run without changing settings |
+| `--verbose` | Force verbose startup |
+| `-a`, `--approve` | Trust project-local files for this run |
+| `-na`, `--no-approve` | Ignore project-local files for this run |
+| `--` | Stop option parsing; remaining arguments are prompts or `@file` inputs |
+| `-h`, `--help` | Show help |
+| `-v`, `--version` | Show version |
+
+In `fullscreen` mode, the transcript scrolls inside the terminal viewport while queued messages, working status, extension widgets, editor, and footer remain fixed at the bottom. Mouse/trackpad input scrolls the region under the pointer; keyboard viewport actions always remain available. Inline images work in terminals that support the Kitty graphics protocol, including Kitty and Ghostty. In iTerm2 they render as text placeholders because its inline-image protocol cannot delete or crop placements during application-owned scrolling. In `regular` mode, pi uses the main screen and terminal-owned scrollback, and iTerm2 inline images continue to render normally. See [Terminal setup](terminal-setup.md) for terminal-specific settings and workarounds.
+
+Set **TUI mode** in `/settings` to switch between `regular` and `fullscreen` immediately and choose the default for future sessions. **Fullscreen exit output** controls whether exiting fullscreen prints the final transcript or restores the previous screen and prints only the session resume hint.
+
+### File Arguments
+
+Prefix files with `@` to include them in the message:
+
+```bash
+pi @prompt.md "Answer this"
+pi -p @screenshot.png "What's in this image?"
+pi @code.ts @test.ts "Review these files"
+```
+
+### Examples
+
+```bash
+# Interactive with initial prompt
+pi "List all .ts files in src/"
+
+# Non-interactive
+pi -p "Summarize this codebase"
+
+# Prompt beginning with a dash
+pi -p -- "- Summarize these points"
+
+# Non-interactive with piped stdin
+cat README.md | pi -p "Summarize this text"
+
+# Named one-shot session
+pi --name "release audit" -p "Audit this repository"
+
+# Different model
+pi --provider openai --model gpt-4o "Help me refactor"
+
+# Model with provider prefix
+pi --model openai/gpt-4o "Help me refactor"
+
+# Model with thinking level shorthand
+pi --model sonnet:high "Solve this complex problem"
+
+# Limit model cycling
+pi --models "claude-*,gpt-4o"
+
+# Read-only mode
+pi --tools read,grep,find,ls -p "Review the code"
+
+# Disable one extension or built-in tool while keeping the rest available
+pi --exclude-tools ask_question
+```
+
+## Design Principles
+
+Pi keeps the core small and pushes workflow-specific behavior into extensions, skills, prompt templates, and packages.
+
+It intentionally does not include built-in MCP, sub-agents, permission popups, plan mode, to-dos, or background bash. You can build or install those workflows as extensions or packages, or use external tools such as containers and tmux.
+
+For the full rationale, read the [blog post](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/).
+
+````

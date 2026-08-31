@@ -1,0 +1,34 @@
+---
+title: "框架评估练习"
+description: "用一次真实请求反向判断框架隐藏了什么。"
+---
+
+# 框架评估练习
+
+选一个框架实现“读取两个文件、修改一个文件、运行测试”。不要先读 marketing 页面，先画出这条 trace：
+
+```text
+user -> context -> model -> tool call -> validation -> permission
+     -> execution -> tool result -> next model -> final -> persistence
+```
+
+然后逐项填写：
+
+1. 谁创建 provider client，谁处理 SSE？
+2. Tool schema 在哪里声明、在哪里真正验证？
+3. unknown tool 和 Tool exception 是 message、exception 还是 silent retry？
+4. 多个 Tool Call 默认串行还是并行？
+5. `maxSteps`、预算、timeout、abort 在哪里设置？
+6. Session 保存的是完整 transcript、摘要还是 graph state？
+7. 重启进程能恢复到哪个边界？
+8. MCP/RAG 结果走 Tool 还是自动注入？
+9. plugin/hook/event 的权限和错误隔离是什么？
+10. Trace 是否记录 token/cost，并且是否脱敏？
+
+<Note>
+
+如果文档没有回答一个问题，不要用猜测填空。打开源码、测试和官方协议；把“框架行为”“应用配置”和“自己的推断”分列。
+
+</Note>
+
+完成后，对照 [三方架构](/19-build-harness/comparison) 和 [Pi 源码索引](/reference/source-map)，你就能判断框架替你完成的是哪段 Harness，而不是只知道一个高层 `agent.invoke()`。

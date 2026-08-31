@@ -1,0 +1,30 @@
+---
+title: "实现 Permission Layer"
+description: "在 Tool 执行前加入路径、命令、超时和审计策略。"
+---
+
+# 实现 Permission Layer
+
+## 判定顺序
+
+```text
+normalize -> classify -> policy -> approval -> sandbox -> execute -> redact -> audit
+```
+
+`normalize` 很关键：`../secret`、符号链接、shell quoting 和 Windows 路径都不能用字符串前缀简单判断。教学示例只实现受限工作目录和危险命令拒绝；生产需要 OS/container 级别的边界。
+
+```text
+allow read if realpath(path) is under workspace
+ask write/edit unless approved scope
+deny command containing destructive pattern
+set timeout and output limit
+record decision without secret contents
+```
+
+## 与 Agent Loop 的位置
+
+权限检查在 schema validation 之后、Tool `execute` 之前；它属于 Harness，不属于模型，也不应藏在 TUI。被拒绝的 Tool 仍返回结构化错误，让模型知道动作没有发生。
+
+## 测试矩阵
+
+测试 cwd 内外路径、符号链接、空命令、shell metacharacters、超时、取消、输出截断和审计 redaction。Go/Java 示例提供可离线运行的基础 policy；不要把它当成安全认证。

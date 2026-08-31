@@ -1,0 +1,12 @@
+---
+title: "Java 08：Events"
+description: "用 EventSink/Listener 观察模型、工具和运行生命周期。"
+---
+
+# Java 08：Events
+
+`EventSink` 接收 `model_attempt`、`tool_start/end`、`tool_error`、`run_end`。返回值负责业务结果，事件负责诊断；这对应 Java Listener，也可换成消息队列适配器。
+
+## 实验
+
+断言 retry 有多个 attempt，Tool 异常有 error 事件，运行结束事件即使最终失败也能说明原因。

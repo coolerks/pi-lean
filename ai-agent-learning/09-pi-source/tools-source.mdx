@@ -1,0 +1,29 @@
+---
+title: "精读 Coding Agent 工具源码"
+description: "用 read、edit、write、bash 追踪 definition 到 executor 的路径。"
+---
+
+# 精读 Coding Agent 工具源码
+
+**入口**：`packages/coding-agent/src/core/tools/index.ts`；**实现**：`read.ts`、`edit.ts`、`write.ts`、`bash.ts`；**symbol**：`createToolDefinition`、`createTool`、各 `create*Tool`；**commit**：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+## Definition 与 executor 分开
+
+`create*ToolDefinition` 只产生给模型看的 name/description/parameters；`create*Tool` 产生带 `execute` 的 AgentTool。`createCodingTools` 组合默认的 read/bash/edit/write，`createReadOnlyTools` 组合 read/grep/find/ls。
+
+## read/edit/write 的关键点
+
+- `read` 有行范围、图片/文本处理和 output truncation；路径要在 cwd 规则内。
+- `edit` 需要旧文本匹配，避免“相似但错误”的替换；失败应返回明确错误。
+- `write` 负责创建/覆盖内容和父目录，写失败不能伪装成成功。
+- `bash` 通过 operations abstraction 执行进程，处理 cwd、输出、退出码、更新和取消。
+
+## 调用链
+
+```text
+createAllTools -> AgentSession registry -> Agent tool definitions
+-> model toolCall -> AgentLoop validation -> beforeTool hooks
+-> tool.execute -> onUpdate/afterTool -> ToolResult
+```
+
+调试时同时观察 schema、validated args、实际 cwd 和截断后的结果；不要只看 UI 显示。

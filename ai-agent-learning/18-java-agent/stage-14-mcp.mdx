@@ -1,0 +1,12 @@
+---
+title: "Java 14：MCP"
+description: "用 newline JSON-RPC 调用 tools/list 和 tools/call。"
+---
+
+# Java 14：MCP
+
+`McpClient` 用 Jackson 构造 request/response，按 id 配对，并将远端 Tool 映射成本地 `Tool`。协议层不等于权限层：远端定义仍需 schema、timeout、网络和用户授权。
+
+## 实验
+
+写一个本地 calculator server，测试错误 response、乱序 id、EOF、超时和恶意参数；再补 initialize 和认证。

@@ -1,0 +1,45 @@
+---
+title: "Pi 源码索引"
+description: "以固定 commit 和 symbol 定位 Agent、Provider、Session、工具与扩展实现。"
+---
+
+# Pi 源码索引
+
+研究 commit：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。以下路径相对于仓库根目录。固定 GitHub 链接使用同一个 commit，避免行号漂移。
+
+| 概念 | Package | 文件 | Symbol | 教材 |
+| --- | --- | --- | --- | --- |
+| Agent Loop 入口 | agent | `packages/agent/src/agent-loop.ts` | `agentLoop`, `runAgentLoop`, `runAgentLoopContinue` | [Loop 源码](/09-pi-source/agent-loop-source) |
+| Tool 调度 | agent | `packages/agent/src/agent-loop.ts` | `executeToolCalls`, `prepareToolCall`, `executePreparedToolCall` | [Tool 生命周期](/04-tools/tool-lifecycle) |
+| Agent 状态与队列 | agent | `packages/agent/src/agent.ts` | `Agent`, `PendingMessageQueue`, `runWithLifecycle` | [Pi Loop](/09-pi-source/agent-loop-source) |
+| Loop 类型契约 | agent | `packages/agent/src/types.ts` | `AgentLoopConfig`, `AgentTool`, `AgentEvent` | [类型契约](/09-pi-source/source-reading) |
+| Harness 公共 API | agent | `packages/agent/src/harness/agent-harness.ts` | `AgentHarness`, `AgentLane`, `LaneSnapshot`, `ActionInfo` | [Harness 边界](/07-harness/architecture) |
+| Harness 设计稿（工作区未跟踪） | agent docs | `packages/agent/docs/harness.v2.md` | Records、lanes、recovery | [可靠性](/07-harness/reliability) |
+| Provider/Model 集合 | ai | `packages/ai/src/models.ts` | `Provider`, `Models`, `createModels`, `streamSimple` dispatch | [Provider](/09-pi-source/provider-source) |
+| 统一消息/流类型 | ai | `packages/ai/src/types.ts` | `Context`, `AssistantMessage`, `ToolCall`, `Usage`, `AssistantMessageEvent` | [API 消息](/01-foundations/api-messages) |
+| Provider 注册 | ai | `packages/ai/src/providers/all.ts` | `builtinProviders`, `builtinModels` | [Monorepo](/08-pi-architecture/monorepo) |
+| 可中止流 | ai | `packages/ai/src/utils/event-stream.ts` | `EventStream`, `AssistantMessageEventStream` | [Streaming](/02-llm-api/http-and-streaming) |
+| Retry | ai | `packages/ai/src/utils/provider-retry.ts` | `retryProviderRequest` | [重试](/03-agent-loop/termination-retry) |
+| Coding Agent 生命周期 | coding-agent | `packages/coding-agent/src/core/agent-session.ts` | `AgentSession`, `_handleAgentEvent`, `_installAgentToolHooks` | [调用链](/08-pi-architecture/call-chain) |
+| Session 树 | coding-agent | `packages/coding-agent/src/core/session-manager.ts` | `SessionManager`, `buildContextEntries`, `sessionEntryToContextMessages` | [Session](/09-pi-source/session-source) |
+| Context/System Prompt | coding-agent | `packages/coding-agent/src/core/system-prompt.ts` | `BuildSystemPromptOptions`, `buildSystemPrompt` | [Context](/05-context/context-composition) |
+| Resource Loader | coding-agent | `packages/coding-agent/src/core/resource-loader.ts` | `ResourceLoader`, `DefaultResourceLoader`, `loadProjectContextFiles` | [Skills](/12-skills/skills) |
+| Skill discovery | coding-agent | `packages/coding-agent/src/core/skills.ts` | `loadSkillsFromDir`, `formatSkillsForPrompt`, `loadSkills` | [Progressive disclosure](/12-skills/progressive-disclosure) |
+| Tool registry | coding-agent | `packages/coding-agent/src/core/tools/index.ts` | `createTool`, `createToolDefinition`, `createCodingTools` | [工具系统](/10-coding-agent/tool-system) |
+| read 工具 | coding-agent | `packages/coding-agent/src/core/tools/read.ts` | `createReadToolDefinition`, `createReadTool` | [工具源码](/09-pi-source/tools-source) |
+| edit 工具 | coding-agent | `packages/coding-agent/src/core/tools/edit.ts` | `createEditToolDefinition`, `createEditTool` | [工具源码](/09-pi-source/tools-source) |
+| write 工具 | coding-agent | `packages/coding-agent/src/core/tools/write.ts` | `createWriteToolDefinition`, `createWriteTool` | [工具源码](/09-pi-source/tools-source) |
+| bash 工具 | coding-agent | `packages/coding-agent/src/core/tools/bash.ts` | `createBashToolDefinition`, `createBashTool` | [安全](/15-security/threat-model) |
+| Extension loader | coding-agent | `packages/coding-agent/src/core/extensions/loader.ts` | `loadExtensions`, `loadExtensionsCached`, `discoverAndLoadExtensions` | [Extensions](/11-extensions/pi-extensions) |
+| Extension runner | coding-agent | `packages/coding-agent/src/core/extensions/runner.ts` | `ExtensionRunner`, `emitToolCall`, `emitToolResult` | [Extensions](/11-extensions/pi-extensions) |
+| Extension API | coding-agent | `packages/coding-agent/src/core/extensions/types.ts` | `Extension`, `ExtensionContext`, `ToolDefinition`, `defineTool` | [插件基础](/11-extensions/plugin-basics) |
+| CLI/TUI/RPC | coding-agent | `packages/coding-agent/src/modes/`, `src/cli/`, `src/rpc-entry.ts` | `interactive-mode`, `print-mode`, `rpc-mode` | [运行模式](/10-coding-agent/cli-tui-rpc) |
+| Telemetry | telemetry/coding-agent | `packages/telemetry/src/index.ts`, `packages/coding-agent/src/core/telemetry.ts` | telemetry contracts and session instrumentation | [遥测](/16-observability/telemetry) |
+
+## 固定链接模板
+
+```text
+https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/agent/src/agent-loop.ts
+```
+
+页面引用优先写 `file path + symbol + commit`，再给少量代码片段；不要依赖易失行号。

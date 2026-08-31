@@ -1,0 +1,19 @@
+---
+title: "Java 15：组合 Harness"
+description: "组合 Model、Loop、Session、权限、插件、MCP 和 Telemetry。"
+---
+
+# Java 15：组合 Harness
+
+`Harness` 创建 PermissionPolicy、ToolRegistry、AgentLoop、Session 和 Telemetry；`prompt` 从 Session snapshot 加入 user message，运行后保存消息前缀。`Main --demo` 用 ScriptedModel，不创建真实 API 请求。
+
+这份代码展示组合边界，不声称已经实现 durable operation log。要达到 `harness.v2.md` 的可靠性目标，还要把 operation acceptance、intent/result、terminal transaction 和恢复状态显式持久化，并为每个 crash point 写测试。
+
+验收：
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn test
+mvn package
+java -jar target/agent-harness-1.0.0.jar --demo
+```

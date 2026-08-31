@@ -1,0 +1,35 @@
+---
+title: "RAG 与检索基础"
+description: "从 chunk、BM25、embedding 到 hybrid search 建立可操作理解。"
+---
+
+# RAG 与检索基础
+
+## 索引和查询
+
+```text
+文档 -> chunk -> metadata
+      -> embedding/vector index
+      -> query embedding
+      -> similarity / BM25
+      -> top K -> rerank -> context
+```
+
+- Chunk 是可检索的文本片段，大小和重叠会影响召回。
+- Embedding 把文本映射到向量；cosine similarity 比较方向。
+- Sparse/BM25 依赖词项和频率，适合精确名字；dense retrieval 适合语义相似。
+- Hybrid 将两者融合；rerank 用更贵的模型重排候选。
+- Metadata filter 先限制租户、文件类型或权限；top K 是成本/召回的取舍。
+
+## RAG 不是 Session
+
+RAG 从索引找外部知识；Session 保存对话和工作状态。RAG 结果应带来源、时间和权限，不应悄悄写进长期 memory。Context Window 仍限制最终注入的片段总量。
+
+## 两种接入
+
+| 方案 | 优点 | 风险 |
+| --- | --- | --- |
+| Harness 自动检索 | 每次请求可强制加入相关知识，行为稳定 | 查询意图和成本由宿主承担，可能注入无关内容 |
+| `search_knowledge` Tool | 模型按需查询，工具链清晰 | 模型可能忘记查、重复查或构造坏 query |
+
+先用内存 BM25/余弦 Demo 验证数据流，再考虑数据库和框架；不要用向量库掩盖 chunk、权限和评估问题。

@@ -1,0 +1,208 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "AI Agent 工程教材",
+  "theme": "mint",
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#60A5FA",
+    "dark": "#2563EB"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "开始学习",
+        "pages": ["index", "00-guide/reading-path", "00-guide/course-map"]
+      },
+      {
+        "group": "基础：从 LLM 到 Agent",
+        "pages": [
+          "01-foundations/llm-to-agent",
+          "01-foundations/concepts",
+          "01-foundations/api-messages",
+          "02-llm-api/http-and-streaming",
+          "02-llm-api/provider-adapters",
+          "02-llm-api/structured-output"
+        ]
+      },
+      {
+        "group": "Agent Loop 与工具",
+        "pages": [
+          "03-agent-loop/react",
+          "03-agent-loop/basic-loop",
+          "03-agent-loop/pi-agent-loop",
+          "03-agent-loop/termination-retry",
+          "03-agent-loop/error-matrix",
+          "03-agent-loop/parallel-tools",
+          "04-tools/tool-calling",
+          "04-tools/tool-lifecycle",
+          "04-tools/coding-tools",
+          "04-tools/security-boundary"
+        ]
+      },
+      {
+        "group": "Context、Session 与 Harness",
+        "pages": [
+          "05-context/context-composition",
+          "05-context/prompt-engineering",
+          "06-session/session-tree",
+          "06-session/compaction",
+          "06-session/persistence",
+          "07-harness/what-is-harness",
+          "07-harness/architecture",
+          "07-harness/lifecycle",
+          "07-harness/reliability",
+          "07-harness/build-your-own",
+          "07-harness/final-design"
+        ]
+      },
+      {
+        "group": "Pi 架构与源码",
+        "pages": [
+          "08-pi-architecture/monorepo",
+          "08-pi-architecture/package-guide",
+          "08-pi-architecture/call-chain",
+          "09-pi-source/source-reading",
+          "09-pi-source/agent-loop-source",
+          "09-pi-source/provider-source",
+          "09-pi-source/session-source",
+          "09-pi-source/tools-source",
+          "09-pi-source/source-debugging",
+          "10-coding-agent/overview",
+          "10-coding-agent/tool-system",
+          "10-coding-agent/cli-tui-rpc"
+        ]
+      },
+      {
+        "group": "扩展能力",
+        "pages": [
+          "11-extensions/plugin-basics",
+          "11-extensions/pi-extensions",
+          "11-extensions/go-java-plugins",
+          "12-skills/skills",
+          "12-skills/progressive-disclosure",
+          "13-mcp/json-rpc-mcp",
+          "13-mcp/mcp-client",
+          "14-rag/retrieval",
+          "14-rag/rag-tool",
+          "15-security/threat-model",
+          "15-security/permission-layer",
+          "16-observability/telemetry",
+          "16-observability/tracing"
+        ]
+      },
+      {
+        "group": "Go 实现",
+        "pages": [
+          "17-go-agent/overview",
+          "17-go-agent/stage-01-client",
+          "17-go-agent/stage-02-streaming",
+          "17-go-agent/stage-02-loop",
+          "17-go-agent/stage-03-tool-definition",
+          "17-go-agent/stage-03-tools",
+          "17-go-agent/stage-04-loop",
+          "17-go-agent/stage-04-runtime",
+          "17-go-agent/stage-05-coding-tools",
+          "17-go-agent/stage-05-harness",
+          "17-go-agent/stage-06-context",
+          "17-go-agent/stage-07-retry-abort",
+          "17-go-agent/stage-08-events",
+          "17-go-agent/stage-09-session",
+          "17-go-agent/stage-10-compaction",
+          "17-go-agent/stage-11-steering",
+          "17-go-agent/stage-12-plugin",
+          "17-go-agent/stage-13-skill",
+          "17-go-agent/stage-14-mcp",
+          "17-go-agent/stage-15-harness"
+        ]
+      },
+      {
+        "group": "Java 实现",
+        "pages": [
+          "18-java-agent/overview",
+          "18-java-agent/stage-01-client",
+          "18-java-agent/stage-02-streaming",
+          "18-java-agent/stage-02-loop",
+          "18-java-agent/stage-03-tool-interface",
+          "18-java-agent/stage-03-tools",
+          "18-java-agent/stage-04-loop",
+          "18-java-agent/stage-04-runtime",
+          "18-java-agent/stage-05-coding-tools",
+          "18-java-agent/stage-05-harness",
+          "18-java-agent/stage-06-context",
+          "18-java-agent/stage-07-retry-cancellation",
+          "18-java-agent/stage-08-events",
+          "18-java-agent/stage-09-session",
+          "18-java-agent/stage-10-compaction",
+          "18-java-agent/stage-11-steering",
+          "18-java-agent/stage-12-plugin",
+          "18-java-agent/stage-13-skill",
+          "18-java-agent/stage-14-mcp",
+          "18-java-agent/stage-15-harness"
+        ]
+      },
+      {
+        "group": "最终设计与框架辨析",
+        "pages": [
+          "19-build-harness/architecture",
+          "19-build-harness/milestones",
+          "19-build-harness/comparison",
+          "20-frameworks/framework-map",
+          "20-frameworks/evaluation"
+        ]
+      },
+      {
+        "group": "参考资料",
+        "pages": [
+          "reference/source-map",
+          "reference/glossary",
+          "reference/concepts",
+          "reference/sources",
+          "reference/translation-map"
+        ]
+      },
+      {
+        "group": "Pi 官方文档中文版",
+        "pages": [
+          "pi-docs/README",
+          "pi-docs/agent/harness",
+          "pi-docs/agent/harness-v2",
+          "pi-docs/agent/search",
+          "pi-docs/agent/telemetry-schema",
+          "pi-docs/coding-agent/index",
+          "pi-docs/coding-agent/quickstart",
+          "pi-docs/coding-agent/usage",
+          "pi-docs/coding-agent/providers",
+          "pi-docs/coding-agent/security",
+          "pi-docs/coding-agent/containerization",
+          "pi-docs/coding-agent/settings",
+          "pi-docs/coding-agent/keybindings",
+          "pi-docs/coding-agent/sessions",
+          "pi-docs/coding-agent/compaction",
+          "pi-docs/coding-agent/extensions",
+          "pi-docs/coding-agent/skills",
+          "pi-docs/coding-agent/prompt-templates",
+          "pi-docs/coding-agent/themes",
+          "pi-docs/coding-agent/packages",
+          "pi-docs/coding-agent/models",
+          "pi-docs/coding-agent/custom-provider",
+          "pi-docs/coding-agent/session-format",
+          "pi-docs/coding-agent/sdk",
+          "pi-docs/coding-agent/rpc",
+          "pi-docs/coding-agent/json",
+          "pi-docs/coding-agent/tui",
+          "pi-docs/coding-agent/windows",
+          "pi-docs/coding-agent/termux",
+          "pi-docs/coding-agent/tmux",
+          "pi-docs/coding-agent/terminal-setup",
+          "pi-docs/coding-agent/shell-aliases",
+          "pi-docs/coding-agent/development",
+          "pi-docs/coding-agent/environment-variables",
+          "pi-docs/coding-agent/llama-cpp"
+        ]
+      }
+    ]
+  },
+  "redirects": [
+    { "source": "/start", "destination": "/00-guide/reading-path" }
+  ]
+}

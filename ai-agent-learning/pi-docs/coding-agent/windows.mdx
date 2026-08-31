@@ -1,0 +1,95 @@
+---
+title: "Windows 设置"
+description: "PowerShell 工具和自定义 Bash 路径。"
+---
+
+# Windows 设置
+
+> 本页是 `packages/coding-agent/docs/windows.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+PowerShell 工具和自定义 Bash 路径。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### Windows 上的 Bash 选择
+
+Pi 默认使用 Git Bash。它按这个顺序寻找 shell：`~/.pi/agent/settings.json` 中的自定义路径、`C:\\Program Files\\Git\\bin\\bash.exe`、以及 PATH 上的 `bash.exe`（可能来自 Cygwin、MSYS2 或 WSL）。对多数用户，安装 Git for Windows 就足够。自定义路径只应指向你信任的 shell，不要把仓库内容直接当作 shell 配置。
+
+### PowerShell Tool
+
+可选的 `powershell` Tool 优先使用 `pwsh.exe`，否则使用 Windows PowerShell；启动参数是 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`。管理员强制的 execution policy 仍可能优先于这些参数。要让模型使用 PowerShell 替代 model-facing `bash`，在 `defaultTools` 中写 `read`、`powershell`、`edit`、`write`；若要比较两者，可以同时列出 `bash` 和 `powershell`。编辑器里的 `!` 与 `!!` 命令仍使用 Bash，不会因 `defaultTools` 改变。
+
+### Custom Bash Path
+
+在 `~/.pi/agent/settings.json` 中配置 `shellPath`，值应是 JSON 字符串形式的 Windows 路径，例如 `C:\\cygwin64\\bin\\bash.exe`。JSON 的反斜杠需要转义；修改后重新启动 Pi 或按资源重新加载流程确认配置生效。
+
+> 译者注：`defaultTools` 决定模型可以看到和调用的 Tool，`!`/`!!` 是编辑器命令路径；它们是两个不同的入口，所以只替换 `bash` 不会替换用户命令的 shell。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Windows Setup | Windows Setup |
+| PowerShell Tool | PowerShell Tool |
+| Custom Bash Path | Custom Bash Path |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/windows.md)
+
+````markdown
+# Windows Setup
+
+Pi uses Git Bash by default on Windows. Checked locations (in order):
+
+1. Custom path from `~/.pi/agent/settings.json`
+2. Git Bash (`C:\Program Files\Git\bin\bash.exe`)
+3. `bash.exe` on PATH (Cygwin, MSYS2, WSL)
+
+For most users, [Git for Windows](https://git-scm.com/download/win) is sufficient.
+
+## PowerShell Tool
+
+The optional `powershell` tool runs commands through `pwsh.exe` when available, otherwise Windows PowerShell. It starts PowerShell with `-NoProfile -NonInteractive -ExecutionPolicy Bypass`. Administrator-enforced execution policies can still take precedence.
+
+Use `defaultTools` to replace the model-facing `bash` tool:
+
+```json
+{
+  "defaultTools": ["read", "powershell", "edit", "write"]
+}
+```
+
+Or enable both while comparing behavior:
+
+```json
+{
+  "defaultTools": ["read", "bash", "powershell", "edit", "write"]
+}
+```
+
+The `!` and `!!` editor commands still use Bash.
+
+## Custom Bash Path
+
+```json
+{
+  "shellPath": "C:\\cygwin64\\bin\\bash.exe"
+}
+```
+
+````

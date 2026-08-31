@@ -1,0 +1,12 @@
+---
+title: "Java 05：基础 Coding Tools"
+description: "用 Path、Files、ProcessBuilder 实现受限本地工具。"
+---
+
+# Java 05：基础 Coding Tools
+
+`BuiltInTools` 提供 `read`、`write`、`edit`、`grep`、`shell`、`calculator`。`PermissionPolicy` 在 `Path.normalize().toAbsolutePath()` 后检查 workspace；`ProcessBuilder` 的输出和退出码进入 Tool Result。
+
+## 实验
+
+测试 workspace 外路径、旧文本不唯一、shell 超时、非零退出码和大输出；读两个独立文件可并行，同一文件的写读要保序。

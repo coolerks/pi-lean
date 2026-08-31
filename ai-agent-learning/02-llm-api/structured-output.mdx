@@ -1,0 +1,39 @@
+---
+title: "Structured Output 与校验"
+description: "把 JSON Schema 当成约束而不是安全边界。"
+---
+
+# Structured Output 与校验
+
+## 两道门
+
+模型可以被要求输出 JSON Schema，但 Provider 的约束能力不同，流式 JSON 也可能不完整。因此 Runtime 需要：
+
+1. 解析：确认内容是合法 JSON。
+2. 校验：确认符合 Tool 的参数 schema、字段类型和业务限制。
+3. 授权：确认这个调用对当前目录、命令和用户是允许的。
+
+Schema 通过只解决了第一层的一部分问题，不会授权 `rm -rf`。
+
+```json
+{
+  "name": "read_file",
+  "description": "读取工作目录中的文件",
+  "parameters": {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+    "additionalProperties": false
+  }
+}
+```
+
+## Tool Call 的错误路径
+
+未知工具、参数 JSON 损坏、schema 不匹配和权限拒绝都应产生可回传给模型的错误 `ToolResult`，而不是让整个进程崩溃。不可恢复的 Provider 错误则产生 `AssistantMessage` 的 `stopReason: "error"`，并触发外层 retry/finish 策略。
+
+Pi 的 `AgentTool` 使用 TypeBox schema，`agent-loop.ts` 在 `prepareToolCall` 中先找工具、执行可选 `prepareArguments`，再调用 `validateToolArguments`，最后才进入 `execute`。这是“模型输出”和“副作用”之间的关键隔离点。
+
+## 练习
+
+为 calculator 写三个用例：合法参数、缺少字段、额外字段。验证三者都不会在校验失败时调用真正的函数；Go/Java 测试应检查 dispatch 记录为空。

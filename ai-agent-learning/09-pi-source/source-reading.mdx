@@ -1,0 +1,33 @@
+---
+title: "如何精读 Pi 源码"
+description: "用职责、输入输出、调用方和实验替代逐行抄代码。"
+---
+
+# 如何精读 Pi 源码
+
+每篇源码文章固定记录：文件、核心 symbol、package、调用方、被调用方、研究 commit。先回答下面 12 个问题：
+
+1. 文件为什么存在？
+2. 它在系统哪一层？
+3. exported 入口是什么？
+4. 输入从哪里来？
+5. 输出交给谁？
+6. 核心 interface/type 是什么？
+7. 正常流程是什么？
+8. 错误、取消和空值怎么处理？
+9. 哪些状态被持久化？
+10. 设计是源码事实还是推断？
+11. Go/Java 怎么表达同一边界？
+12. 能做什么观察/修改/实现/设计实验？
+
+## 最小引用规则
+
+引用十几行能说明控制流的代码即可；代码下面说明输入、输出、状态变化和下一个调用方。需要全貌时给固定 commit 文件链接，而不是复制几百行。
+
+```text
+file path + symbol + commit
+packages/agent/src/agent-loop.ts
+runAgentLoop -> runLoop -> streamAssistantResponse -> executeToolCalls
+```
+
+TypeScript 里的 `interface`、泛型和 union 可以映射到 Java interface/泛型/密封层次或 Go interface/struct；不要因为语法不同就把架构边界删掉。

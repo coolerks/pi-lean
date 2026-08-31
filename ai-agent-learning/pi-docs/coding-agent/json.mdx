@@ -1,0 +1,162 @@
+---
+title: "JSON Event Stream Mode"
+description: "机器消费的 JSON 事件流模式和消息格式。"
+---
+
+# JSON Event Stream Mode
+
+> 本页是 `packages/coding-agent/docs/json.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+机器消费的 JSON 事件流模式和消息格式。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+用 `pi --mode json "Your prompt"` 把所有 Session 事件逐行写到 stdout，适合脚本、日志管道或自定义 UI。每一行都是独立 JSON 对象，不能把整个 stdout 当成一个 JSON array；stderr 应单独处理。
+
+### 事件类型与消息类型
+
+wire event 类型是 `JsonAgentSessionEvent`。它基本对应 `AgentSessionEvent`，但 `message_update` 去掉了累计 `partial` 快照，改为包含 `usage` 和精简的 `assistantMessageEvent`。`toolcall_start` 保留稳定的 `id`、`toolName`，其余增量只传 delta。`queue_update` 在 steering/follow-up 队列改变时发送完整队列；`compaction_start`/`compaction_end` 同时覆盖手动和自动压缩。
+
+底层 `AgentEvent` 还包括 `agent_start/end`、`turn_start/end`、`message_start/update/end` 和 `tool_execution_start/update/end`。基础消息来自 `packages/ai/src/types.ts` 的 `UserMessage`、`AssistantMessage`、`ToolResultMessage`；Coding Agent 还增加 `BashExecutionMessage`、`CustomMessage`、`BranchSummaryMessage`、`CompactionSummaryMessage`。这些 role/type 是协议字段，客户端应按 discriminator 分支，不要用是否有 `content` 猜类型。
+
+### 输出与增量拼接
+
+第一行通常是 `type: "session"` 的 header，包含 `version`、`id`、`timestamp` 和 `cwd`；随后是 lifecycle、message、Tool 和 compaction 事件。`message_update` 只传增量，不传累计 `message`，所以客户端需要按 `contentIndex` 和 `delta` 拼接文本、thinking 或 Tool Call arguments；Provider 只在完成时报告 usage 时，中间 usage 可能为零。最终 `message_end` 才是权威完整消息，`agent_end` 给出本次最终 messages。
+
+例如只筛选完整消息：
+
+```bash
+pi --mode json "List files" 2>/dev/null | jq -c 'select(.type == "message_end")'
+```
+
+> 译者注：JSON mode 是 AgentSession 的观察/集成表面；RPC mode 则是带命令和响应语义的控制协议。两者都可能使用 JSONL，但不能互换客户端。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| JSON Event Stream Mode | JSON Event Stream Mode |
+| Event Types | Event Types |
+| Message Types | 消息类型 |
+| Output Format | Output Format |
+| Example | Example |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/json.md)
+
+````markdown
+# JSON Event Stream Mode
+
+```bash
+pi --mode json "Your prompt"
+```
+
+Outputs all session events as JSON lines to stdout. Useful for integrating pi into other tools or custom UIs.
+
+## Event Types
+
+Wire events use `JsonAgentSessionEvent`. It matches
+[`AgentSessionEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts)
+except that streaming message updates omit cumulative snapshots:
+
+```typescript
+type WithoutPartial<T> = T extends { partial: unknown } ? Omit<T, "partial"> : T;
+
+type JsonAssistantMessageEvent<T> = T extends { type: "toolcall_start"; partial: unknown }
+  ? WithoutPartial<T> & { id: string; toolName: string }
+  : WithoutPartial<T>;
+
+type JsonAgentSessionEvent =
+  | Exclude<AgentSessionEvent, { type: "message_update" }>
+  | {
+      type: "message_update";
+      usage: Usage;
+      assistantMessageEvent: JsonAssistantMessageEvent<AssistantMessageEvent>;
+    };
+```
+
+`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction.
+
+Other base events come from
+[`AgentEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/types.ts):
+
+```typescript
+type AgentEvent =
+  // Agent lifecycle
+  | { type: "agent_start" }
+  | { type: "agent_end"; messages: AgentMessage[] }
+  // Turn lifecycle
+  | { type: "turn_start" }
+  | { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+  // Message lifecycle
+  | { type: "message_start"; message: AgentMessage }
+  | { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+  | { type: "message_end"; message: AgentMessage }
+  // Tool execution
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+  | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+```
+
+## Message Types
+
+Base messages from [`packages/ai/src/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/types.ts#L134):
+- `UserMessage` (line 134)
+- `AssistantMessage` (line 140)
+- `ToolResultMessage` (line 152)
+
+Extended messages from [`packages/coding-agent/src/core/messages.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/messages.ts#L29):
+- `BashExecutionMessage` (line 29)
+- `CustomMessage` (line 46)
+- `BranchSummaryMessage` (line 55)
+- `CompactionSummaryMessage` (line 62)
+
+## Output Format
+
+Each line is a JSON object. The first line is the session header:
+
+```json
+{"type":"session","version":3,"id":"uuid","timestamp":"...","cwd":"/path"}
+```
+
+Followed by events as they occur:
+
+```json
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","content":[],...}}
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}
+{"type":"message_end","message":{...}}
+{"type":"turn_end","message":{...},"toolResults":[]}
+{"type":"agent_end","messages":[...]}
+```
+
+`message_update` records are delta-only. They omit both the cumulative `message` field and
+`assistantMessageEvent.partial` to keep stream size linear. The top-level `usage` field contains
+the latest cumulative provider-reported usage and may remain zero when a provider only reports
+usage at completion. Use `contentIndex` and `delta` to assemble live text, thinking, or tool-call
+arguments if needed. A `toolcall_start` event also includes the constant-sized `id` and `toolName`
+fields. `message_end` contains the final authoritative message.
+
+## Example
+
+```bash
+pi --mode json "List files" 2>/dev/null | jq -c 'select(.type == "message_end")'
+```
+
+````

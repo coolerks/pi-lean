@@ -1,0 +1,19 @@
+---
+title: "Go 03：Tool Definition"
+description: "定义 Tool、JSON Schema 和执行边界。"
+---
+
+# Go 03：Tool Definition
+
+```go
+type Tool interface {
+    Definition() ToolDefinition
+    Execute(context.Context, json.RawMessage) (ToolResult, error)
+}
+```
+
+模型只看到 `Definition`；只有 `Registry.Validate` 通过名称、object 参数和 required 字段检查后，Runtime 才调用 `Execute`。模型生成的是数据，不是 Go 函数调用。
+
+## 实验
+
+注册 `calculator` 和一个计数 Tool，断言 unknown name、非法 JSON、缺字段都不会进入 Tool；再为错误结果保留 `toolCallID`，让下一轮模型能定位失败。

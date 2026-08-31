@@ -1,0 +1,127 @@
+---
+title: "tmux 设置"
+description: "Pi TUI 使用 tmux 时的推荐配置和键盘协议。"
+---
+
+# tmux 设置
+
+> 本页是 `packages/coding-agent/docs/tmux.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+Pi TUI 使用 tmux 时的推荐配置和键盘协议。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 推荐配置
+
+tmux 默认会丢弃部分修饰键的信息，所以 `Shift+Enter` 和 `Ctrl+Enter` 可能退化成普通 `Enter`。在 `~/.tmux.conf` 中开启 `extended-keys`，并把 `extended-keys-format` 设为 `csi-u`，然后完全重启 tmux：先执行 `tmux kill-server`，再运行 `tmux`。`extended-keys-format` 要求 tmux 3.5 或更新版本。
+
+当 Kitty keyboard protocol 不可用时，Pi 会自动请求 extended key reporting。`csi-u` 是推荐格式，因为它能稳定表达修饰键；但 Pi 同时支持 tmux 默认的 xterm `modifyOtherKeys` 格式。
+
+### 为什么选择 csi-u
+
+只设置 `extended-keys on` 时，tmux 使用 xterm 格式，例如 `Ctrl+C` 是 `\\x1b[27;5;99~`，`Ctrl+Enter` 是 `\\x1b[27;5;13~`。启用 `csi-u` 后，它们分别变为 `\\x1b[99;5u` 和 `\\x1b[13;5u`。这些是终端传输序列，不是要输入配置文件的普通文字；页面原文保留了完整的逐键映射。
+
+### 这解决什么问题
+
+没有 extended keys 时，普通 Enter、Shift+Enter、Ctrl+Enter 和 Alt/Option+Enter 可能都被看成 `\\r` 或 `\\x1b\\r`。这会影响默认 keybindings：`Enter` 提交、`Shift+Enter` 换行，以及所有使用修饰版 Enter 的自定义绑定。启用 csi-u 后，TUI 能区分这些动作。
+
+### 版本要求
+
+`extended-keys-format csi-u` 需要 tmux 3.5 或更新版本，可用 `tmux -V` 检查；终端还必须支持 extended keys，例如 Ghostty、Kitty、iTerm2、WezTerm 或 Windows Terminal。tmux 3.2–3.4 不应写 csi-u，只启用 `extended-keys on`，让 Pi 使用 xterm 格式。
+
+> 译者注：这里的问题在 TUI 之前的 terminal transport 层。Java Listener 或 Go callback 收到的 key event 已经是解析后的结果；若 tmux 丢了修饰键，应用层没有机会把普通 Enter 重新猜成 Ctrl+Enter。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| tmux Setup | tmux Setup |
+| Recommended Configuration | Recommended 配置 |
+| Why `csi-u` Is Recommended | Why csi-u Is Recommended |
+| What This Fixes | What This Fixes |
+| Requirements | Requirements |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/tmux.md)
+
+````markdown
+# tmux Setup
+
+Pi works inside tmux, but tmux strips modifier information from certain keys by default. Without configuration, `Shift+Enter` and `Ctrl+Enter` are usually indistinguishable from plain `Enter`.
+
+## Recommended Configuration
+
+Add to `~/.tmux.conf`:
+
+```tmux
+set -g extended-keys on
+set -g extended-keys-format csi-u
+```
+
+Then restart tmux fully:
+
+```bash
+tmux kill-server
+tmux
+```
+
+Pi requests extended key reporting automatically when Kitty keyboard protocol is not available. With `extended-keys-format csi-u`, tmux forwards modified keys in CSI-u format, which is the most reliable configuration. The `extended-keys-format` option requires tmux 3.5 or later.
+
+## Why `csi-u` Is Recommended
+
+With only:
+
+```tmux
+set -g extended-keys on
+```
+
+tmux defaults to `extended-keys-format xterm`. When an application requests extended key reporting, modified keys are forwarded in xterm `modifyOtherKeys` format such as:
+
+- `Ctrl+C` → `\x1b[27;5;99~`
+- `Ctrl+D` → `\x1b[27;5;100~`
+- `Ctrl+Enter` → `\x1b[27;5;13~`
+
+With `extended-keys-format csi-u`, the same keys are forwarded as:
+
+- `Ctrl+C` → `\x1b[99;5u`
+- `Ctrl+D` → `\x1b[100;5u`
+- `Ctrl+Enter` → `\x1b[13;5u`
+
+Pi supports both formats, but `csi-u` is the recommended tmux setup.
+
+## What This Fixes
+
+Without tmux extended keys, modified Enter keys collapse to legacy sequences:
+
+| Key | Without extkeys | With `csi-u` |
+|-----|-----------------|--------------|
+| Enter | `\r` | `\r` |
+| Shift+Enter | `\r` | `\x1b[13;2u` |
+| Ctrl+Enter | `\r` | `\x1b[13;5u` |
+| Alt/Option+Enter | `\x1b\r` | `\x1b[13;3u` |
+
+This affects the default keybindings (`Enter` to submit, `Shift+Enter` for newline) and any custom keybindings using modified Enter.
+
+## Requirements
+
+- tmux 3.5 or later for `extended-keys-format csi-u` (run `tmux -V` to check)
+- A terminal emulator that supports extended keys (Ghostty, Kitty, iTerm2, WezTerm, Windows Terminal)
+
+With tmux 3.2 through 3.4, omit `extended-keys-format csi-u`; Pi still supports tmux's default xterm `modifyOtherKeys` format.
+
+````

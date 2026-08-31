@@ -1,0 +1,28 @@
+---
+title: "十个阶段性项目"
+description: "通过可验证 Milestone 逐步完成 Go 和 Java Harness。"
+---
+
+# 十个阶段性项目
+
+| Milestone | 目标 | 验收 |
+| --- | --- | --- |
+| 1 | 纯聊天 CLI | HTTP/FakeModel、错误、无 key 测试 |
+| 2 | calculator | schema、dispatch、unknown tool |
+| 3 | 最小 Coding Agent | read/write/grep/shell、权限和 max steps |
+| 4 | Session | JSONL 保存、恢复、坏文件错误 |
+| 5 | Compaction | token 估算、summary、恢复后的投影 |
+| 6 | Steering/Follow-up | turn 边界、abort 时队列语义 |
+| 7 | Plugin | registry、冲突、生命周期、失败策略 |
+| 8 | Skill | metadata、按需正文、无效 frontmatter |
+| 9 | MCP | JSON-RPC id、tools/list/call、断线 |
+| 10 | 完整 Harness | telemetry、权限、配置、集成和 crash 设计 |
+
+## 每项都要有四类实验
+
+- 观察：打印/断言状态、消息和事件。
+- 修改：改变执行模式、上限或 hook。
+- 实现：新增一个可测试能力。
+- 设计：说明 race、恢复和安全取舍。
+
+Go 和 Java 的 milestone 对应知识点，但不强求代码逐行一致：Go 显式传 `context.Context` 和 channel；Java 显式传 token、Future/Executor 和 Listener。

@@ -1,0 +1,46 @@
+---
+title: "阅读指南"
+description: "为 Java 后端工程师设计的 AI Agent 学习路径。"
+---
+
+# 阅读指南
+
+## 适合谁
+
+你有 Java 后端经验，熟悉 HTTP、JSON、并发和测试；Go 只需要基础语法，TypeScript 只解释到能够读懂 Pi。教程不要求先学 React，也不要求先安装 Agent Framework。
+
+学完后，你应该能从 HTTP API 开始写出一个带 Tool Calling 的 Agent，解释它的持久化、取消、重试和权限边界，并读懂 Pi 的关键调用链。
+
+## 怎么走
+
+<Steps>
+  <Step title="先建立模型边界">
+    阅读 LLM、Message、Context 和 Tool Calling。每次先问：这一段是模型输出，还是 Runtime 的动作？
+  </Step>
+  <Step title="再写最小闭环">
+    用 `ScriptedModel` 测试两轮：第一轮返回 calculator 的 `tool_call`，第二轮返回文本。这样不需要 API key。
+  </Step>
+  <Step title="最后补可靠性">
+    加入 max steps、retry、abort、Session、Compaction、Steering、Permission 和 Telemetry。
+  </Step>
+</Steps>
+
+## 哪些可以略读
+
+- 已经熟悉 HTTP/SSE 的读者可以略读 `02-llm-api` 的协议细节，但仍应看 Provider adapter 的边界。
+- 只想实现单进程 Agent 的读者可先略过 `07-harness/reliability` 的崩溃恢复设计，之后再回来做设计实验。
+- `pi-docs` 是查阅型内容，不必按顺序读；学习原创教材时以当前源码为事实来源。
+
+## 三种语言的关系
+
+| 语言/层 | 教材中的用途 |
+| --- | --- |
+| TypeScript | 观察 Pi 的接口、联合类型、`Promise`、`AsyncIterable` 和事件流。 |
+| Go | 用 `context.Context`、channel 和标准库展示显式并发与取消。 |
+| Java | 用 interface、`ExecutorService`/`Future`、Listener 和 `ServiceLoader` 建立同一组抽象；异步封装时可再使用 `CompletableFuture`。 |
+
+`async/await` 可以先类比 Java `CompletableFuture` 的顺序组合；`AbortSignal` 可以类比取消令牌，但它不是线程强杀。Go 的 `context.Context` 同样只表达取消和截止时间，实际工具必须主动检查它。
+
+## Pi 的角色
+
+Pi 是案例，不是唯一正确答案。当前研究版本的低层 `Agent` 和 `agent-loop.ts` 可以运行；`harness/agent-harness.ts` 是尚未完成的公共骨架。教材会把“源码事实”“官方说明”和“设计推断”分开。

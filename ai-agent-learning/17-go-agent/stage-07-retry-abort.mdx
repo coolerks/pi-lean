@@ -1,0 +1,12 @@
+---
+title: "Go 07：Retry 与 Abort"
+description: "使用 context.Context 和有限 backoff 处理可恢复失败。"
+---
+
+# Go 07：Retry 与 Abort
+
+`RetryPolicy` 只在允许重试的 Model 错误上进行有限次数尝试；backoff 期间用 `select` 监听 `ctx.Done()`。`Abort` 调用当前 run 的 cancel，不杀进程；工具和 HTTP 请求必须继续传递同一个 context。
+
+## 实验
+
+让 `ScriptedModel` 先返回 503 再成功，断言 attempt 数；让它延迟并在中途取消，断言没有下一轮请求。区分 timeout、429、永久 4xx 和用户 abort。

@@ -1,0 +1,256 @@
+---
+title: "快速开始"
+description: "安装、认证、第一次 session 和常见 CLI 用法。"
+---
+
+# 快速开始
+
+> 本页是 `packages/coding-agent/docs/quickstart.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+安装、认证、第一次 session 和常见 CLI 用法。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 安装与卸载
+
+Pi 作为 npm package 分发。正常安装命令使用 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`；`--ignore-scripts` 会禁用依赖 lifecycle scripts，Pi 的普通 npm 安装不需要这些脚本。Linux/macOS 也可以运行 curl installer。卸载必须匹配安装方式：curl installer 和 npm 使用 `npm uninstall -g`，pnpm、Yarn、Bun 分别使用各自的 global remove 命令。
+
+卸载只移除程序，不会清理 `~/.pi/agent/` 中的 settings、credentials、sessions 和已安装 packages。进入实际工作目录后运行 `pi`，不要在错误的父目录启动，否则 cwd 和可加载的项目资源都会改变。
+
+### 认证
+
+Subscription provider 在 Pi 中通过 `/login` 选择，例如 Claude Pro/Max、ChatGPT Plus/Pro（Codex）和 GitHub Copilot。API-key provider 可以在启动前设置 `ANTHROPIC_API_KEY` 等环境变量，也可以用 `/login` 将 key 保存到 `~/.pi/agent/auth.json`。认证方式、环境变量和 cloud provider 的细节应继续查看 Providers 页面；不要把 key 写进 project instructions 或提交到仓库。
+
+### 第一次 session
+
+第一次输入可以是“总结仓库并告诉我如何运行检查”。默认暴露给模型的四个工具是 `read`、`write`、`edit` 和 `bash`；`grep`、`find`、`ls` 等只读工具可以通过 tool options 开启。工具在当前 cwd 运行，write/edit/bash 可能修改本地文件，因此应先用 git checkpoint 或其他回滚办法。
+
+### 项目指令与资源
+
+在项目中创建 `AGENTS.md` 可以声明工作规则。Pi 还会读取 `~/.pi/agent/AGENTS.md`、父目录和当前目录的 `AGENTS.md` 或 `CLAUDE.md`；同目录的 `AGENTS.override.md` 会替代普通指令。修改这些文件后重启 Pi 或运行 `/reload`。这类 context files 与 project-local extensions、skills、prompts 的 trust 规则不同，不能只凭文件名推断加载结果。
+
+### 常见操作
+
+在编辑器输入 `@` 可以模糊搜索文件，也可以用 `pi @README.md "Summarize this"` 传入文件；支持的终端还可粘贴或拖入图片。交互模式中的 `!command` 会把输出送进模型，`!!command` 只运行命令而不加入模型 Context。`/model`、`/thinking`、Shift+Tab 和模型选择器用于切换模型及 thinking level；`Ctrl+S` 的含义取决于当前选择器。
+
+Session 会自动保存：`pi -c` 继续最近 session，`pi -r` 浏览旧 session，`--name` 设置显示名称，`--session` 打开指定路径或 id；交互中还可以使用 `/resume`、`/new`、`/tree`、`/fork` 和 `/clone`。一次性任务使用 `-p`，stdin 管道和 `@screenshot.png` 也可以作为输入；`--mode json` 输出事件，`--mode rpc` 用于进程集成。
+
+> 译者注：`!` 与 `!!` 的差异是“是否把结果加入下一次 Model Context”，不是“是否执行命令”。两者都应当遵守同一权限和 sandbox 边界。
+
+### 下一步
+
+完成第一轮后，按顺序阅读 Using Pi、Providers、Settings、Keybindings 和 Pi Packages；平台问题再查看 Windows、Termux、tmux、Terminal Setup 与 Shell Aliases。完整的 JSONL Session 结构见 Session Format。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Quickstart | Quickstart |
+| Install | Install |
+| Uninstall | Uninstall |
+| curl installer or npm install -g | curl installer or npm install -g |
+| pnpm | pnpm |
+| Yarn | Yarn |
+| Bun | Bun |
+| Authenticate | Authenticate |
+| Option 1: subscription login | Option 1: subscription login |
+| Option 2: API key | Option 2: API key |
+| First session | First session |
+| Give pi project instructions | Give pi project instructions |
+| Project Instructions | Project Instructions |
+| Common things to try | Common things to try |
+| Reference files | Reference files |
+| Run shell commands | Run shell commands |
+| Switch models | Switch models |
+| Continue later | Continue later |
+| Non-interactive mode | Non-interactive mode |
+| Next steps | Next steps |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/quickstart.md)
+
+````markdown
+# Quickstart
+
+This page gets you from install to a useful first pi session.
+
+## Install
+
+Pi is distributed as an npm package:
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
+
+### Uninstall
+
+Use the package manager that installed pi. The curl installer uses npm globally, so curl and npm installs are removed with npm:
+
+```bash
+# curl installer or npm install -g
+npm uninstall -g @earendil-works/pi-coding-agent
+
+# pnpm
+pnpm remove -g @earendil-works/pi-coding-agent
+
+# Yarn
+yarn global remove @earendil-works/pi-coding-agent
+
+# Bun
+bun uninstall -g @earendil-works/pi-coding-agent
+```
+
+Uninstalling pi leaves settings, credentials, sessions, and installed pi packages in `~/.pi/agent/`.
+
+Then start pi in the project directory you want it to work on:
+
+```bash
+cd /path/to/project
+pi
+```
+
+## Authenticate
+
+Pi can use subscription providers through `/login`, or API-key providers through environment variables or the auth file.
+
+### Option 1: subscription login
+
+Start pi and run:
+
+```text
+/login
+```
+
+Then select a provider. Built-in subscription logins include Claude Pro/Max, ChatGPT Plus/Pro (Codex), and GitHub Copilot.
+
+### Option 2: API key
+
+Set an API key before launching pi:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+pi
+```
+
+You can also run `/login` and select an API-key provider to store the key in `~/.pi/agent/auth.json`.
+
+See [Providers](providers.md) for all supported providers, environment variables, and cloud-provider setup.
+
+## First session
+
+Once pi starts, type a request and press Enter:
+
+```text
+Summarize this repository and tell me how to run its checks.
+```
+
+By default, pi gives the model four tools:
+
+- `read` - read files
+- `write` - create or overwrite files
+- `edit` - patch files
+- `bash` - run shell commands
+
+Additional built-in read-only tools (`grep`, `find`, `ls`) are available through tool options. Pi runs in your current working directory and can modify files there. Use git or another checkpointing workflow if you want easy rollback.
+
+## Give pi project instructions
+
+Pi loads context files at startup. Add an `AGENTS.md` file to tell it how to work in a project:
+
+```markdown
+# Project Instructions
+
+- Run `npm run check` after code changes.
+- Do not run production migrations locally.
+- Keep responses concise.
+```
+
+Pi loads:
+
+- `~/.pi/agent/AGENTS.md` for global instructions
+- `AGENTS.md` or `CLAUDE.md` from parent directories and the current directory
+
+If a directory contains `AGENTS.override.md`, Pi loads it instead of `AGENTS.md` or `CLAUDE.md` from that directory.
+
+Restart pi, or run `/reload`, after changing context files.
+
+## Common things to try
+
+### Reference files
+
+Type `@` in the editor to fuzzy-search files, or pass files on the command line:
+
+```bash
+pi @README.md "Summarize this"
+pi @src/app.ts @src/app.test.ts "Review these together"
+```
+
+Images or text can be pasted with Ctrl+V (Alt+V on Windows); images can also be dragged into supported terminals.
+
+### Run shell commands
+
+In interactive mode:
+
+```text
+!npm run lint
+```
+
+The command output is sent to the model. Use `!!command` to run a command without adding its output to the model context.
+
+### Switch models
+
+Use `/model` or Ctrl+L to choose a model for the current session. Press Ctrl+S in the model picker to save the highlighted model as the startup default. Use `/thinking` to choose a thinking level for the current session, or Ctrl+S in that picker to save the startup default thinking level. Use Shift+Tab to cycle thinking level. Use Ctrl+P / Shift+Ctrl+P to cycle through scoped models.
+
+### Continue later
+
+Sessions are saved automatically:
+
+```bash
+pi -c                  # Continue most recent session
+pi -r                  # Browse previous sessions
+pi --name "my task"    # Set session display name at startup
+pi --session <path|id> # Open a specific session
+```
+
+Inside pi, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.
+
+### Non-interactive mode
+
+For one-shot prompts:
+
+```bash
+pi -p "Summarize this codebase"
+cat README.md | pi -p "Summarize this text"
+pi -p @screenshot.png "What's in this image?"
+```
+
+Use `--mode json` for JSON event output or `--mode rpc` for process integration.
+
+## Next steps
+
+- [Using Pi](usage.md) - interactive mode, slash commands, sessions, context files, and CLI reference.
+- [Providers](providers.md) - authentication and model setup.
+- [Settings](settings.md) - global and project configuration.
+- [Keybindings](keybindings.md) - shortcuts and customization.
+- [Pi Packages](packages.md) - install shared extensions, skills, prompts, and themes.
+
+Platform notes: [Windows](windows.md), [Termux](termux.md), [tmux](tmux.md), [Terminal setup](terminal-setup.md), [Shell aliases](shell-aliases.md).
+
+````

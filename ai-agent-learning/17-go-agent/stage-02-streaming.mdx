@@ -1,0 +1,14 @@
+---
+title: "Go 02：Streaming"
+description: "从 HTTP response body 和 SSE 行解析理解增量输出。"
+---
+
+# Go 02：Streaming
+
+`HTTPModel.Stream` 用 `http.NewRequestWithContext`、`bufio.Scanner` 和 `io.Reader` 消费 `data:` 行；`delta` 是 Provider 的增量文本，不是完整 assistant message。收到 `[DONE]` 后才结束正常流。
+
+## 实验
+
+用 `httptest.Server` 将 JSON 分成多次 `Write`，测试断行、空 delta、未知事件、坏 JSON、HTTP 429/500 和 `context.Cancel`。检查 callback 顺序与最终拼接文本；不要把“网络 chunk”误当作“语义事件”。
+
+对应源码：`examples/go-agent/internal/agent/model.go` 的 `HTTPModel.Stream`、`StreamingModel`。

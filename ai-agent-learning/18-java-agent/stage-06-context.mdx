@@ -1,0 +1,12 @@
+---
+title: "Java 06：Context 与 Message"
+description: "区分 transcript、tool definitions 和 Provider 请求。"
+---
+
+# Java 06：Context 与 Message
+
+`Message` 是内部历史；`Request` 携带 messages 和 `ToolDefinition`；Jackson JSON 只在 Provider 边界序列化。system、user、assistant、tool 的 role 不能靠一段拼接字符串代替。
+
+## 实验
+
+打印每轮 roles、call id、definition 数量和 usage；断言 tool result 与 assistant call 配对。

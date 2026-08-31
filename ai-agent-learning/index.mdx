@@ -1,0 +1,70 @@
+---
+title: "AI Agent 工程教材"
+description: "从 LLM API、Tool Calling 和 ReAct 出发，基于 Pi 源码，用 Go 与 Java 构建可测试的 Agent Harness。"
+sidebarTitle: "课程首页"
+---
+
+# AI Agent 工程教材
+
+这不是某个框架的 API 速查表。你会先从 HTTP 请求和一条消息开始，逐步实现工具调用、Agent Loop、上下文管理、会话持久化、取消、重试、插件、Skills、MCP 与可观测性，最后再比较框架替你隐藏了哪些工程工作。
+
+<Info>
+
+本教材分析的 Pi 研究版本是 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。源码事实以当前工作区为准；`packages/agent/src/harness/agent-harness.ts` 在这个版本仍是明确标注未完成的公共骨架，不能被描述成已经交付的持久化 Harness。
+
+</Info>
+
+## 课程地图
+
+<CardGroup cols={2}>
+  <Card title="先理解模型" icon="book-open" href="/01-foundations/llm-to-agent">
+    Message、Context Window、Streaming、Tool Calling，以及模型和 Runtime 的边界。
+  </Card>
+  <Card title="再实现循环" icon="repeat" href="/03-agent-loop/basic-loop">
+    从一个 FakeModel 开始，逐步处理工具、并行、重试、取消和终止条件。
+  </Card>
+  <Card title="读真实源码" icon="code" href="/09-pi-source/agent-loop-source">
+    按文件、symbol、调用方和固定 commit 阅读 Pi，而不是背 API 名称。
+  </Card>
+  <Card title="构建 Harness" icon="layers" href="/07-harness/what-is-harness">
+    把 Agent Loop 外的状态、Session、权限、插件与遥测组合起来。
+  </Card>
+  <Card title="Go 实现" icon="terminal" href="/17-go-agent/overview">
+    只用标准库和 ScriptedModel，所有关键边界都有离线测试。
+  </Card>
+  <Card title="Java 实现" icon="coffee" href="/18-java-agent/overview">
+    使用 Java 21、HttpClient、ExecutorService/Future、ServiceLoader 和 Maven；异步 API 的 CompletableFuture 对照见 Java 阶段。
+  </Card>
+</CardGroup>
+
+## 推荐顺序
+
+<Steps>
+  <Step title="建立边界">
+    阅读 [LLM 到 Agent](/01-foundations/llm-to-agent)、[Tool Calling](/04-tools/tool-calling) 和 [ReAct](/03-agent-loop/react)。先回答“模型到底返回了什么”。
+  </Step>
+  <Step title="写出最小循环">
+    阅读 [基础 Agent Loop](/03-agent-loop/basic-loop)，运行 Go 和 Java 的 ScriptedModel 测试，再阅读 Pi 的 [Agent Loop 源码](/09-pi-source/agent-loop-source)。
+  </Step>
+  <Step title="补上工程能力">
+    学习 Context、Session、Compaction、Steering、Follow-up、权限和 Telemetry。它们决定系统能否在真实进程中工作。
+  </Step>
+  <Step title="实现并比较">
+    按 Go/Java 阶段完成代码，再用 [最终 Harness 设计](/19-build-harness/architecture) 和 [框架辨析](/20-frameworks/evaluation) 检查自己的理解。
+  </Step>
+</Steps>
+
+## 你最后应能回答的问题
+
+- 模型生成了一个 `tool_call`，究竟是谁打开文件或执行命令？
+- Tool Result、Session、Context 和 Memory 为什么不是同一个东西？
+- Agent 在工具执行中途收到新指令，为什么不能随便把消息插入当前请求？
+- Pi 的 `Agent`、`AgentSession`、Provider adapter、Extension 和 TUI 各自负责什么？
+- 重启进程后，哪些状态可以恢复，哪些外部副作用必须设计成幂等？
+- Spring AI、LangChain4j、LangGraph 或 Eino 替你实现了 Harness 的哪一层？
+
+<Warning>
+
+示例里的 `shell`、文件写入和网络请求都应在受限目录、测试进程和明确权限下运行。不要把教材示例直接接到生产凭据或根目录。
+
+</Warning>

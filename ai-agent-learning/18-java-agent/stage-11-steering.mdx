@@ -1,0 +1,12 @@
+---
+title: "Java 11：Steering 与 Follow-up"
+description: "用线程安全队列在 turn 边界改变运行中的要求。"
+---
+
+# Java 11：Steering 与 Follow-up
+
+`Agent.steer`/`followUp` 在运行中入队，`QueueSource` 在边界排空；`abort` 清掉当前 run 的队列；`nextRun` 保存到下一次 prompt。同步块只保护队列和状态，不能在锁内等待模型。
+
+## 实验
+
+模型延迟时从另一个线程 steer，验证下一次 request 获得消息；再 abort，验证 steering/follow-up 不会在取消后执行。

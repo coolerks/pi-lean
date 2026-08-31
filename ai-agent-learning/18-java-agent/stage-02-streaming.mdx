@@ -1,0 +1,14 @@
+---
+title: "Java 02：Streaming"
+description: "使用 HttpResponse.BodyHandlers.ofLines 理解 SSE 行流。"
+---
+
+# Java 02：Streaming
+
+`HttpModel.stream` 通过 `HttpClient` 的 line body handler 读取 `data:`，解析 JSON delta，并在 `[DONE]` 时完成。SSE 的事件边界、网络读取边界和完整 JSON 边界需要分别处理。
+
+## 实验
+
+用本地 `HttpServer` 拆分写入，测试空 delta、坏 JSON、429/500、连接断开和取消；比较同步 `send` 与放入 `ExecutorService` 的异步封装。
+
+对应源码：`HttpModel.stream`、`StreamingModel`。

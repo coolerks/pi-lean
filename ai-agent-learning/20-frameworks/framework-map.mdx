@@ -1,0 +1,31 @@
+---
+title: "最后再看 Agent Framework"
+description: "用已掌握的 Harness 分层阅读主流框架，而不是背 API。"
+---
+
+# 最后再看 Agent Framework
+
+只有完成 Go/Java 基础实现后，再看 Spring AI、LangChain4j、LangChain、LangGraph、Eino、Google ADK、OpenAI Agents SDK 等活跃项目。版本和功能变化很快，阅读时以项目当前官方文档为准。
+
+## 统一提问
+
+```text
+它替我实现了哪一层？
+Tool abstraction / model adapter / memory / agent loop / workflow
+MCP / RAG / observability / persistence / permissions
+哪些边界仍由我的应用负责？
+```
+
+## 典型映射
+
+| 能力 | 框架常见提供物 | 仍需自己判断 |
+| --- | --- | --- |
+| Model | client、message、stream adapter | provider 兼容、重试、成本、取消 |
+| Tool | schema 注解/registry | 参数和权限、幂等、并行依赖 |
+| Loop | agent executor/graph | 终止、max steps、错误和恢复 |
+| Workflow | graph/state machine | durable state、版本、重放 |
+| Memory | history/vector store | 数据边界、隐私、压缩、召回评估 |
+| MCP/RAG | connector/retriever | trust、租户过滤、结果注入 |
+| Observability | callback/tracing integration | 脱敏、采样、成本归因 |
+
+框架减少样板，不会自动知道你的生产权限、数据保留或副作用语义。

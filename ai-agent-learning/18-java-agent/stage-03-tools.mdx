@@ -1,0 +1,12 @@
+---
+title: "Java 05–08：Coding Tools、并行与取消"
+description: "用 JDK 文件/进程 API 实现本地工具和可观察事件。"
+---
+
+# Java 05–08：Coding Tools、并行与取消
+
+`BuiltInTools` 提供 `read`、`write`、`edit`、`grep`、`shell` 和 `calculator`。`PermissionPolicy` 先规范化 workspace path，shell 拒绝明显危险模式；结果限制在教学上限。
+
+`ExecutionMode.PARALLEL` 使用 `ExecutorService` 提交每个 call，再按 source order 收集 Future；这与“完成事件可能乱序、回传消息保持配对顺序”一致。共享文件的写操作应走 `SEQUENTIAL` 或显式锁。
+
+事件通过 `EventSink` Listener 观察 `model_attempt`、`tool_start/end`、`tool_error` 和 `run_end`。retry 的 delay 循环检查 token；abort 只取消当前运行，并清空 steering/follow-up，`nextRun` 留给下一次。

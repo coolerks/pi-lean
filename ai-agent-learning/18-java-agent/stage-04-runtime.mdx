@@ -1,0 +1,12 @@
+---
+title: "Java 09–14：Session、Compaction、SPI、Skill 与 MCP"
+description: "把内存循环接到 JSONL、ServiceLoader 和 JSON-RPC。"
+---
+
+# Java 09–14：Session、Compaction、SPI、Skill 与 MCP
+
+`Session` 逐行保存 Jackson record，写入临时文件后原子替换；坏行带行号抛出错误。`Compactor` 保留 system 和最近尾部，用摘要替换旧消息，明确这是教学策略而不是完整语义压缩。
+
+`AgentPlugin` 是 Java interface，可由 `ServiceLoader` 从 `META-INF/services` 发现；`PluginManager` 负责 register/close。`SkillDiscovery` 只加载 frontmatter，正文按需读取。
+
+`McpClient` 以 newline-delimited JSON-RPC 调用 `tools/list` 和 `tools/call`，Remote Tool 再适配成本地 `Tool`。它串行匹配 id；生产版本应加 initialize、并发 dispatcher、超时、重连和权限。

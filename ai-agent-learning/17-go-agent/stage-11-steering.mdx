@@ -1,0 +1,12 @@
+---
+title: "Go 11：Steering 与 Follow-up"
+description: "在 turn 边界注入用户新指令，并区分中止与排队。"
+---
+
+# Go 11：Steering 与 Follow-up
+
+`Steer` 和 `FollowUp` 只在运行中入队，由 loop 在工具批次或模型响应边界读取；`Abort` 取消当前 run 并清空这两类队列；`NextRun` 留给下一次 `Prompt`。这是状态语义，不是普通字符串数组。
+
+## 实验
+
+让工具阻塞时调用 `Steer`，断言下一次请求包含新消息；再调用 `Abort`，确认它不会偷偷在取消后执行；单独测试 `NextRun`。

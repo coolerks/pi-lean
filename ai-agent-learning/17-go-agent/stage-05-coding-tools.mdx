@@ -1,0 +1,12 @@
+---
+title: "Go 05：基础 Coding Tools"
+description: "实现 read、write、edit、grep 和 shell，并先经过权限边界。"
+---
+
+# Go 05：基础 Coding Tools
+
+`builtin_tools.go` 将文件和命令能力实现为同一个 `Tool` 接口。`PermissionPolicy` 规范 workspace 内路径并拒绝明显危险 shell；这只是教学门，不是容器沙箱。
+
+## 实验
+
+为 `read` 加输出上限，为 `write` 加拒绝 workspace 外路径，为 `edit` 加“旧文本必须唯一”；再测试 shell timeout、命令失败和大输出。比较 sequential 与 parallel：读两个独立文件可以并行，write/read 同一文件必须保序。

@@ -1,0 +1,31 @@
+---
+title: "Go 03–04：Tool 与 Agent Loop"
+description: "实现 Tool interface、schema gate、消息回传和 maxSteps。"
+---
+
+# Go 03–04：Tool 与 Agent Loop
+
+## Tool interface
+
+```go
+type Tool interface {
+    Definition() ToolDefinition
+    Execute(context.Context, json.RawMessage) (ToolResult, error)
+}
+```
+
+`ToolDefinition` 是给模型的 metadata；`Execute` 是 Runtime 的副作用。`Registry.Validate` 先查找工具、解析 object 和 required 字段，只有通过后才会调用 `Execute`。
+
+## Loop 的边界
+
+`AgentLoop.Run` 每步向 Model 发 `Request{Messages, Tools}`；assistant 有 Tool Calls 时执行 batch，把每个结果转换成 `RoleTool` 消息；没有 Tool Calls 时检查 follow-up。`LoopOptions.MaxSteps` 防止模型不断返回调用。
+
+## 错误语义
+
+unknown tool、坏 JSON、缺 required 参数和执行异常变成 error `ToolResult`，让下一轮模型可见；模型请求错误由 retry policy 处理，耗尽后返回错误。取消通过 `context.Context`，而不是把进程强杀。
+
+## 练习
+
+1. 增加一个 counter Tool，断言 unknown tool 不会增加调用数。
+2. 让 ScriptedModel 返回两轮：calculator call、final text。
+3. 只给一轮 Tool Call，`MaxSteps=1`，断言返回 max steps error。

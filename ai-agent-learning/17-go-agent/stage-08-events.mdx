@@ -1,0 +1,12 @@
+---
+title: "Go 08：Events"
+description: "让 Agent Run 可观察，而不把日志硬编码进业务分支。"
+---
+
+# Go 08：Events
+
+`Event` 描述 `model_attempt`、`tool_start`、`tool_end`、`tool_error` 和 `run_end`；`OnEvent` 是 callback。业务结果走返回值，诊断和 telemetry 走事件，二者不要混淆。
+
+## 实验
+
+记录一次 run 的 event 时间线和 step，验证 Tool error 仍有 end/error 事件，Provider retry 能看到多个 attempt。事件 handler 自己失败时不能让核心循环静默丢结果。

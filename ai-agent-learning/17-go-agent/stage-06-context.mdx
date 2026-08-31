@@ -1,0 +1,12 @@
+---
+title: "Go 06：Context 与 Message"
+description: "明确内部消息、工具定义和 Provider payload 的边界。"
+---
+
+# Go 06：Context 与 Message
+
+`Message` 是内部 transcript；`Request` 把 messages 和可用 Tool Definitions 交给 Model；`ToolResult` 再成为下一轮上下文。不要把 system prompt、工具 schema 和历史消息混成一个字符串。
+
+## 实验
+
+打印每次 request 的 message roles、tool call id 和定义数量，加入 system message，再断言 Tool Result 与对应 call id 配对。用 `context.Context` 同时传取消和 deadline。

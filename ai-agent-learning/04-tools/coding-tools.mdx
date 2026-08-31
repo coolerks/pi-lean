@@ -1,0 +1,40 @@
+---
+title: "Coding Agent 的基础工具"
+description: "以 read、write、edit、grep 和 shell 组成最小 Coding Agent。"
+---
+
+# Coding Agent 的基础工具
+
+## Pi 的当前工具集合
+
+`packages/coding-agent/src/core/tools/index.ts` 暴露 `read`、`write`、`edit`、`grep`、`find`、`ls`、`bash`、`powershell` 的 definition 和 executor。`createCodingTools` 默认返回 `read`、`bash`、`edit`、`write`；`createReadOnlyTools` 则只读目录工具。
+
+| Tool | 主要副作用 | 教学重点 |
+| --- | --- | --- |
+| `read` | 读取文件 | 路径解析、行号、过长输出截断 |
+| `write` | 创建/覆盖文件 | 父目录、编码、权限和写入失败 |
+| `edit` | 精确替换 | 唯一匹配、变更摘要、避免误改 |
+| `grep` | 搜索内容 | 正则/文本、结果限制、二进制文件 |
+| `find`/`ls` | 枚举路径 | 隐藏文件、忽略规则、输出上限 |
+| `bash` | 执行进程 | cwd、超时、退出码、取消和权限 |
+
+## 最小组合
+
+```text
+LLM
+ + tool definitions
+ + read/write/edit/grep/bash registry
+ + Agent Loop
+ + path and command permission
+ + output truncation
+```
+
+它距离 Pi 仍缺少 Session、资源加载、Extension、TUI/RPC、多 Provider、认证、图片、自动压缩、项目可信度和更完整的诊断。
+
+## 输出过长
+
+工具输出不能无上限塞入 Context。Pi 有 `truncateHead`/`truncateTail` 和工具自己的上限；教学实现也应保留“已截断”的明确标记，让模型知道它看到的不是完整输出。截断是 Context 策略，不是把文件静默删掉。
+
+## 实现实验
+
+先只开放 `read` 与 `grep`，确认 Agent 能定位问题；再开放 `write`/`edit`；最后在沙箱目录开放 shell。每开放一个副作用 Tool，都新增一个权限测试。

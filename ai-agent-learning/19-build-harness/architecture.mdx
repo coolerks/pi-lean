@@ -1,0 +1,45 @@
+---
+title: "成熟 Harness 的实现顺序"
+description: "用逐层里程碑把可运行 Loop 变成可恢复系统。"
+---
+
+# 成熟 Harness 的实现顺序
+
+```mermaid
+flowchart TB
+    A[纯聊天 CLI] --> B[calculator Tool]
+    B --> C[read/write/grep/shell]
+    C --> D[Session]
+    D --> E[Compaction]
+    E --> F[Steering / Follow-up]
+    F --> G[Plugin]
+    G --> H[Skill]
+    H --> I[MCP]
+    I --> J[完整 Harness]
+    J --> K[Framework evaluation]
+```
+
+## 最终边界
+
+```text
+AgentHarness
+├── ModelProvider / ModelRegistry
+├── PromptBuilder / ContextManager
+├── MessageStore / SessionManager
+├── ToolRegistry / ToolExecutor
+├── AgentLoop
+├── EventBus
+├── RetryPolicy / Cancellation
+├── PermissionManager / Sandbox
+├── CompactionManager
+├── SkillRegistry / PluginManager
+├── MCPManager
+├── Telemetry
+└── Configuration + CLI/TUI/RPC surface
+```
+
+先让纯函数和 ScriptedModel 稳定，再接副作用；先有单进程 Session，再做 crash recovery；先有本地 Tool，再接 MCP。每一层都定义输入、输出、错误、取消和测试。
+
+## Durable 版本还要补什么
+
+当前 Go/Java 示例是教学组合层，不是 `harness.v2.md` 完整实现。要升级，需要 append-only tree、operation intent/result、provisioned ids、per-lane mutation line、usage ledger、terminal cleanup、manual drive、restore reduction、deferred provider 和完整 race/crash matrix。设计文件中的 invariant 是规格来源，不能靠一条 `while` 替代。

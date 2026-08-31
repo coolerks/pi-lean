@@ -1,0 +1,24 @@
+---
+title: "Progressive Disclosure"
+description: "设计从 metadata 到完整资源的分层加载，并测试 token 成本。"
+---
+
+# Progressive Disclosure
+
+## 三层加载
+
+```text
+Level 1: name + description + path     -> 模型发现能力
+Level 2: SKILL.md                      -> 模型决定采用的方法
+Level 3: references/scripts/assets     -> 完成当前子任务
+```
+
+这不是“把内容藏起来”。目标是让低概率资源不占据每次请求的 Context，同时保留按需读取的路径。
+
+## 失败情况
+
+metadata 无效、name 与目录不一致、重复 Skill、缺 description、frontmatter YAML 错误和路径不存在都应成为诊断；不能静默把一个错误 Skill 当作正常能力。加载失败也不能让模型以为它拥有该能力。
+
+## 实验
+
+建立 3 个 Skill：一个只含 metadata，一个需要 reference，一个带危险脚本。打印最终 system prompt，确认只出现摘要；让模型/测试显式 read reference；最后用 Permission 拒绝脚本。对比全量注入和按需加载的 token 估算。

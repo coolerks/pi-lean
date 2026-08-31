@@ -1,0 +1,1105 @@
+---
+title: "TUI Components"
+description: "pi-tui 组件接口、overlay、布局、主题和常见模式。"
+---
+
+# TUI Components
+
+> 本页是 `packages/coding-agent/docs/tui.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+pi-tui 组件接口、overlay、布局、主题和常见模式。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 页面范围与核心接口
+
+Pi 可以创建 TUI（终端用户界面）组件。Extension 和自定义 Tool 可以用这些组件向交互式用户显示选择器、进度、状态或完整的输入界面。本页的组件库是 `@earendil-works/pi-tui`，后面的应用级辅助组件来自 `@earendil-works/pi-coding-agent`。
+
+所有组件都实现下面四个约定：
+
+```typescript
+interface Component {
+  render(width: number): string[];
+  handleInput?(data: string): void;
+  wantsKeyRelease?: boolean;
+  invalidate(): void;
+}
+```
+
+`render(width)` 返回每行一个字符串的数组，而且每行的显示宽度都不能超过 `width`。可选的 `handleInput` 只在组件拥有焦点时接收键盘输入；`wantsKeyRelease` 设为 `true` 时，组件还会收到 Kitty 键盘协议的按键释放事件，默认是 `false`。`invalidate` 清除缓存的渲染结果，主题改变时 TUI 会调用它。
+
+TUI 在每个已渲染行的末尾追加完整的 SGR reset 和 OSC 8 reset，所以样式不会跨行延续。若一段带 ANSI 样式的文本跨越多行，必须逐行重新应用样式，或者使用 `wrapTextWithAnsi()`，否则后续文字可能继承错误的颜色或链接状态。
+
+### Focusable、IME 与容器焦点
+
+如果组件显示文本光标并需要 IME（输入法编辑器），它应实现 `Focusable`。组件在当前获得焦点时把 `focused` 设为 `true`，在 render 输出中把 `CURSOR_MARKER` 放在模拟光标前。TUI 会扫描这个零宽 APC escape sequence，计算终端硬件光标的位置；只有启用 `showHardwareCursor` 时才显示硬件光标。默认隐藏硬件光标是为了继续使用组件绘制的模拟光标，同时让支持 IME 的终端知道候选窗口应该出现在哪里。某些终端需要可见硬件光标，届时可以设置 `showHardwareCursor`、调用 `setShowHardwareCursor(true)`，或设置 `PI_HARDWARE_CURSOR=1`。内置 `Editor` 和 `Input` 已实现这个接口。
+
+包含 `Input` 或 `Editor` 子组件的 dialog、selector 等容器也必须实现 `Focusable`，并在 setter 中把自己的焦点状态传给子输入框。若只给外层容器设置焦点而不传播，中文、日文、韩文等输入法的候选框会出现在错误位置。这里的关键不是“哪个组件接收字符串”，而是焦点状态、render 光标标记和终端硬件光标必须形成同一条链。
+
+### 在 Extension、Tool 和 overlay 中使用组件
+
+`ctx.ui.custom()` 接收一个 factory。factory 会拿到当前 TUI、theme、keybindings 和 `done` 回调，然后返回一个 `Component` 或兼容的三方法对象。异步调用方等待 `custom` 返回的 Promise；选择、取消和关闭都应在明确的路径调用 `done(value)`，不能让组件只改变内部字段而不通知宿主。
+
+```text
+Extension/Tool handler
+  -> await ctx.ui.custom(factory)
+  -> factory 创建组件并绑定 onSelect/onCancel
+  -> handleInput 改变状态并 requestRender
+  -> done(value) 结束 UI Promise
+```
+
+这里的 TypeScript `async`/`await` 与 Java 的 `CompletableFuture`、listener callback 类似，也可以把 `done` 理解为一次性的 `Consumer<Result>`；Go 中通常用 channel 或显式 callback 把选择结果送回 handler。`ctx.ui.custom` 的取消结果应和业务值区分，例如 `string | null` 中的 `null` 表示用户取消，而不是选中了空字符串。
+
+传入 `{ overlay: true }` 时，组件会叠加在已有内容之上而不清屏。`overlayOptions` 可以用数字或百分比设置 `width`、`minWidth`、`maxHeight`，用 `anchor`、`offsetX`、`offsetY` 或 `row`、`col` 设置位置，用 `margin` 设置边距，并用 `visible(termWidth, termHeight)` 在窄终端隐藏它。`onHandle` 可得到控制句柄：`focus()` 把 overlay 置于视觉前景并接收输入，`unfocus()` 释放焦点，`unfocus({ target })` 把输入交给指定组件，`unfocus({ target: null })` 则有意留下未聚焦状态；`setHidden` 控制可见性，`hide` 永久移除。
+
+一个可见且已聚焦的 overlay 会在临时的非 overlay UI 结束后重新取得输入。如果 overlay 打开另一个普通 `ctx.ui.custom()`，新 UI 活跃期间由新 UI 接收输入；关闭后原 overlay 可以恢复。不要复用已关闭 overlay 的对象引用：关闭会 dispose 组件，旧引用已经失效。正确方式是每次重新调用 factory 创建新实例，而不是把已 dispose 的菜单再次交给 TUI。overlay 的 anchor、margin、stacking、窄窗口和动画可参照 `overlay-qa-tests.ts`。
+
+### 内置组件
+
+`Text` 显示多行文字并负责换行；可设置水平、垂直 padding 和背景函数，并用 `setText` 更新内容。`Box` 是带 padding 和背景色的容器，可以用 `addChild` 放入 `Text`，也可以用 `setBgFn` 更换背景。`Container` 只负责把子组件按垂直方向编排，支持 `addChild` 和 `removeChild`。`Spacer` 产生指定数量的空行。
+
+`Markdown` 负责 Markdown 渲染和语法高亮；创建时传入文本、padding 和 `MarkdownTheme`，更新时调用 `setText`。`Image` 接收 base64 数据、MIME type、`ImageTheme` 和尺寸限制，在 Kitty、iTerm2、Ghostty、WezTerm、Warp 等支持的终端显示图片。图片能力取决于终端协议，不能把“对象创建成功”当成“屏幕一定能显示”。
+
+### 键盘输入、行宽与自定义组件
+
+使用 `matchesKey()` 判断按键，并优先使用 `Key.enter`、`Key.escape`、`Key.up`、`Key.ctrl("c")` 等 `Key` 常量或构造器。也支持 `enter`、`ctrl+c`、`shift+tab`、`ctrl+shift+p` 等字符串格式，但组件应保持一种清晰的写法。选择器通常在上下键改变 `selectedIndex`，Enter 调用 `onSelect`，Escape 调用 `onCancel`。
+
+`render(width)` 的宽度约束是硬规则，不是建议。`visibleWidth` 忽略 ANSI escape sequence 计算显示列数；`truncateToWidth` 进行安全截断并可指定 ellipsis；`wrapTextWithAnsi` 换行时保留样式。不要用 JavaScript 的 `string.length` 或 Go 的字节长度直接代替终端列宽：中文、emoji、组合字符和 ANSI 序列都会使二者不同。
+
+自定义组件通常保存业务状态和可选的 `cachedWidth`、`cachedLines`。当 width 没变且缓存存在时直接返回缓存；上下选择改变后调用 `invalidate`，再由注入的 `tui.requestRender()` 请求下一帧。`handleInput` 是同步 callback，不应在其中等待网络；耗时工作应启动异步任务、显示 loader，并在完成或取消时调用 `done`。
+
+### 主题、缓存失效与性能
+
+在 `renderCall`、`renderResult` 或 `ctx.ui.custom` factory 中使用 callback 提供的 `theme`，不要从全局导入一个可能过期的主题。`theme.fg(color, text)` 设置前景色，`theme.bg(color, text)` 设置背景色。前景 token 包括通用文字、状态、边框、消息、Tool、diff、Markdown、语法高亮、Thinking level 和 `bashMode`；背景 token 包括 selected、search match、user message、custom message 和 Tool 成功/失败/等待状态。Markdown 应通过 `getMarkdownTheme()` 获得专用主题。
+
+自定义组件可以定义自己的小型 theme interface，例如 `selected` 和 `normal` 两个样式函数。关键是保存原始数据，不要只保存已经用旧主题生成的 ANSI 字符串。若构造函数把 `theme.fg("accent", message)` 直接塞进子 `Text`，父容器的普通 `invalidate` 只清缓存而不会重新生成这段旧字符串，换主题后颜色仍然错误。正确实现是在 `invalidate()` 中先调用 `super.invalidate()`，再用当前 theme 重建 children；复杂组件可以 `clear()` 后重新建立整棵子树。
+
+这种 rebuild 模式适用于预先染色的文本、语法高亮和包含主题字符串的复杂布局；如果传入的是 render 时才调用的 theme callback、只是无样式的简单容器，或每次 render 都重新计算，就不需要额外重建。渲染成本较高时应缓存结果，但任何影响布局的 state、width 或主题变化都必须让缓存失效。`PI_TUI_WRITE_LOG` 可以把写到 stdout 的原始 ANSI 流保存到文件，用于排查光标、颜色和换行问题。
+
+### 七类常见交互模式
+
+1. **Selection Dialog（`SelectList`）**：用 `SelectList`、`DynamicBorder` 和 `Container` 组合选择 dialog。设置 selected prefix/text、description、scroll info 和 no-match 的 theme；选择时调用 `done(value)`，取消时调用 `done(null)`。这是“可选择列表”优先复用内置组件的模式。
+2. **可取消异步操作（`BorderedLoader`）**：用 `BorderedLoader` 显示 spinner，把 `loader.signal` 传给 `fetchData`，在 `onAbort` 调用 `done(null)`，Promise 成功时返回数据，失败时也走可解释的取消/失败路径。Java 可以把 signal 对应为 cancellation token，Go 可以对应 `context.Context`；仅调用 `Future.cancel(true)` 不代表远端请求一定已经停止。
+3. **设置与开关（`SettingsList`）**：用 `SettingItem` 描述 id、label、当前值和值集合；`SettingsList` 负责导航和可选 fuzzy search，值改变 callback 只提交配置变更，关闭 callback 调用 `done`。保存配置和重新渲染是两个动作，不能让 UI 状态冒充已持久化。
+4. **持久状态栏**：用 `ctx.ui.setStatus("my-ext", value)` 把 mode/status 放进 footer，用 `undefined` 清除。状态属于宿主布局，不应每次 render 都创建重复组件。
+5. **工作指示器**：`setWorkingIndicator` 接收 frames 和 `intervalMs`，可以设置静态帧、自定义动画、空数组隐藏，或不传参数恢复默认 spinner。它只改变普通 streaming 的 working indicator，不改变 compaction 和 retry loader 的内置样式；自定义 frame 必须自己加颜色。
+6. **编辑器上下方 Widget 与自定义 Footer**：`setWidget` 可放字符串行或 render factory，并用 `placement: "belowEditor"` 放到编辑器下方；清除时传 `undefined`。`setFooter` factory 接收 `footerData`，可读取 git branch、Extension status，并通过 `onBranchChange` 触发重绘；恢复默认 footer 同样传 `undefined`。这些持久区域必须在 branch、model 或数据变化时请求 render。
+7. **自定义 Editor（例如 Vim mode）**：继承 `CustomEditor` 而不是基础 `Editor`，保留应用已有的 abort、退出、模型切换等快捷键。自定义模式只处理自己的按键，其余按键调用 `super.handleInput(data)`；用 factory 接收 `tui`、theme 和 keybindings，并用 `setEditorComponent(undefined)` 恢复默认编辑器。Vim 示例把 Escape 在 insert/normal 两种模式下分别解释，且用 `truncateToWidth` 让 mode indicator 不突破行宽。
+
+这些模式的共同边界是：UI callback 只更新 UI 或报告用户选择，实际 Agent prompt、Tool 执行和 Session 写入仍由宿主控制。一个 loader 的取消应该停止当前等待，并清理对它负责的异步资源；不能关闭整个 TUI 或误取消另一个 run。
+
+### 实现规则与练习
+
+1. 一定使用 factory callback 提供的 `theme`，不要导入全局旧主题。
+2. `DynamicBorder` 的颜色函数写成 `(s: string) => theme.fg("accent", s)`，保持 TypeScript 的参数类型明确。
+3. state 变化后调用 `tui.requestRender()`；改变字段本身不会自动绘制下一帧。
+4. 自定义组件至少返回 `render`、`invalidate`、`handleInput` 三个职责明确的方法；不接收输入时也要有稳定的 no-op 处理策略。
+5. 优先使用 `SelectList`、`SettingsList`、`BorderedLoader`，不要复制一份已有组件的焦点、宽度和取消逻辑。
+
+建议实验顺序是：先用 `preset.ts` 完成选择 dialog；再用 `qna.ts` 让一个可取消的异步请求显示 loader；然后用 `tools.ts` 做设置开关；最后阅读 `modal-editor.ts`、`custom-footer.ts`、`working-indicator.ts`、`snake.ts` 和 `todo.ts`。每次实验都记录输入事件、state 变化、`requestRender` 次数、dispose 时机和最终 `done` 值。这样可以同时观察 TypeScript callback/Promise、Java listener/Future、Go callback/channel 与 TUI 生命周期之间的对应关系。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| TUI Components | TUI Components |
+| Component Interface | Component Interface |
+| Focusable Interface (IME Support) | Focusable Interface (IME Support) |
+| Container Components with Embedded Inputs | Container Components with Embedded Inputs |
+| Using Components | Using Components |
+| Overlays | Overlays |
+| Overlay Focus | Overlay Focus |
+| Overlay Lifecycle | Overlay Lifecycle |
+| Built-in Components | Built-in Components |
+| Text | Text |
+| Box | Box |
+| Container | Container |
+| Spacer | Spacer |
+| Markdown | Markdown |
+| Image | Image |
+| Keyboard Input | Keyboard Input |
+| Line Width | Line Width |
+| Creating Custom Components | Creating Custom Components |
+| Theming | Theming |
+| Debug logging | Debug logging |
+| Performance | Performance |
+| Invalidation and Theme Changes | Invalidation and Theme Changes |
+| The Problem | The Problem |
+| The Solution | The Solution |
+| Pattern: Rebuild on Invalidate | Pattern: Rebuild on Invalidate |
+| When This Matters | When This Matters |
+| Common Patterns | Common Patterns |
+| Pattern 1: Selection Dialog (SelectList) | Pattern 1: Selection Dialog (SelectList) |
+| Pattern 2: Async Operation with Cancel (BorderedLoader) | Pattern 2: Async Operation with Cancel (BorderedLoader) |
+| Pattern 3: Settings/Toggles (SettingsList) | Pattern 3: Settings/Toggles (SettingsList) |
+| Pattern 4: Persistent Status Indicator | Pattern 4: Persistent Status Indicator |
+| Pattern 4b: Working Indicator Customization | Pattern 4b: Working Indicator Customization |
+| Pattern 5: Widgets Above/Below Editor | Pattern 5: Widgets Above/Below Editor |
+| Pattern 6: Custom Footer | Pattern 6: Custom Footer |
+| Pattern 7: Custom Editor (vim mode, etc.) | Pattern 7: Custom Editor (vim mode, etc.) |
+| Key Rules | Key Rules |
+| Examples | Examples |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/tui.md)
+
+````markdown
+> pi can create TUI components. Ask it to build one for your use case.
+
+# TUI Components
+
+Extensions and custom tools can render custom TUI components for interactive user interfaces. This page covers the component system and available building blocks.
+
+**Source:** [`@earendil-works/pi-tui`](https://github.com/earendil-works/pi-mono/tree/main/packages/tui)
+
+## Component Interface
+
+All components implement:
+
+```typescript
+interface Component {
+  render(width: number): string[];
+  handleInput?(data: string): void;
+  wantsKeyRelease?: boolean;
+  invalidate(): void;
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `render(width)` | Return array of strings (one per line). Each line **must not exceed `width`**. |
+| `handleInput?(data)` | Receive keyboard input when component has focus. |
+| `wantsKeyRelease?` | If true, component receives key release events (Kitty protocol). Default: false. |
+| `invalidate()` | Clear cached render state. Called on theme changes. |
+
+The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
+
+## Focusable Interface (IME Support)
+
+Components that display a text cursor and need IME (Input Method Editor) support should implement the `Focusable` interface:
+
+```typescript
+import { CURSOR_MARKER, type Component, type Focusable } from "@earendil-works/pi-tui";
+
+class MyInput implements Component, Focusable {
+  focused: boolean = false;  // Set by TUI when focus changes
+  
+  render(width: number): string[] {
+    const marker = this.focused ? CURSOR_MARKER : "";
+    // Emit marker right before the fake cursor
+    return [`> ${beforeCursor}${marker}\x1b[7m${atCursor}\x1b[27m${afterCursor}`];
+  }
+}
+```
+
+When a `Focusable` component has focus, TUI:
+1. Sets `focused = true` on the component
+2. Scans rendered output for `CURSOR_MARKER` (a zero-width APC escape sequence)
+3. Positions the hardware terminal cursor at that location
+4. Shows the hardware cursor only when `showHardwareCursor` is enabled
+
+The cursor remains hidden by default. This keeps the fake cursor rendering, while still positioning the hardware cursor for terminals that track IME candidate windows with hidden cursors. Some terminals require a visible hardware cursor for IME positioning; enable it with `showHardwareCursor`, `setShowHardwareCursor(true)`, or `PI_HARDWARE_CURSOR=1`. The `Editor` and `Input` built-in components already implement this interface.
+
+### Container Components with Embedded Inputs
+
+When a container component (dialog, selector, etc.) contains an `Input` or `Editor` child, the container must implement `Focusable` and propagate the focus state to the child. Otherwise, the hardware cursor won't be positioned correctly for IME input.
+
+```typescript
+import { Container, type Focusable, Input } from "@earendil-works/pi-tui";
+
+class SearchDialog extends Container implements Focusable {
+  private searchInput: Input;
+
+  // Focusable implementation - propagate to child input for IME cursor positioning
+  private _focused = false;
+  get focused(): boolean {
+    return this._focused;
+  }
+  set focused(value: boolean) {
+    this._focused = value;
+    this.searchInput.focused = value;
+  }
+
+  constructor() {
+    super();
+    this.searchInput = new Input();
+    this.addChild(this.searchInput);
+  }
+}
+```
+
+Without this propagation, typing with an IME (Chinese, Japanese, Korean, etc.) will show the candidate window in the wrong position on screen.
+
+## Using Components
+
+**In extensions** via `ctx.ui.custom()`:
+
+```typescript
+pi.on("session_start", async (_event, ctx) => {
+  const result = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) =>
+    new MyComponent({
+      theme,
+      keybindings,
+      onChange: () => tui.requestRender(),
+      onSelect: (value) => done(value),
+      onCancel: () => done(null),
+    })
+  );
+});
+```
+
+**In custom tools** via `ctx.ui.custom()`:
+
+```typescript
+async execute(toolCallId, params, signal, onUpdate, ctx) {
+  const result = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) =>
+    new MyComponent({
+      theme,
+      keybindings,
+      onChange: () => tui.requestRender(),
+      onSelect: (value) => done(value),
+      onCancel: () => done(null),
+    })
+  );
+  // Use result...
+}
+```
+
+## Overlays
+
+Overlays render components on top of existing content without clearing the screen. Pass `{ overlay: true }` to `ctx.ui.custom()`:
+
+```typescript
+const result = await ctx.ui.custom<string | null>(
+  (tui, theme, keybindings, done) => new MyDialog({ onClose: done }),
+  { overlay: true }
+);
+```
+
+For positioning and sizing, use `overlayOptions`:
+
+```typescript
+const result = await ctx.ui.custom<string | null>(
+  (tui, theme, keybindings, done) => new SidePanel({ onClose: done }),
+  {
+    overlay: true,
+    overlayOptions: {
+      // Size: number or percentage string
+      width: "50%",          // 50% of terminal width
+      minWidth: 40,          // minimum 40 columns
+      maxHeight: "80%",      // max 80% of terminal height
+
+      // Position: anchor-based (default: "center")
+      anchor: "right-center", // 9 positions: center, top-left, top-center, etc.
+      offsetX: -2,            // offset from anchor
+      offsetY: 0,
+
+      // Or percentage/absolute positioning
+      row: "25%",            // 25% from top
+      col: 10,               // column 10
+
+      // Margins
+      margin: 2,             // all sides, or { top, right, bottom, left }
+
+      // Responsive: hide on narrow terminals
+      visible: (termWidth, termHeight) => termWidth >= 80,
+    },
+    // Get handle for programmatic focus and visibility control
+    onHandle: (handle) => {
+      // handle.focus() - focus this overlay and bring it to the visual front
+      // handle.unfocus() - release input to normal fallback
+      // handle.unfocus({ target }) - release input to a specific component or null
+      // handle.setHidden(true/false) - toggle visibility
+      // handle.hide() - permanently remove
+    },
+  }
+);
+```
+
+### Overlay Focus
+
+A focused visible overlay keeps input ownership across temporary non-overlay UI. If an overlay opens another `ctx.ui.custom()` component without `{ overlay: true }`, that replacement UI receives input while it is active; when it closes, the focused overlay can reclaim input.
+
+Use `handle.unfocus()` when a visible overlay should stop owning input and let TUI fall back to another visible capturing overlay or the previous focus target. Use `handle.unfocus({ target })` when a specific component should receive input while the overlay stays visible. Passing `{ target: null }` intentionally leaves no focused component until focus is set again.
+
+### Overlay Lifecycle
+
+Overlay components are disposed when closed. Don't reuse references - create fresh instances:
+
+```typescript
+// Wrong - stale reference
+let menu: MenuComponent;
+await ctx.ui.custom((_, __, ___, done) => {
+  menu = new MenuComponent(done);
+  return menu;
+}, { overlay: true });
+setActiveComponent(menu);  // Disposed
+
+// Correct - re-call to re-show
+const showMenu = () => ctx.ui.custom((_, __, ___, done) => 
+  new MenuComponent(done), { overlay: true });
+
+await showMenu();  // First show
+await showMenu();  // "Back" = just call again
+```
+
+See [overlay-qa-tests.ts](../examples/extensions/overlay-qa-tests.ts) for comprehensive examples covering anchors, margins, stacking, responsive visibility, and animation.
+
+## Built-in Components
+
+Import from `@earendil-works/pi-tui`:
+
+```typescript
+import { Text, Box, Container, Spacer, Markdown } from "@earendil-works/pi-tui";
+```
+
+### Text
+
+Multi-line text with word wrapping.
+
+```typescript
+const text = new Text(
+  "Hello World",    // content
+  1,                // paddingX (default: 1)
+  1,                // paddingY (default: 1)
+  (s) => bgGray(s)  // optional background function
+);
+text.setText("Updated");
+```
+
+### Box
+
+Container with padding and background color.
+
+```typescript
+const box = new Box(
+  1,                // paddingX
+  1,                // paddingY
+  (s) => bgGray(s)  // background function
+);
+box.addChild(new Text("Content", 0, 0));
+box.setBgFn((s) => bgBlue(s));
+```
+
+### Container
+
+Groups child components vertically.
+
+```typescript
+const container = new Container();
+container.addChild(component1);
+container.addChild(component2);
+container.removeChild(component1);
+```
+
+### Spacer
+
+Empty vertical space.
+
+```typescript
+const spacer = new Spacer(2);  // 2 empty lines
+```
+
+### Markdown
+
+Renders markdown with syntax highlighting.
+
+```typescript
+const md = new Markdown(
+  "# Title\n\nSome **bold** text",
+  1,        // paddingX
+  1,        // paddingY
+  theme     // MarkdownTheme (see below)
+);
+md.setText("Updated markdown");
+```
+
+### Image
+
+Renders images in supported terminals (Kitty, iTerm2, Ghostty, WezTerm, Warp).
+
+```typescript
+const image = new Image(
+  base64Data,   // base64-encoded image
+  "image/png",  // MIME type
+  theme,        // ImageTheme
+  { maxWidthCells: 80, maxHeightCells: 24 }
+);
+```
+
+## Keyboard Input
+
+Use `matchesKey()` for key detection:
+
+```typescript
+import { matchesKey, Key } from "@earendil-works/pi-tui";
+
+handleInput(data: string) {
+  if (matchesKey(data, Key.up)) {
+    this.selectedIndex--;
+  } else if (matchesKey(data, Key.enter)) {
+    this.onSelect?.(this.selectedIndex);
+  } else if (matchesKey(data, Key.escape)) {
+    this.onCancel?.();
+  } else if (matchesKey(data, Key.ctrl("c"))) {
+    // Ctrl+C
+  }
+}
+```
+
+**Key identifiers** (use `Key.*` for autocomplete, or string literals):
+- Basic keys: `Key.enter`, `Key.escape`, `Key.tab`, `Key.space`, `Key.backspace`, `Key.delete`, `Key.home`, `Key.end`
+- Arrow keys: `Key.up`, `Key.down`, `Key.left`, `Key.right`
+- With modifiers: `Key.ctrl("c")`, `Key.shift("tab")`, `Key.alt("left")`, `Key.ctrlShift("p")`
+- String format also works: `"enter"`, `"ctrl+c"`, `"shift+tab"`, `"ctrl+shift+p"`
+
+## Line Width
+
+**Critical:** Each line from `render()` must not exceed the `width` parameter.
+
+```typescript
+import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
+
+render(width: number): string[] {
+  // Truncate long lines
+  return [truncateToWidth(this.text, width)];
+}
+```
+
+Utilities:
+- `visibleWidth(str)` - Get display width (ignores ANSI codes)
+- `truncateToWidth(str, width, ellipsis?)` - Truncate with optional ellipsis
+- `wrapTextWithAnsi(str, width)` - Word wrap preserving ANSI codes
+
+## Creating Custom Components
+
+Example: Interactive selector
+
+```typescript
+import {
+  matchesKey, Key,
+  truncateToWidth, visibleWidth
+} from "@earendil-works/pi-tui";
+
+class MySelector {
+  private items: string[];
+  private selected = 0;
+  private cachedWidth?: number;
+  private cachedLines?: string[];
+  
+  public onSelect?: (item: string) => void;
+  public onCancel?: () => void;
+
+  constructor(items: string[]) {
+    this.items = items;
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.up) && this.selected > 0) {
+      this.selected--;
+      this.invalidate();
+    } else if (matchesKey(data, Key.down) && this.selected < this.items.length - 1) {
+      this.selected++;
+      this.invalidate();
+    } else if (matchesKey(data, Key.enter)) {
+      this.onSelect?.(this.items[this.selected]);
+    } else if (matchesKey(data, Key.escape)) {
+      this.onCancel?.();
+    }
+  }
+
+  render(width: number): string[] {
+    if (this.cachedLines && this.cachedWidth === width) {
+      return this.cachedLines;
+    }
+
+    this.cachedLines = this.items.map((item, i) => {
+      const prefix = i === this.selected ? "> " : "  ";
+      return truncateToWidth(prefix + item, width);
+    });
+    this.cachedWidth = width;
+    return this.cachedLines;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedLines = undefined;
+  }
+}
+```
+
+Usage in an extension:
+
+```typescript
+pi.registerCommand("pick", {
+  description: "Pick an item",
+  handler: async (_args, ctx) => {
+    const items = ["Option A", "Option B", "Option C"];
+    const selected = await ctx.ui.custom<string | null>((tui, _theme, _keybindings, done) => {
+      const selector = new MySelector(items);
+      selector.onSelect = done;
+      selector.onCancel = () => done(null);
+
+      return {
+        render: (width) => selector.render(width),
+        handleInput: (data) => {
+          selector.handleInput(data);
+          tui.requestRender();
+        },
+        invalidate: () => selector.invalidate(),
+      };
+    });
+
+    if (selected !== null) {
+      ctx.ui.notify(`Selected: ${selected}`, "info");
+    }
+  }
+});
+```
+
+## Theming
+
+Components accept theme objects for styling.
+
+**In `renderCall`/`renderResult`**, use the `theme` parameter:
+
+```typescript
+renderResult(result, options, theme, context) {
+  // Use theme.fg() for foreground colors
+  return new Text(theme.fg("success", "Done!"), 0, 0);
+  
+  // Use theme.bg() for background colors
+  const styled = theme.bg("toolPendingBg", theme.fg("accent", "text"));
+}
+```
+
+**Foreground colors** (`theme.fg(color, text)`):
+
+| Category | Colors |
+|----------|--------|
+| General | `text`, `accent`, `muted`, `dim`, `searchMatchText` |
+| Status | `success`, `error`, `warning` |
+| Borders | `border`, `borderAccent`, `borderMuted` |
+| Messages | `userMessageText`, `customMessageText`, `customMessageLabel` |
+| Tools | `toolTitle`, `toolOutput` |
+| Diffs | `toolDiffAdded`, `toolDiffRemoved`, `toolDiffContext` |
+| Markdown | `mdHeading`, `mdLink`, `mdLinkUrl`, `mdCode`, `mdCodeBlock`, `mdCodeBlockBorder`, `mdQuote`, `mdQuoteBorder`, `mdHr`, `mdListBullet` |
+| Syntax | `syntaxComment`, `syntaxKeyword`, `syntaxFunction`, `syntaxVariable`, `syntaxString`, `syntaxNumber`, `syntaxType`, `syntaxOperator`, `syntaxPunctuation` |
+| Thinking | `thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, `thinkingMax` |
+| Modes | `bashMode` |
+
+**Background colors** (`theme.bg(color, text)`):
+
+`selectedBg`, `searchMatchBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
+
+**For Markdown**, use `getMarkdownTheme()`:
+
+```typescript
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
+
+renderResult(result, options, theme, context) {
+  const mdTheme = getMarkdownTheme();
+  return new Markdown(result.details.markdown, 0, 0, mdTheme);
+}
+```
+
+**For custom components**, define your own theme interface:
+
+```typescript
+interface MyTheme {
+  selected: (s: string) => string;
+  normal: (s: string) => string;
+}
+```
+
+## Debug logging
+
+Set `PI_TUI_WRITE_LOG` to capture the raw ANSI stream written to stdout.
+
+```bash
+PI_TUI_WRITE_LOG=/tmp/tui-ansi.log npx tsx packages/tui/test/chat-simple.ts
+```
+
+## Performance
+
+Cache rendered output when possible:
+
+```typescript
+class CachedComponent {
+  private cachedWidth?: number;
+  private cachedLines?: string[];
+
+  render(width: number): string[] {
+    if (this.cachedLines && this.cachedWidth === width) {
+      return this.cachedLines;
+    }
+    // ... compute lines ...
+    this.cachedWidth = width;
+    this.cachedLines = lines;
+    return lines;
+  }
+
+  invalidate(): void {
+    this.cachedWidth = undefined;
+    this.cachedLines = undefined;
+  }
+}
+```
+
+Call `invalidate()` when state changes, then use the injected `tui.requestRender()` to trigger re-render.
+
+## Invalidation and Theme Changes
+
+When the theme changes, the TUI calls `invalidate()` on all components to clear their caches. Components must properly implement `invalidate()` to ensure theme changes take effect.
+
+### The Problem
+
+If a component pre-bakes theme colors into strings (via `theme.fg()`, `theme.bg()`, etc.) and caches them, the cached strings contain ANSI escape codes from the old theme. Simply clearing the render cache isn't enough if the component stores the themed content separately.
+
+**Wrong approach** (theme colors won't update):
+
+```typescript
+class BadComponent extends Container {
+  private content: Text;
+
+  constructor(message: string, theme: Theme) {
+    super();
+    // Pre-baked theme colors stored in Text component
+    this.content = new Text(theme.fg("accent", message), 1, 0);
+    this.addChild(this.content);
+  }
+  // No invalidate override - parent's invalidate only clears
+  // child render caches, not the pre-baked content
+}
+```
+
+### The Solution
+
+Components that build content with theme colors must rebuild that content when `invalidate()` is called:
+
+```typescript
+class GoodComponent extends Container {
+  private message: string;
+  private content: Text;
+
+  constructor(message: string) {
+    super();
+    this.message = message;
+    this.content = new Text("", 1, 0);
+    this.addChild(this.content);
+    this.updateDisplay();
+  }
+
+  private updateDisplay(): void {
+    // Rebuild content with current theme
+    this.content.setText(theme.fg("accent", this.message));
+  }
+
+  override invalidate(): void {
+    super.invalidate();  // Clear child caches
+    this.updateDisplay(); // Rebuild with new theme
+  }
+}
+```
+
+### Pattern: Rebuild on Invalidate
+
+For components with complex content:
+
+```typescript
+class ComplexComponent extends Container {
+  private data: SomeData;
+
+  constructor(data: SomeData) {
+    super();
+    this.data = data;
+    this.rebuild();
+  }
+
+  private rebuild(): void {
+    this.clear();  // Remove all children
+
+    // Build UI with current theme
+    this.addChild(new Text(theme.fg("accent", theme.bold("Title")), 1, 0));
+    this.addChild(new Spacer(1));
+
+    for (const item of this.data.items) {
+      const color = item.active ? "success" : "muted";
+      this.addChild(new Text(theme.fg(color, item.label), 1, 0));
+    }
+  }
+
+  override invalidate(): void {
+    super.invalidate();
+    this.rebuild();
+  }
+}
+```
+
+### When This Matters
+
+This pattern is needed when:
+
+1. **Pre-baking theme colors** - Using `theme.fg()` or `theme.bg()` to create styled strings stored in child components
+2. **Syntax highlighting** - Using `highlightCode()` which applies theme-based syntax colors
+3. **Complex layouts** - Building child component trees that embed theme colors
+
+This pattern is NOT needed when:
+
+1. **Using theme callbacks** - Passing functions like `(text) => theme.fg("accent", text)` that are called during render
+2. **Simple containers** - Just grouping other components without adding themed content
+3. **Stateless render** - Computing themed output fresh in every `render()` call (no caching)
+
+## Common Patterns
+
+These patterns cover the most common UI needs in extensions. **Copy these patterns instead of building from scratch.**
+
+### Pattern 1: Selection Dialog (SelectList)
+
+For letting users pick from a list of options. Use `SelectList` from `@earendil-works/pi-tui` with `DynamicBorder` for framing.
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+
+pi.registerCommand("pick", {
+  handler: async (_args, ctx) => {
+    const items: SelectItem[] = [
+      { value: "opt1", label: "Option 1", description: "First option" },
+      { value: "opt2", label: "Option 2", description: "Second option" },
+      { value: "opt3", label: "Option 3" },  // description is optional
+    ];
+
+    const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      const container = new Container();
+
+      // Top border
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+      // Title
+      container.addChild(new Text(theme.fg("accent", theme.bold("Pick an Option")), 1, 0));
+
+      // SelectList with theme
+      const selectList = new SelectList(items, Math.min(items.length, 10), {
+        selectedPrefix: (t) => theme.fg("accent", t),
+        selectedText: (t) => theme.fg("accent", t),
+        description: (t) => theme.fg("muted", t),
+        scrollInfo: (t) => theme.fg("dim", t),
+        noMatch: (t) => theme.fg("warning", t),
+      });
+      selectList.onSelect = (item) => done(item.value);
+      selectList.onCancel = () => done(null);
+      container.addChild(selectList);
+
+      // Help text
+      container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel"), 1, 0));
+
+      // Bottom border
+      container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+      return {
+        render: (w) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data) => { selectList.handleInput(data); tui.requestRender(); },
+      };
+    });
+
+    if (result) {
+      ctx.ui.notify(`Selected: ${result}`, "info");
+    }
+  },
+});
+```
+
+**Examples:** [preset.ts](../examples/extensions/preset.ts), [tools.ts](../examples/extensions/tools.ts)
+
+### Pattern 2: Async Operation with Cancel (BorderedLoader)
+
+For operations that take time and should be cancellable. `BorderedLoader` shows a spinner and handles escape to cancel.
+
+```typescript
+import { BorderedLoader } from "@earendil-works/pi-coding-agent";
+
+pi.registerCommand("fetch", {
+  handler: async (_args, ctx) => {
+    const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      const loader = new BorderedLoader(tui, theme, "Fetching data...");
+      loader.onAbort = () => done(null);
+
+      // Do async work
+      fetchData(loader.signal)
+        .then((data) => done(data))
+        .catch(() => done(null));
+
+      return loader;
+    });
+
+    if (result === null) {
+      ctx.ui.notify("Cancelled", "info");
+    } else {
+      ctx.ui.setEditorText(result);
+    }
+  },
+});
+```
+
+**Examples:** [qna.ts](../examples/extensions/qna.ts), [handoff.ts](../examples/extensions/handoff.ts)
+
+### Pattern 3: Settings/Toggles (SettingsList)
+
+For toggling multiple settings. Use `SettingsList` from `@earendil-works/pi-tui` with `getSettingsListTheme()`.
+
+```typescript
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+
+pi.registerCommand("settings", {
+  handler: async (_args, ctx) => {
+    const items: SettingItem[] = [
+      { id: "verbose", label: "Verbose mode", currentValue: "off", values: ["on", "off"] },
+      { id: "color", label: "Color output", currentValue: "on", values: ["on", "off"] },
+    ];
+
+    await ctx.ui.custom((_tui, theme, _kb, done) => {
+      const container = new Container();
+      container.addChild(new Text(theme.fg("accent", theme.bold("Settings")), 1, 1));
+
+      const settingsList = new SettingsList(
+        items,
+        Math.min(items.length + 2, 15),
+        getSettingsListTheme(),
+        (id, newValue) => {
+          // Handle value change
+          ctx.ui.notify(`${id} = ${newValue}`, "info");
+        },
+        () => done(undefined),  // On close
+        { enableSearch: true }, // Optional: enable fuzzy search by label
+      );
+      container.addChild(settingsList);
+
+      return {
+        render: (w) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data) => settingsList.handleInput?.(data),
+      };
+    });
+  },
+});
+```
+
+**Examples:** [tools.ts](../examples/extensions/tools.ts)
+
+### Pattern 4: Persistent Status Indicator
+
+Show status in the footer that persists across renders. Good for mode indicators.
+
+```typescript
+// Set status (shown in footer)
+ctx.ui.setStatus("my-ext", ctx.ui.theme.fg("accent", "● active"));
+
+// Clear status
+ctx.ui.setStatus("my-ext", undefined);
+```
+
+**Examples:** [status-line.ts](../examples/extensions/status-line.ts), [plan-mode/index.ts](../examples/extensions/plan-mode/index.ts), [preset.ts](../examples/extensions/preset.ts)
+
+### Pattern 4b: Working Indicator Customization
+
+Customize the inline working indicator shown while pi is streaming a response.
+
+```typescript
+// Static indicator
+ctx.ui.setWorkingIndicator({ frames: [ctx.ui.theme.fg("accent", "●")] });
+
+// Custom animated indicator
+ctx.ui.setWorkingIndicator({
+  frames: [
+    ctx.ui.theme.fg("dim", "·"),
+    ctx.ui.theme.fg("muted", "•"),
+    ctx.ui.theme.fg("accent", "●"),
+    ctx.ui.theme.fg("muted", "•"),
+  ],
+  intervalMs: 120,
+});
+
+// Hide the indicator entirely
+ctx.ui.setWorkingIndicator({ frames: [] });
+
+// Restore pi's default spinner
+ctx.ui.setWorkingIndicator();
+```
+
+This only affects the normal streaming working indicator. Compaction and retry loaders keep their built-in styling. Custom frames are rendered verbatim, so extensions must add their own colors when needed.
+
+**Examples:** [working-indicator.ts](../examples/extensions/working-indicator.ts)
+
+### Pattern 5: Widgets Above/Below Editor
+
+Show persistent content above or below the input editor. Good for todo lists, progress.
+
+```typescript
+// Simple string array (above editor by default)
+ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);
+
+// Render below the editor
+ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"], { placement: "belowEditor" });
+
+// Or with theme
+ctx.ui.setWidget("my-widget", (_tui, theme) => {
+  const lines = items.map((item, i) =>
+    item.done
+      ? theme.fg("success", "✓ ") + theme.fg("muted", item.text)
+      : theme.fg("dim", "○ ") + item.text
+  );
+  return {
+    render: () => lines,
+    invalidate: () => {},
+  };
+});
+
+// Clear
+ctx.ui.setWidget("my-widget", undefined);
+```
+
+**Examples:** [plan-mode/index.ts](../examples/extensions/plan-mode/index.ts)
+
+### Pattern 6: Custom Footer
+
+Replace the footer. `footerData` exposes data not otherwise accessible to extensions.
+
+```typescript
+ctx.ui.setFooter((tui, theme, footerData) => ({
+  invalidate() {},
+  render(width: number): string[] {
+    // footerData.getGitBranch(): string | null
+    // footerData.getExtensionStatuses(): ReadonlyMap<string, string>
+    return [`${ctx.model?.id} (${footerData.getGitBranch() || "no git"})`];
+  },
+  dispose: footerData.onBranchChange(() => tui.requestRender()), // reactive
+}));
+
+ctx.ui.setFooter(undefined); // restore default
+```
+
+Token stats available via `ctx.sessionManager.getBranch()` and `ctx.model`.
+
+**Examples:** [custom-footer.ts](../examples/extensions/custom-footer.ts)
+
+### Pattern 7: Custom Editor (vim mode, etc.)
+
+Replace the main input editor with a custom implementation. Useful for modal editing (vim), different keybindings (emacs), or specialized input handling.
+
+```typescript
+import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+
+type Mode = "normal" | "insert";
+
+class VimEditor extends CustomEditor {
+  private mode: Mode = "insert";
+
+  handleInput(data: string): void {
+    // Escape: switch to normal mode, or pass through for app handling
+    if (matchesKey(data, "escape")) {
+      if (this.mode === "insert") {
+        this.mode = "normal";
+        return;
+      }
+      // In normal mode, escape aborts agent (handled by CustomEditor)
+      super.handleInput(data);
+      return;
+    }
+
+    // Insert mode: pass everything to CustomEditor
+    if (this.mode === "insert") {
+      super.handleInput(data);
+      return;
+    }
+
+    // Normal mode: vim-style navigation
+    switch (data) {
+      case "i": this.mode = "insert"; return;
+      case "h": super.handleInput("\x1b[D"); return; // Left
+      case "j": super.handleInput("\x1b[B"); return; // Down
+      case "k": super.handleInput("\x1b[A"); return; // Up
+      case "l": super.handleInput("\x1b[C"); return; // Right
+    }
+    // Pass unhandled keys to super (ctrl+c, etc.), but filter printable chars
+    if (data.length === 1 && data.charCodeAt(0) >= 32) return;
+    super.handleInput(data);
+  }
+
+  render(width: number): string[] {
+    const lines = super.render(width);
+    // Add mode indicator to bottom border (use truncateToWidth for ANSI-safe truncation)
+    if (lines.length > 0) {
+      const label = this.mode === "normal" ? " NORMAL " : " INSERT ";
+      const lastLine = lines[lines.length - 1]!;
+      // Pass "" as ellipsis to avoid adding "..." when truncating
+      lines[lines.length - 1] = truncateToWidth(lastLine, width - label.length, "") + label;
+    }
+    return lines;
+  }
+}
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    // Factory receives the TUI, theme, and keybindings from the app
+    ctx.ui.setEditorComponent((tui, theme, keybindings) =>
+      new VimEditor(tui, theme, keybindings)
+    );
+  });
+}
+```
+
+**Key points:**
+
+- **Extend `CustomEditor`** (not base `Editor`) to get app keybindings (escape to abort, ctrl+d to exit, model switching, etc.)
+- **Call `super.handleInput(data)`** for keys you don't handle
+- **Factory pattern**: `setEditorComponent` receives a factory function that gets `tui`, `theme`, and `keybindings`
+- **Pass `undefined`** to restore the default editor: `ctx.ui.setEditorComponent(undefined)`
+
+**Examples:** [modal-editor.ts](../examples/extensions/modal-editor.ts)
+
+## Key Rules
+
+1. **Always use theme from callback** - Don't import theme directly. Use `theme` from the `ctx.ui.custom((tui, theme, keybindings, done) => ...)` callback.
+
+2. **Always type DynamicBorder color param** - Write `(s: string) => theme.fg("accent", s)`, not `(s) => theme.fg("accent", s)`.
+
+3. **Call tui.requestRender() after state changes** - In `handleInput`, call `tui.requestRender()` after updating state.
+
+4. **Return the three-method object** - Custom components need `{ render, invalidate, handleInput }`.
+
+5. **Use existing components** - `SelectList`, `SettingsList`, `BorderedLoader` cover 90% of cases. Don't rebuild them.
+
+## Examples
+
+- **Selection UI**: [examples/extensions/preset.ts](../examples/extensions/preset.ts) - SelectList with DynamicBorder framing
+- **Async with cancel**: [examples/extensions/qna.ts](../examples/extensions/qna.ts) - BorderedLoader for LLM calls
+- **Settings toggles**: [examples/extensions/tools.ts](../examples/extensions/tools.ts) - SettingsList for tool enable/disable
+- **Status indicators**: [examples/extensions/plan-mode/index.ts](../examples/extensions/plan-mode/index.ts) - setStatus and setWidget
+- **Working indicator**: [examples/extensions/working-indicator.ts](../examples/extensions/working-indicator.ts) - setWorkingIndicator
+- **Custom footer**: [examples/extensions/custom-footer.ts](../examples/extensions/custom-footer.ts) - setFooter with stats
+- **Custom editor**: [examples/extensions/modal-editor.ts](../examples/extensions/modal-editor.ts) - Vim-like modal editing
+- **Snake game**: [examples/extensions/snake.ts](../examples/extensions/snake.ts) - Full game with keyboard input, game loop
+- **Custom tool rendering**: [examples/extensions/todo.ts](../examples/extensions/todo.ts) - renderCall and renderResult
+
+````

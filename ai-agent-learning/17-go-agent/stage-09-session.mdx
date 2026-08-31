@@ -1,0 +1,12 @@
+---
+title: "Go 09：Session"
+description: "用 JSONL 保存可恢复的消息前缀。"
+---
+
+# Go 09：Session
+
+`Session.Save` 先写临时文件再 rename；`LoadSession` 逐行解码并报告坏行号。Harness 在 run 后保存成功前缀，因此失败的 Provider 不会让已经确认的历史凭空消失。
+
+## 实验
+
+重启进程加载 session，注入 malformed JSON、空 role、超长行，验证错误不会被吞掉；为实际生产版本补 fsync、版本 header、树节点和并发锁。

@@ -1,0 +1,36 @@
+---
+title: "Session 持久化与恢复"
+description: "区分写入顺序、崩溃边界、恢复状态和审计信息。"
+---
+
+# Session 持久化与恢复
+
+## 最小持久化协议
+
+一次可靠的 turn 至少包含：接受 user message、记录 assistant message、记录 Tool Result、更新 leaf、记录 usage。每个副作用前后都应有可恢复边界；不要等到 run 结束才一次性保存全部 transcript。
+
+```text
+accept prompt -> append user entry
+request model -> append assistant entry
+validate/execute tool -> append tool result
+checkpoint -> apply queues / compaction
+finish -> persist terminal outcome
+```
+
+## 当前 Pi 的事实
+
+`SessionManager` 管理当前 v3 JSONL 会话：header 中有 `sessionId`、`cwd`、`version`；entries 通过 `parentId` 形成树。`AgentSession._handleAgentEvent` 在 `message_end` 等事件处保存消息，并处理 compaction、usage、分支等行为。
+
+这和 `packages/agent/src/harness/agent-harness.ts` 的新公共 API 不是同一个持久化实现；后者当前 scaffold 的 `create` 在发现已有记录时会返回 `HarnessNotImplemented`。教材明确区分“现有 Coding Agent session”与“durable Harness 设计稿”。
+
+## 恢复问题清单
+
+- assistant 已写、Tool Result 未写：能否安全重放 Tool？
+- Tool 已执行、进程崩溃：副作用是否幂等？是否应合成 interrupted？
+- retry 等待中崩溃：attempt 是否持久化，是否会无上限重试？
+- compaction 已决定但摘要未写：是否能从同一分支重新生成？
+- queued steering 已接受但尚未消费：重开后在哪个边界注入？
+
+## 测试
+
+所有边界都用“写到这里就关闭/重开”的测试覆盖；恢复结果应与不中断运行的 durable state 相同。不要只测正常退出。

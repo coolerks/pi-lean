@@ -1,0 +1,19 @@
+---
+title: "Java 03：Tool Interface"
+description: "用 interface、JsonNode 和 ToolRegistry 建立执行边界。"
+---
+
+# Java 03：Tool Interface
+
+```java
+public interface Tool {
+    ToolDefinition definition();
+    ToolResult execute(CancellationToken cancellation, JsonNode arguments) throws Exception;
+}
+```
+
+`definition()` 供模型看到；`execute()` 才有副作用。`ToolRegistry` 做名称和 required 字段检查，unknown/invalid call 变成 error result，不进入真实 Tool。
+
+## 实验
+
+为 Tool 加唯一 call id 和必填字段，测试 malformed JSON、缺字段、重复注册及 execution exception。

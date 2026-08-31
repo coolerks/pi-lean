@@ -1,0 +1,14 @@
+---
+title: "Go 01：最小 LLM Client"
+description: "从 net/http 和 encoding/json 发出一次非流式模型请求。"
+---
+
+# Go 01：最小 LLM Client
+
+`HTTPModel.Complete` 只处理一次 OpenAI-compatible Chat Completions 请求：构造 JSON、设置 `Authorization` 和 `Content-Type`、绑定 `context.Context`、检查 HTTP 状态、解码 assistant message。它不负责 Tool 执行，也不把 Provider 错误伪装成最终回答。
+
+## 实验
+
+用 `httptest.Server` 返回成功、429、500、空 choices 和 malformed JSON；断言错误含状态但不含 API key。默认测试使用 `ScriptedModel`，真实 API 只通过环境变量配置。
+
+对应代码：`examples/go-agent/internal/agent/model.go` 的 `Model`、`HTTPModel.Complete`。

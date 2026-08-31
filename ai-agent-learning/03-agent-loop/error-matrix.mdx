@@ -1,0 +1,47 @@
+---
+title: "Agent 错误与边界矩阵"
+description: "按错误来源决定重试、转成 Tool Result、终止或让用户处理。"
+---
+
+# Agent 错误与边界矩阵
+
+同一个 `error` 字符串不能覆盖所有语义。先判断副作用发生在哪一层，再决定是否能重试。
+
+| 场景 | 发生层 | 默认处理 | 是否继续 |
+| --- | --- | --- | --- |
+| timeout | HTTP/Provider/Tool | 记录 deadline 和 attempt | 可恢复时有限重试 |
+| 429 | Provider | respect `Retry-After`，指数退避 | 有上限 |
+| 5xx | Provider | 有上限重试 | 耗尽后结束 |
+| invalid JSON | Provider stream/Tool args | 保留原始片段，生成结构化错误 | Tool 参数错误可回模型 |
+| unknown tool | Registry | `isError=true` 的 Tool Result | 让模型修正或达到上限 |
+| Tool exception | Executor | 捕获、脱敏、带 call id 返回 | 由模型决定修复 |
+| Tool timeout | Executor | 取消子任务并记录 | 不应留下假成功 |
+| user abort | Harness | 取消 signal/token，清理当前队列 | 结束本次 run |
+| context too long | Context/Provider | 压缩并重建请求 | 只允许有限 recovery |
+| broken stream | Provider | 关闭流，按 Provider policy 重试 | 不拼接半个成功 |
+| MCP disconnected | Transport | 标记 remote tool unavailable | 不伪造结果 |
+| plugin load failed | Loader | 隔离失败插件并报告 | 按配置 fail-fast |
+| skill invalid | Resource loader | 跳过或显式告警 | 不把坏文本放入 prompt |
+| session corrupted | Persistence | 报行号/版本，不静默丢历史 | 需要修复或只读恢复 |
+| budget exceeded | Harness | 停止新请求/工具 | 返回可解释结果 |
+
+## 终止条件
+
+- Provider 返回最终文本且没有 Tool Call。
+- Tool batch 的协议/业务结果明确 `terminate`。
+- `maxSteps`、预算或 deadline 达到上限。
+- 用户 abort、不可恢复 Provider 错误或上下文无法压缩。
+
+`stopReason` 是 Provider 的信号，不是唯一的终止依据；Agent Runtime 仍要检查 Tool Call、队列、权限和本地上限。
+
+## 实验
+
+**目标**：让每种错误走一条可断言路径。
+
+**准备**：使用 Go/Java `ScriptedModel`，不要填真实 key。
+
+**步骤**：先注入一次 503，再注入 malformed Tool arguments、unknown tool 和永久失败；分别设置 `maxAttempts=2`、`maxSteps=1`，记录每个 event 和最后一条 message。
+
+**观察点**：retry 只发生在 Model 层；Tool 参数错误成为 Tool Result；abort 不会偷偷开始下一轮；持久化的失败前缀仍可诊断。
+
+**思考题**：如果写文件已经成功但响应丢失，为什么“再试一次”可能重复副作用？如何用 operation id 或幂等键解决？

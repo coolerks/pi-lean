@@ -1,0 +1,30 @@
+---
+title: "Coding Agent 由什么组成"
+description: "从 Pi 的 AgentSession、工具、资源、模式和配置理解 Coding Agent。"
+---
+
+# Coding Agent 由什么组成
+
+Coding Agent 不是“聊天框加 shell”。Pi 的当前运行路径可以拆成：
+
+```text
+CLI/TUI/RPC
+  -> AgentSession
+     -> Agent (agent-loop)
+        -> pi-ai Provider
+     -> SessionManager
+     -> ResourceLoader / Skills / Prompt templates
+     -> ExtensionRunner
+     -> coding tools
+     -> ModelRuntime / auth / settings
+```
+
+`AgentSession` 是核心编排点，负责订阅 Agent 事件、持久化消息、刷新 system prompt/tools、auto compaction、retry、bash 状态和 Extension hooks。不同 mode 只改变输入输出表面。
+
+## 和最小 Agent 的差距
+
+最小 Agent 只有 messages、model、tools 和 loop；Coding Agent 还必须知道 cwd、项目上下文、文件输出上限、可信度、认证、Session 分支、TUI 状态、远程 RPC 和插件故障。理解这些差距，就是从 Agent 进入 Harness 的入口。
+
+## 核心问题
+
+一个成熟 Coding Agent 的工程能力并不是模型“自带”的；它由 Agent core、coding-agent 编排层、Provider adapter、工具实现、资源系统、Session 和 UI 多个 package 共同提供。

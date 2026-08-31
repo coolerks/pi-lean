@@ -1,0 +1,29 @@
+---
+title: "设计一次 Agent Run Trace"
+description: "用 run、LLM span 和 Tool span 分析真实请求。"
+---
+
+# 设计一次 Agent Run Trace
+
+```text
+run: refactor-auth
+├── llm.request attempt=1 latency=1.2s input=... output=...
+├── tool.read duration=15ms error=false
+├── tool.grep duration=42ms error=false
+├── llm.request attempt=1 latency=0.9s
+├── tool.edit duration=21ms
+├── tool.bash duration=3.1s exit=1
+└── llm.request final
+```
+
+## 关联和采样
+
+用 `traceId` 关联一次 run，`spanId` 表示请求/Tool，`sessionId` 关联持久化会话，`toolCallId` 关联模型调用和结果。高成本 payload 不应全量采样；生产可保留耗时、状态、token、错误类型和脱敏摘要。
+
+## 练习
+
+在 Go/Java `EventBus` 上挂一个 telemetry listener，生成上述树；测试 Tool exception、Provider 429→retry、abort 和 compaction。断言即使失败也有结束 span，且输出中不含 API key 或文件正文。
+
+## 核心问题
+
+可观测性不是把所有内容打印出来，而是让一次运行的状态转换、成本和故障可以被关联、聚合和诊断。

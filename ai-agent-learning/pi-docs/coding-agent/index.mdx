@@ -1,0 +1,157 @@
+---
+title: "Pi 文档"
+description: "Pi Coding Agent 的入口、定制、编程使用和开发索引。"
+---
+
+# Pi 文档
+
+> 本页是 `packages/coding-agent/docs/index.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+Pi Coding Agent 的入口、定制、编程使用和开发索引。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+Pi 是一个保持核心精简的终端 Coding Agent。它不会把所有能力硬编码到核心，而是通过 TypeScript Extensions、Skills、Prompt Templates、Themes 和 Pi Packages 增加能力。下面的索引说明从安装到扩展、编程集成、平台设置和本地开发的完整路径。
+
+### 快速开始
+
+使用 npm 全局安装 `@earendil-works/pi-coding-agent` 时，示例明确加上 `--ignore-scripts`；这会关闭依赖的 lifecycle scripts，而普通 npm 安装不依赖它们。在 Linux 或 macOS 上，也可以使用 `https://pi.dev/install.sh` installer。卸载时要使用实际安装 Pi 的包管理器：npm、pnpm、Yarn 和 Bun 的命令不同。卸载 Pi 不会删除 `~/.pi/agent/` 下的 settings、credentials、sessions 和已安装 packages。
+
+进入目标项目目录后运行 `pi`。认证有两条路径：启动后执行 `/login` 选择 subscription provider，或在启动前设置例如 `ANTHROPIC_API_KEY` 的 API-key provider。详细的认证、第一次 session 和常见问题见 [快速开始](/pi-docs/coding-agent/quickstart)。
+
+### 从哪里开始
+
+[快速开始](/pi-docs/coding-agent/quickstart) 负责安装和认证；[使用 Pi](/pi-docs/coding-agent/usage) 解释交互模式、斜杠命令、context files 和 CLI；[Providers](/pi-docs/coding-agent/providers) 解释订阅和 API keys；`llama.cpp` 章节解释本地 router。安全、容器化、Settings、Keybindings、Sessions 和 Compaction 分别处理权限边界、隔离、配置、快捷键、会话树和上下文压缩。
+
+### 定制 Pi
+
+Extensions 是宿主内的 TypeScript 模块，可以增加 tools、commands、events 和自定义 UI。Skills 是按需加载的能力说明；Prompt Templates 是可由斜杠命令展开的重复提示；Themes 改变终端显示；Pi Packages 将这些资源打包分发。Models 和 Custom Providers 则分别扩展模型定义与 API/OAuth 适配。它们的权限、加载范围和生命周期不同，不能把 Skill、Extension 和 MCP 当成同一种插件。
+
+### 编程使用
+
+SDK 让 Node.js 程序直接嵌入 Pi；RPC Mode 通过 stdin/stdout 的 JSONL 控制进程；JSON Event Stream Mode 输出机器可消费的结构化事件；TUI Components 提供 Extension 自定义终端 UI 的组件接口。RPC 是控制 Pi Agent 的协议，不能因为两者都使用 JSON 就把它和 MCP 混为一谈。
+
+### Reference、平台与开发
+
+Environment Variables 说明 Pi 进程配置以及 Bash Tool 可见的 session metadata；Session Format 说明 JSONL entries 和 `SessionManager` API。Windows、Termux、tmux、Terminal Setup 和 Shell Aliases 解决不同运行环境的终端边界。Development 章节最后说明本地 setup、项目结构、路径解析、调试命令和测试方式。
+
+> 译者注：这个索引把 Pi 分成“运行核心”和“资源/扩展表面”。在 Java 中可以把 SDK/RPC 看成宿主 API，把 Extension loader 看成 SPI；在 Go 中则通常由显式 registry 和进程协议承担同样的边界。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Pi Documentation | Pi Documentation |
+| Quick start | 快速开始 |
+| Start here | Start here |
+| Customization | Customization |
+| Programmatic usage | Programmatic 使用方式 |
+| Reference | Reference |
+| Platform setup | Platform setup |
+| Development | Development |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/index.md)
+
+````markdown
+# Pi Documentation
+
+Pi is a minimal terminal coding harness. It is designed to stay small at the core while being extended through TypeScript extensions, skills, prompt templates, themes, and pi packages.
+
+## Quick start
+
+Install Pi with npm:
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
+
+On Linux or macOS, you can also use the installer:
+
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+```
+
+To uninstall pi itself, use npm for curl and npm installs:
+
+```bash
+npm uninstall -g @earendil-works/pi-coding-agent
+```
+
+For pnpm, Yarn, or Bun installs, use the matching global remove command: `pnpm remove -g @earendil-works/pi-coding-agent`, `yarn global remove @earendil-works/pi-coding-agent`, or `bun uninstall -g @earendil-works/pi-coding-agent`.
+
+Then run it in a project directory:
+
+```bash
+pi
+```
+
+Authenticate with `/login` for subscription providers, or set an API key such as `ANTHROPIC_API_KEY` before starting pi.
+
+For the full first-run flow, see [Quickstart](quickstart.md).
+
+## Start here
+
+- [Quickstart](quickstart.md) - install, authenticate, and run a first session.
+- [Using Pi](usage.md) - interactive mode, slash commands, context files, and CLI reference.
+- [Providers](providers.md) - subscription and API-key setup for built-in providers.
+- [llama.cpp](llama-cpp.md) - run a local router and manage models with `/llama`.
+- [Security](security.md) - project trust, sandbox boundaries, and vulnerability reporting.
+- [Containerization](containerization.md) - sandbox pi with Gondolin, Docker, or OpenShell.
+- [Settings](settings.md) - global and project settings.
+- [Keybindings](keybindings.md) - default shortcuts and custom keybindings.
+- [Sessions](sessions.md) - session management, branching, and tree navigation.
+- [Compaction](compaction.md) - context compaction and branch summarization.
+
+## Customization
+
+- [Extensions](extensions.md) - TypeScript modules for tools, commands, events, and custom UI.
+- [Skills](skills.md) - Agent Skills for reusable on-demand capabilities.
+- [Prompt templates](prompt-templates.md) - reusable prompts that expand from slash commands.
+- [Themes](themes.md) - built-in and custom terminal themes.
+- [Pi packages](packages.md) - bundle and share extensions, skills, prompts, and themes.
+- [Custom models](models.md) - add model entries for supported provider APIs.
+- [Custom providers](custom-provider.md) - implement custom APIs and OAuth flows.
+
+## Programmatic usage
+
+- [SDK](sdk.md) - embed pi in Node.js applications.
+- [RPC mode](rpc.md) - integrate over stdin/stdout JSONL.
+- [JSON event stream mode](json.md) - print mode with structured events.
+- [TUI components](tui.md) - build custom terminal UI for extensions.
+
+## Reference
+
+- [Environment variables](environment-variables.md) - Pi process configuration and session metadata available to bash tools.
+- [Session format](session-format.md) - JSONL session file format, entry types, and SessionManager API.
+
+## Platform setup
+
+- [Windows](windows.md)
+- [Termux on Android](termux.md)
+- [tmux](tmux.md)
+- [Terminal setup](terminal-setup.md)
+- [Shell aliases](shell-aliases.md)
+
+## Development
+
+- [Development](development.md) - local setup, project structure, and debugging.
+
+````

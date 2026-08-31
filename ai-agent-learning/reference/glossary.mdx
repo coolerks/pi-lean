@@ -1,0 +1,44 @@
+---
+title: "术语表"
+description: "Agent 工程中的中英文核心术语、边界和 Pi 对应位置。"
+---
+
+# 中文 Agent Glossary
+
+| English | 中文 | 准确定义 |
+| --- | --- | --- |
+| LLM | 大语言模型 | 根据输入上下文生成下一段输出的模型；它不会替你执行本地函数。 |
+| Agent | Agent | 让模型请求、工具执行、结果回传和下一轮请求形成闭环的运行时。 |
+| Harness | Agent Harness | 管理 Loop 之外的状态、持久化、恢复、并发、权限、队列、插件和可观测性的工程外壳。 |
+| Agent Loop | Agent 循环 | 一轮或多轮请求模型、执行 Tool、把 Tool Result 放回上下文的控制流程。 |
+| ReAct | Reason + Act | 交替进行推理与行动的研究范式；现代原生 Tool Calling 不一定输出字面 `Thought:`。 |
+| Tool | 工具 | Agent Runtime 暴露给模型的名称、描述和 JSON Schema，以及真正执行的代码。 |
+| Tool Call | 工具调用 | 模型生成的结构化请求，不是函数已经执行的证明。 |
+| Tool Result | 工具结果 | Runtime 执行 Tool 后生成、再提交给模型的消息。 |
+| Function Calling | 函数调用 | 厂商对结构化 Tool Call 的称呼；调用代码仍由应用执行。 |
+| Context | 上下文 | 某次模型请求实际提交的 system、messages、tools 和 provider 选项。 |
+| Context Window | 上下文窗口 | 模型一次请求能处理的 token 上限。 |
+| Context Engineering | 上下文工程 | 有意识地选择、排序、压缩和注入模型输入。 |
+| Session | 会话 | 能跨进程保存的对话、树、元数据和用量；不是当前请求的完整 Context。 |
+| Memory | 记忆 | 更宽泛的长期信息机制，可能由 Session、数据库或检索构成。 |
+| Compaction | 压缩 | 在上下文逼近上限时把旧消息整理成较短摘要，并保留继续工作所需信息。 |
+| Steering | 转向 | 运行中在下一次模型请求前注入的纠偏消息。 |
+| Follow-up | 后续消息 | Agent 原本准备停止后才消费的追加任务。 |
+| Extension / Plugin | 扩展 / 插件 | 不改核心源码而注册工具、命令、钩子或 UI 行为的模块。 |
+| Hook | 钩子 | 在特定生命周期点拦截并可能改变输入或结果的回调。 |
+| Event | 事件 | 描述已经发生的事实，原则上不负责改变执行。 |
+| Skill | 技能 | 以 metadata 和 `SKILL.md` 等资源渐进加载的可复用指令单元。 |
+| MCP | Model Context Protocol | 用 JSON-RPC 和 transport 让客户端发现、调用外部工具/资源的协议。 |
+| RAG | 检索增强生成 | 先检索外部知识，再把相关片段提供给模型生成答案。 |
+| Embedding | 向量表示 | 把文本映射到向量空间，供相似度检索使用。 |
+| Provider | Provider 适配器 | 把统一模型请求转换成某厂商 API，并把响应转换回统一流。 |
+| Model | 模型描述 | provider、model id、api、能力、上下文窗口、价格等静态/运行时元数据。 |
+| Streaming | 流式响应 | 在完整消息完成前逐片接收文本、思考或 Tool Call 增量。 |
+| SSE | Server-Sent Events | HTTP 单向事件流；常见于 LLM streaming。 |
+| JSON-RPC | JSON-RPC | 以 `jsonrpc`、`id`、`method`、`params`、`result/error` 表示请求和响应的协议格式。 |
+| Telemetry | 遥测 | 面向分析和诊断的结构化运行数据，例如 token、延迟、错误和成本。 |
+| Trace / Span | 追踪 / 跨度 | 一次运行的树状轨迹及其中一个请求、Tool 或阶段。 |
+| Sandbox | 沙箱 | 限制文件、网络、进程和资源的执行环境。 |
+| Permission | 权限 | 在 Tool 执行前决定某个动作是否允许、需要确认或被拒绝的策略。 |
+| CLI / TUI | 命令行 / 终端界面 | CLI 负责命令和进程入口；TUI 负责终端中的交互呈现。 |
+| RPC | 远程过程调用 | 应用控制面与 Agent 进程间的请求/事件传输；它不是 MCP。 |

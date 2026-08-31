@@ -1,0 +1,17 @@
+---
+title: "Java 15：Harness"
+description: "组合 Java Provider、Loop、Tools、Session、Plugin、Skill、MCP 和 Telemetry。"
+---
+
+# Java 15：Harness
+
+`Harness` 是组合根：构造 `PermissionPolicy`、`ToolRegistry`、`AgentLoop`、`Session` 和 `Telemetry`，`prompt` 恢复历史、执行并保存结果。它展示模块边界，不能把一次 demo 误称为 durable operation log。
+
+```bash
+cd ai-agent-learning/examples/java-agent
+mvn test
+mvn package
+java -jar target/agent-harness-1.0.0.jar --demo
+```
+
+要继续到生产级，需要 operation intent/result、崩溃恢复、幂等副作用和真实 sandbox，见 [成熟 Harness](/19-build-harness/architecture)。

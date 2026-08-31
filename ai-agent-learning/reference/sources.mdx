@@ -1,0 +1,47 @@
+---
+title: "权威来源与研究边界"
+description: "教材使用的 Pi 源码、协议规范、论文和官方 API 资料。"
+---
+
+# 权威来源与研究边界
+
+## 证据优先级
+
+1. 当前本地源码和测试。
+2. 当前仓库官方文档。
+3. 固定 commit 的 Git history/permalink。
+4. Provider、MCP、JSON-RPC、SSE 和 Mintlify 官方资料。
+5. 原始论文。
+6. 博客和二手文章只用于发现线索，不替代前五类证据。
+
+## Pi
+
+- [研究 commit](https://github.com/coolerks/pi-lean/tree/853a80d26c90a14c1886f0ebb8ffaae133ca2185)：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+- `packages/agent/docs/harness.v2.md` 是当前工作区的未跟踪设计稿，不属于上述 commit；译本按本地文件完整保留，并明确区分设计稿与已提交源码。
+- [Agent Loop 固定文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/agent/src/agent-loop.ts)。
+- [AI types 固定文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/ai/src/types.ts)。
+- [Coding Agent SessionManager](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/core/session-manager.ts)。
+
+## 原始资料
+
+- [ReAct](https://arxiv.org/abs/2210.03629)
+- [OpenAI Function Calling](https://platform.openai.com/docs/guides/function-calling)
+- [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
+- [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+- [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
+- [MCP specification](https://modelcontextprotocol.io/specification)
+- [MDN Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+- [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/)
+- [Mintlify docs.json](https://www.mintlify.com/docs.json)
+- [Mintlify CLI commands](https://www.mintlify.com/docs/cli/commands)
+- [Spring AI](https://spring.io/projects/spring-ai)
+- [LangChain4j](https://docs.langchain4j.dev/)
+- [LangChain](https://python.langchain.com/docs/)
+- [LangGraph](https://langchain-ai.github.io/langgraph/)
+- [Eino](https://www.cloudwego.io/docs/eino/)
+- [Google ADK](https://google.github.io/adk-docs/)
+- [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+
+## 版本提醒
+
+Provider API、MCP 草案和 Mintlify CLI 会变化。页面中的 API 例子只用于解释边界；运行前要打开当前官方规范。对于 Pi，若文档和当前源码不一致，页面明确采用当前源码并标注差异。

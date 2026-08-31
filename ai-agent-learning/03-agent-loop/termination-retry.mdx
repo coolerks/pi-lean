@@ -1,0 +1,39 @@
+---
+title: "终止、重试与取消"
+description: "让 Agent Loop 在错误、超时和用户取消时有界地结束。"
+---
+
+# 终止、重试与取消
+
+## 明确的终止条件
+
+至少覆盖：
+
+- `stop` 或没有 Tool Call：返回 final text。
+- `length`：保留截断消息；若带 Tool Call，不执行可能不完整的参数。
+- `maxSteps`/预算：生成解释性错误并停止。
+- `abort`：停止请求和工具，输出可识别的 aborted 结果。
+- fatal error：不盲目重试。
+- context overflow：压缩一次后重试；必须有上限。
+
+任何示例都必须有 `maxSteps`，否则坏模型可以永远返回 Tool Call。
+
+## 两种重试
+
+Provider 层重试一次 HTTP 请求，例如 429/5xx 和 `retry-after`；Agent 层重试一次步骤，例如没有得到可用 assistant message。两者相乘会放大延迟，所以应记录 attempt，并设置上限和可取消的 backoff。
+
+Pi 的 `retryProviderRequest` 使用 408、409、429、5xx 和 `x-should-retry`，退避等待会响应 `AbortSignal`。这说明“睡眠”也是控制边界，不应让取消等待到定时器结束。
+
+## Abort 的语义
+
+`AbortController.abort()` 发出信号，不保证杀死已在系统调用中的 Tool。Tool 要把信号传到 `fetch`、子进程或循环，并在完成时产生一致的结果。Harness 还需处理已启动但未写入结果的 Tool：选择幂等重放或合成 interrupted result。
+
+## Pi 对应位置
+
+- `packages/agent/src/agent.ts`：`runWithLifecycle` 创建 `AbortController`，`abort()` 触发它，事件 listener 完成后才结束 run。
+- `packages/agent/src/agent-loop.ts`：收到 assistant `error/aborted` 时结束；Tool 执行前后检查 signal。
+- `packages/coding-agent/src/core/agent-session.ts`：处理 auto retry、overflow recovery、compaction 和 session 事件。
+
+## 练习
+
+让 FakeModel 第一次返回可重试错误、第二次成功；让 Tool 在 `ctx.Done()` 后返回；分别断言 attempt 数、事件顺序和最终状态。不要把“捕获异常后再调用自身”当成完整重试策略。

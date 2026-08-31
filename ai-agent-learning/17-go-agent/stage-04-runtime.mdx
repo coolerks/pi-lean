@@ -1,0 +1,22 @@
+---
+title: "Go 09–14：Session、Compaction、插件、Skill 与 MCP"
+description: "把内存 Loop 接到可恢复的教学运行时。"
+---
+
+# Go 09–14：Session、Compaction、插件、Skill 与 MCP
+
+## Session 和 Compaction
+
+`Session.Save` 使用临时文件再 rename，把当前消息写成 JSONL；`LoadSession` 按行解码并在坏行报告行号。`Compact` 是确定性教学实现：保留 system/最近尾部，用 summary message 替代旧内容。它还没有 Pi v2 设计中的 operation ledger。
+
+## Steering / Follow-up
+
+`Agent.Steer` 在下一次模型请求前消费；`FollowUp` 在 Loop 没有 Tool Call 时消费；`NextRun` 不属于当前运行，Prompt 开始时才捕获。Abort 只清掉前两者。
+
+## 插件和 Skill
+
+Go 采用显式 `Plugin.Register`，避免依赖平台受限的 native `plugin`；`DiscoverSkills` 只解析 `SKILL.md` frontmatter，完整正文通过 `ReadSkill` 按需读取。
+
+## MCP
+
+`MCPClient` 用 newline-delimited JSON-RPC 发 `tools/list`/`tools/call`，`RemoteTool` 适配本地 `Tool`。示例 client 串行 request；生产实现需 response dispatcher、transport 超时、initialize/capability 协商和权限检查。

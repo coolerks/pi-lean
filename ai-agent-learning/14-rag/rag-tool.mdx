@@ -1,0 +1,43 @@
+---
+title: "把 RAG 暴露成 Tool"
+description: "设计一个带来源和权限过滤的 search_knowledge 工具。"
+---
+
+# 把 RAG 暴露成 Tool
+
+## Tool 合约
+
+```json
+{
+  "name": "search_knowledge",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {"type":"string"},
+      "topK": {"type":"integer","minimum":1,"maximum":8}
+    },
+    "required": ["query"]
+  }
+}
+```
+
+Executor 先限制 query 长度和 topK，再应用当前用户/项目的 metadata policy，返回 `source`、`score`、`snippet` 和检索时间。不要只返回拼接后的无来源长字符串。
+
+## 和自动注入比较
+
+自动注入适合每个请求都必须满足的租户知识或系统事实；Tool 适合用户意图不确定、查询代价高或需要模型决定何时查。折中做法是注入小型索引说明，详细内容走 Tool。
+
+## 一个可运行的最小 Demo
+
+示例代码 `examples/go-agent/internal/agent/rag.go` 的 `KnowledgeTool` 不依赖向量数据库：它对词项做 overlap score，先按 `Tenant` 过滤，再返回带 `source` 的 JSON snippet。这不是生产检索器，却把关键边界变成了可运行的 Tool。
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./... -run KnowledgeTool
+```
+
+把它替换成 embedding/vector store 时，Tool schema 和权限过滤仍应留在 Runtime 这一侧；只有检索实现变化。
+
+## 测试
+
+用 5 个固定文档测试 exact term、同义表达、topK、无结果、跨租户过滤、超长 snippet 和重复 query。FakeModel 第一轮请求 search，第二轮用结果回答，断言来源进入下一次 Context，并且越权文档从未返回。

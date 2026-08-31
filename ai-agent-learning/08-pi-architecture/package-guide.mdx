@@ -1,0 +1,30 @@
+---
+title: "Pi 各包导读"
+description: "为每个运行时 package 建立问题、入口、类型和流程清单。"
+---
+
+# Pi 各包导读
+
+## `pi-ai`
+
+它把 OpenAI Completions/Responses、Anthropic Messages、Google、Bedrock、Mistral 等实际 API 变成统一的 `AssistantMessageEventStream`。`Model` 是描述和能力，`Provider` 是适配器集合，`models.ts` 负责注册/查找/stream dispatch。它不执行本地 Tool。
+
+## `pi-agent-core`
+
+`Agent` 保存 `AgentState`，`agent-loop.ts` 负责多轮请求、Tool prepare/execute/finalize、事件和队列。核心不假定 TUI，也不保存 Coding Agent 的 JSONL Session；`convertToLlm` 是应用连接上下文和 Provider 的显式边界。
+
+## `pi-coding-agent`
+
+`AgentSession` 是编排层：它把 Agent、SessionManager、SettingsManager、ResourceLoader、ModelRuntime、ExtensionRunner 和 compaction 接起来。`core/tools` 提供 read/write/edit/bash 等工具；`modes` 提供 print、interactive、json、rpc。
+
+## `pi-client`/`pi-server`/`pi-protocol`
+
+它们把“控制一个远程 session”和“在本进程跑 Loop”分开。协议层负责 schema/framing，server 管理连接和 session，client 提供调用 facade。RPC 和 MCP 都可能传 JSON，但目的不同：前者控制 Agent，后者发现/调用外部能力。
+
+## `pi-tui`/`pi-telemetry`
+
+TUI 只负责终端组件、编辑器、Markdown 和布局；Telemetry 保存跨应用的 tracing/属性契约。把展示和观测从 Loop 拆开，便于 print/RPC 和测试复用同一核心。
+
+## 练习
+
+对一次 prompt 画包级调用链：`coding-agent -> agent -> ai`；再标出 Session、TUI 和 Telemetry 的旁路。每条箭头都用一个 import 或 package dependency 证明。

@@ -1,0 +1,22 @@
+---
+title: "Go 05–08：Coding Tools、并行、重试与事件"
+description: "把 Tool Loop 变成可用的本地 Coding Agent。"
+---
+
+# Go 05–08：Coding Tools、并行、重试与事件
+
+## Coding Tools
+
+`builtin_tools.go` 实现 `read`、`write`、`edit`、`grep`、`shell` 和 `calculator`。`PermissionPolicy` 先把路径限制在 workspace，shell 拒绝明显危险模式；输出有上限。它是教学保护，不是 OS 沙箱。
+
+## 并行
+
+`LoopOptions.ToolMode` 为 `Parallel` 时用 goroutine 并行执行多个 Tool，结果按 assistant 的 source index 写回 `results` 切片；因此执行完成顺序可以不同，而给模型的消息顺序稳定。写入同一文件的 Tool 应设置 Sequential 或由更高层依赖分析控制。
+
+## 事件
+
+`EventSink` 观察 `step_start`、`model_attempt`、`assistant`、`tool_start/end`、`tool_result` 和 `run_end`。事件不应成为第二个状态机；Session/Telemetry 可以订阅它，但不应偷偷改变消息。
+
+## 重试和取消
+
+`RetryPolicy` 对模型请求做有界的指数 delay；timer 选择 `ctx.Done()`，所以退避也能取消。`Agent.Abort` 调用内部 cancel 并清理当前 run 的 steering/follow-up，`nextRun` 保留。

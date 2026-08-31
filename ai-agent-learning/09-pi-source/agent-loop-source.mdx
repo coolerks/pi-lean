@@ -1,0 +1,39 @@
+---
+title: "精读 agent-loop.ts"
+description: "从 runAgentLoop 到 Tool Result 的实际控制流。"
+---
+
+# 精读 `agent-loop.ts`
+
+**源码**：`packages/agent/src/agent-loop.ts`；**symbol**：`runAgentLoop`、`runLoop`、`streamAssistantResponse`、`executeToolCalls`；**commit**：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+## 调用者和被调用者
+
+`Agent.runPromptMessages` 调用 `runAgentLoop`；它调用 `streamAssistantResponse`；后者调用配置中的 `transformContext`、`convertToLlm` 和 `streamFunction`。当 assistant content 有 `toolCall`，`executeToolCalls` 调用 `prepareToolCall`、`executePreparedToolCall`、`finalizeExecutedToolCall`，然后回到 `runLoop`。
+
+## 两层循环
+
+```text
+outer loop:
+  inner loop: tool calls 或 steering 尚未耗尽
+    可选 prepareNextTurn
+    注入 steering
+    stream assistant
+    execute tool calls
+    emit turn_end
+  drain follow-up
+```
+
+`error`/`aborted` 直接发 `turn_end` 与 `agent_end`。没有 Tool Call 时先检查 follow-up；有 Tool Call 时除非整个 batch 的结果都 `terminate`，否则下一轮让模型看到结果。
+
+## 一个容易忽略的安全点
+
+当 stop reason 是 `length` 且消息含 Tool Call，Pi 不执行这些可能被截断的参数，而是为每个 call 创建错误 Tool Result。参数即使“勉强能解析”，也不代表它完整。
+
+## 事件顺序
+
+`agent_start -> turn_start -> message_start/update/end -> tool_execution_start/update/end -> tool result message_start/end -> turn_end -> agent_end`。Agent 类在 `processEvents` 中先更新 runtime state，再等待 listeners，因此 UI 的 `agent_end` listener 完成才算真正 idle。
+
+## 调试实验
+
+用 `packages/agent/test/agent-loop.test.ts` 的 faux stream 思路记录 `convertToLlm` 输入、Provider events 和 Tool executor；不要调用真实 provider。测试 parallel mode 时同时检查 execution completion order 和 result message source order。

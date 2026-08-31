@@ -1,0 +1,12 @@
+---
+title: "Java 07：Retry 与 Cancellation"
+description: "把 retry、Future interruption 和 Token 检查连到每一层。"
+---
+
+# Java 07：Retry 与 Cancellation
+
+`CancellationToken` 是跨 Model/Tool 的显式信号；线程 interruption 是执行器层信号，二者都要检查。`AgentLoop` 对 Provider 做有限 attempts 和可取消 delay；`Future.cancel(true)` 不能保证远端请求已经停止。
+
+## 实验
+
+ScriptedModel 先失败再成功，断言 attempts；在延迟模型中调用 `Agent.abort()`，断言抛出 `CancellationException` 且没有隐藏的下一轮。

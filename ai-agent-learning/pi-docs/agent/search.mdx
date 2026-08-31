@@ -1,0 +1,352 @@
+---
+title: "Session Search"
+description: "Session 搜索 API、异步迭代和索引后端。"
+---
+
+# Session Search
+
+> 本页是 `packages/agent/docs/search.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+Session 搜索 API、异步迭代和索引后端。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+### 公共接口与稳定身份
+
+Session Search 面向的是已经提交的 session entry。公共结果 `SessionSearchHit` 只包含 `sessionId` 和 `entryId`：前者定位所属 session，后者定位 session 内的 entry。它故意不把 snippet、时间、分数、metadata 或 offset 放进基础接口，因为 JSONL、内存、SQLite FTS 和远程索引无法保证这些字段具有相同含义。具体后端可以通过泛型 hit 扩展它们。
+
+调用 `search(text, options?)` 返回 `AsyncIterable<T>`。`entryTypes` 用 canonical entry type 过滤；`limit` 是最多返回多少条，后端可以少返回但不能超过它；`signal` 允许调用方取消。搜索 API 不负责 debounce：搜索框的调用者应在新 query 到来时 abort 旧请求。
+
+### 为什么返回异步迭代器
+
+`AsyncIterable` 让 UI 在第一批结果到达时就渲染，而不是等完整数组；调用方也可以在足够结果后停止 `for await`。示例中的 `AbortController` 每次 query 先取消旧 controller，再把新 `signal` 传给 search。若后端以 `AbortError` 结束，UI 将它当作正常的“用户已输入新 query”，其他错误才继续抛出。
+
+### 扫描实现
+
+扫描器把可读 session 适配为 `SessionSearchCandidate`。candidate 包含 entry id、序号、时间、用于匹配的 text 和可选 fields；匹配后公开的 `ScanningSessionSearchHit` 增加 timestamp 和 snippet。已经打开的 session/storage 可以直接扫描；JSONL 则先用只读的 metadata/list/load helper 发现并加载，再交给同一个 scanner。
+
+不要在 Harness 已持有的 session 上调用可能获取 writer lease 的 `SessionRepo.open()`。搜索是读路径，应使用只读加载；否则一个看似无害的搜索可能和正在运行的写操作争抢租约。扫描源也不能产出重复的 `sessionId`，因为基础 hit 的组合身份是 `(sessionId, entryId)`。
+
+### SQLite FTS
+
+SQLite 后端返回 metadata、timestamp 和 score。第一次执行非空查询时，FTS 表和 triggers 可以惰性创建；首次创建会从 canonical `entries` 做一次 rebuild，之后由 trigger 跟随 insert、delete 和 payload update。因此 commit 后搜索保持新鲜，但 FTS trigger 失败也可能使 canonical SQLite 写入回滚。`entryTypes` 和 `limit` 仍通过公共 options 传入。
+
+### 外部索引与一致性
+
+Elasticsearch 示例不是核心内建的存储，而是应用侧 glue。应用把每个 entry 投影成包含 session/entry identity、seq、timestamp、cwd、text 和 metadata 的文档，通过 upsert/delete feed 维护索引，`flush` 后再提供 query。索引是 derived state：可以重试、重建或标记 stale，不能把它当作 canonical session。
+
+索引 writer 需要处理 update/delete、bulk 失败和 refresh；查询结果仍须检查 `_source`、limit 和 cancellation。若系统需要显式维护索引，可以由 canonical write site 发出 no-op-by-default sink 事件；类似 telemetry 关闭时的 no-op，不应让“搜索未启用”改变主写入路径。
+
+**实验**：先用两个内存 session 验证同一 query 的逐条输出，再切换 `limit=1` 和已取消 signal；随后模拟一个重复 session id、损坏 JSONL 和 SQLite trigger 失败。观察哪些是搜索错误、哪些是 canonical storage 错误，以及为什么重建索引不会修复错误的 session identity。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Session Search | Session Search |
+| Core API | 核心 API |
+| Why async iterable | Why async iterable |
+| Default implementations | 默认实现 |
+| Scanning search | Scanning search |
+| SQLite FTS | SQLite FTS |
+| Indexed backends | 索引后端 |
+| JSONL sessions with Elasticsearch | JSONL sessions with Elasticsearch |
+| Correctness and failure boundaries | 正确性与失败边界 |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/agent/docs/search.md)
+
+````markdown
+# Session Search
+
+Pi search is a small query interface over committed session entries. The shared contract returns only stable hit identity; implementations may extend hits with backend-specific display data.
+
+## Core API
+
+```ts
+export interface SessionSearchHit {
+  /** Logical identifier of the session that owns the entry. */
+  readonly sessionId: string;
+
+  /** Logical identifier of the entry within that session. */
+  readonly entryId: string;
+}
+
+export interface SessionSearchOptions {
+  /** Restrict results to specific canonical entry types. */
+  readonly entryTypes?: readonly Entry["type"][];
+
+  /** Maximum number of hits to return. Backends may return fewer, not more. */
+  readonly limit?: number;
+
+  /** Abort signal for cancellation, e.g. search-as-you-type. */
+  readonly signal?: AbortSignal;
+}
+
+export interface SessionSearch<T extends SessionSearchHit = SessionSearchHit> {
+  search(text: string, options?: SessionSearchOptions): AsyncIterable<T>;
+}
+```
+
+The base hit is intentionally minimal: `(sessionId, entryId)` is the portable identity across JSONL, memory, SQLite FTS, and remote indexes. Snippets, timestamps, scores, metadata, offsets, and ranking semantics belong to concrete implementations.
+
+## Why async iterable
+
+`AsyncIterable` lets consumers render early results, stop iteration when they have enough, and cancel in-flight work with `AbortSignal`. Debouncing remains a UI/caller concern; the API only provides the cancellation primitive.
+
+```ts
+let currentAbortController: AbortController | undefined;
+
+async function updateResults(query: string) {
+  currentAbortController?.abort();
+  const controller = new AbortController();
+  currentAbortController = controller;
+
+  try {
+    for await (const hit of search.search(query, { limit: 10, signal: controller.signal })) {
+      render(hit);
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+  }
+}
+```
+
+## Default implementations
+
+### Scanning search
+
+The reusable scanner adapts session-like readables (`getMetadata`, `findEntries`, and `getLabel`) into projected entries:
+
+```ts
+export interface SessionSearchCandidate {
+  readonly entryId: string;
+  readonly seq: number;
+  readonly type: Entry["type"];
+  readonly timestamp: number;
+  readonly text: string;
+  readonly fields?: Record<string, unknown>;
+}
+
+export interface ScanningSessionSearchHit extends SessionSearchHit {
+  readonly timestamp: number;
+  readonly snippet: string;
+}
+```
+
+`SessionSearchCandidate` is pre-match scanner input: it contains searchable text, type, sequence, and optional projected fields. The scanner turns matching candidates into public hits.
+
+Already-open sessions or storages can be scanned directly:
+
+```ts
+const search = createScanningSessionSearch(sessions);
+
+for await (const hit of search.search("authentication", { limit: 10 })) {
+  const session = sessionsById.get(hit.sessionId)!;
+  const entry = await session.getEntry(hit.entryId);
+  console.log(entry);
+}
+```
+
+JSONL does not need a separate public search adapter. JSONL-backed code can keep discovery/loading local, then pass the loaded storages to the same scanner:
+
+```ts
+async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, query: JsonlSessionListOptions = {}) {
+  for (const metadata of await listJsonlSessionMetadata(jsonl, query)) {
+    yield loadJsonlSessionStorage(jsonl, metadata);
+  }
+}
+
+const search = createScanningSessionSearch((query) => jsonlReadables(jsonl, query));
+```
+
+A scanning source must not call `SessionRepo.open()` on a harness-owned session if that operation may claim a writer lease. JSONL should use read-only loading helpers; already-open sessions/storages can be scanned directly.
+
+### SQLite FTS
+
+SQLite search exposes an extended hit:
+
+```ts
+export interface SqliteSessionSearchHit extends SessionSearchHit {
+  readonly metadata: SqliteSessionMetadata;
+  readonly timestamp: number;
+  readonly score: number;
+}
+```
+
+```ts
+const search = createSqliteSessionSearch({ env, sqlite, databasePath });
+
+for await (const hit of search.search("auth", {
+  entryTypes: ["message", "compaction"],
+  limit: 20,
+})) {
+  console.log(hit.sessionId, hit.entryId, hit.score);
+}
+```
+
+The FTS table and triggers are created lazily on first non-blank search. When FTS is first created, SQLite performs a one-time rebuild from canonical `entries`; after that, SQLite triggers keep FTS in sync with canonical entry inserts, deletes, and payload updates. This makes SQLite search fresh after commit, but it also means FTS trigger failures can roll back canonical SQLite writes while search is enabled for that database.
+
+## Indexed backends
+
+Search indexing is backend-owned derived state. The shared package only exports the query API; applications or backend packages may define their own writer/feed contracts when they need explicit index maintenance.
+
+### JSONL sessions with Elasticsearch
+
+This is application-owned glue. Core provides the query contract and JSONL session discovery; the Elastic writer contract is local to this adapter.
+
+```ts
+import { Client } from "@elastic/elasticsearch";
+import {
+  scanningEntries,
+  type JsonlSessionMetadata,
+  type JsonlSessionRepoOptions,
+  type SessionSearch,
+  type SessionSearchHit,
+  type SessionSearchOptions,
+} from "@earendil-works/pi-agent-core";
+
+// JSONL-backed code can provide this locally from existing JSONL list/load helpers.
+async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, options: { cwd?: string } = {}) {
+  for (const metadata of await listJsonlSessionMetadata(jsonl, options)) {
+    yield loadJsonlSessionStorage(jsonl, metadata);
+  }
+}
+
+interface SearchIndexWriter<TItem> {
+  apply(items: TItem[]): Promise<void>;
+  flush?(): Promise<void>;
+}
+
+interface IndexedSessionSearch<T extends SessionSearchHit, TItem>
+  extends SessionSearch<T>, SearchIndexWriter<TItem> {}
+
+type ElasticSessionFeedItem =
+  | { type: "upsert"; id: string; body: ElasticSessionDoc }
+  | { type: "delete"; id: string };
+
+interface ElasticSessionDoc {
+  sessionId: string;
+  entryId: string;
+  seq: number;
+  timestamp: number;
+  cwd: string;
+  text: string;
+  metadata: JsonlSessionMetadata;
+  fields?: Record<string, unknown>;
+}
+
+interface ElasticSessionSearchHit extends SessionSearchHit {
+  readonly timestamp: number;
+  readonly snippet: string;
+  readonly score?: number;
+}
+
+class ElasticSessionSearch
+  implements IndexedSessionSearch<ElasticSessionSearchHit, ElasticSessionFeedItem>
+{
+  constructor(
+    private readonly client: Client,
+    private readonly index: string,
+  ) {}
+
+  async apply(items: ElasticSessionFeedItem[]): Promise<void> {
+    const operations = items.flatMap((item) => {
+      if (item.type === "delete") {
+        return [{ delete: { _index: this.index, _id: item.id } }];
+      }
+      return [{ index: { _index: this.index, _id: item.id } }, item.body];
+    });
+
+    if (operations.length > 0) await this.client.bulk({ operations });
+  }
+
+  async flush(): Promise<void> {
+    await this.client.indices.refresh({ index: this.index });
+  }
+
+  async *search(
+    text: string,
+    options: SessionSearchOptions = {},
+  ): AsyncIterable<ElasticSessionSearchHit> {
+    const result = await this.client.search<ElasticSessionDoc>({
+      index: this.index,
+      size: options.limit ?? 20,
+      query: {
+        bool: {
+          must: [{ match: { text } }],
+        },
+      },
+    });
+
+    for (const hit of result.hits.hits) {
+      if (!hit._source) continue;
+      if (options.signal?.aborted) throw options.signal.reason;
+      yield {
+        sessionId: hit._source.sessionId,
+        entryId: hit._source.entryId,
+        timestamp: hit._source.timestamp,
+        snippet: hit._source.text,
+        score: hit._score ?? undefined,
+      };
+    }
+  }
+}
+```
+
+A catch-up/rebuild job can feed JSONL projections into Elasticsearch without taking a writer lease:
+
+```ts
+async function indexJsonlSessionsIntoElastic(
+  jsonl: JsonlSessionRepoOptions,
+  elastic: ElasticSessionSearch,
+  options: { cwd?: string } = {},
+): Promise<void> {
+  for await (const session of jsonlReadables(jsonl, { cwd: options.cwd })) {
+    const metadata = await session.getMetadata();
+    for await (const candidate of scanningEntries(session)) {
+      await elastic.apply([{
+        type: "upsert",
+        id: `${metadata.id}:${candidate.entryId}`,
+        body: {
+          sessionId: metadata.id,
+          entryId: candidate.entryId,
+          seq: candidate.seq,
+          timestamp: candidate.timestamp,
+          cwd: metadata.cwd,
+          text: candidate.text,
+          metadata,
+          fields: candidate.fields,
+        },
+      }]);
+    }
+  }
+
+  await elastic.flush();
+}
+```
+
+## Correctness and failure boundaries
+
+Search indexes are derived state for the shared API: applications can retry, rebuild, or mark search stale. Backend-specific choices may make different tradeoffs; SQLite FTS uses co-located triggers, so FTS failures can roll back canonical SQLite writes after search has initialized the triggers.
+
+Scanning sources should fail fast if they yield duplicate `sessionId` values, because base hit identity is `(sessionId, entryId)`. Indexed backends usually enforce uniqueness in their storage/index layer.
+
+Search opt-in still needs a sync/indexing layer. A follow-up should add a no-op-by-default search index sink (for example `NOOP_SEARCH_INDEX_SINK`) so canonical write sites can emit indexing events unconditionally, similar to how telemetry uses no-op implementations when telemetry is disabled.
+
+````

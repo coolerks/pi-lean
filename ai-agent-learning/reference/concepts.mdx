@@ -1,0 +1,36 @@
+---
+title: "概念辨析"
+description: "用同一个请求区分 Agent 工程中经常混淆的概念。"
+---
+
+# 概念辨析
+
+先记住一个具体事实：用户说“读取配置并修复错误”时，模型只能生成文本或结构化 `tool_call`；真正打开文件的是 Runtime，真正决定是否允许打开的是权限层。
+
+| 容易混淆 | 区别 | 例子 |
+| --- | --- | --- |
+| LLM / Agent | LLM 生成输出；Agent 负责循环和外部动作。 | `streamSimple` 是模型层，`runAgentLoop` 是 Agent 层。 |
+| Agent / Harness | Loop 决定下一轮；Harness 还负责 Session、恢复、队列、权限和遥测。 | Pi `Agent` 可运行；`AgentHarness` scaffold 目前多数操作未实现。 |
+| Agent Loop / ReAct | Loop 是工程控制流；ReAct 是交替推理与行动的研究范式。 | 原生 Tool Calling 不要求输出 `Thought:`。 |
+| Tool / MCP Tool | Tool 是本地 Runtime 接口；MCP Tool 先经 JSON-RPC/transport，再适配成 Tool。 | 本地 `read` 与远端 `tools/call`。 |
+| Tool / Skill | Tool 是可执行函数；Skill 是帮助模型知道如何完成任务的资源。 | `grep` 执行搜索；Skill 指示排查流程。 |
+| Skill / Extension | Skill 主要提供渐进式指令/资源；Extension 可以注册代码、事件和 UI。 | `SKILL.md` vs `ExtensionRunner`。 |
+| Extension / MCP | Extension 是宿主扩展机制；MCP 是跨进程协议。 | Extension 可以实现一个 MCP client，但二者不是同义词。 |
+| System Prompt / Context | System Prompt 是 context 的一部分；Context 还包括 messages、tools 和请求选项。 | `buildSystemPrompt` 只负责文本组装。 |
+| Memory / Session | Session 是具体持久化结构；Memory 是用途更广的长期信息概念。 | JSONL session 可以是 memory 的一种来源。 |
+| Session / Context | Session 跨进程保存；Context 是本轮实际送给 provider 的投影。 | Compaction 会改变投影，不必删除全部历史。 |
+| RAG / Memory | RAG 是检索路径；Memory 是信息保存与复用目标。 | 向量库检索可以成为 memory 子系统。 |
+| RAG / Tool | RAG 是方案；`search_knowledge` 是让模型主动查询的 Tool。 | 也可由 Harness 自动注入结果。 |
+| Hook / Event | Hook 可以改输入/结果；Event 描述发生过的事实。 | `beforeToolCall` vs `tool_execution_end`。 |
+| Tool Call / Function Execution | 前者是模型输出，后者是 Runtime 副作用。 | 不验证 arguments 就执行是安全漏洞。 |
+| Provider / Model | Provider 处理协议；Model 描述某个模型及能力。 | `openai-responses` 是 API，`gpt-*` 是 model id。 |
+| Streaming / Agent Event | Streaming 是 provider 的增量协议；Agent Event 是 Runtime 的生命周期事件。 | 一个 `text_delta` 可触发一个 `message_update`。 |
+| Compaction / RAG | Compaction 减少历史体积；RAG 从外部索引补知识。 | 压缩不会自动恢复被省略的源码细节。 |
+| Steering / Follow-up | Steering 在当前工作尚未结束时纠偏；Follow-up 等 Loop 将停时追加。 | “不要改数据库”应优先 steering。 |
+| Abort / Steering | Abort 请求停止并处理未完成副作用；Steering 要求继续但改变方向。 | `AbortSignal` 不是用户消息队列。 |
+| CLI / TUI | CLI 是入口/参数；TUI 是交互渲染。 | Pi 的 print、RPC 和 interactive 是不同运行模式。 |
+| RPC / MCP | RPC 控制 Agent 服务；MCP 规范外部工具/资源的交互。 | 二者都可能用 JSON，但生命周期和语义不同。 |
+
+## 核心问题
+
+阅读后应能把一次请求拆成：模型输出（LLM）、决策循环（Agent）、可靠性和边界（Harness）、协议适配（Provider）、执行能力（Tool）、外部知识（RAG/MCP）、呈现（CLI/TUI）。

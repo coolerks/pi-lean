@@ -1,0 +1,17 @@
+---
+title: "Go 15：Harness"
+description: "把 Provider、Loop、工具、Session、Compaction、插件、Skill、MCP 和 Telemetry 组合起来。"
+---
+
+# Go 15：Harness
+
+`Harness` 是装配根：建立 PermissionPolicy 和 Registry，加载工具/插件，恢复 Session，运行 Agent，保存成功前缀并记录事件。它解决的是跨组件生命周期，而不只是多写一个 `while`。
+
+```bash
+cd ai-agent-learning/examples/go-agent
+go test ./...
+go vet ./...
+go run ./cmd/agent --demo
+```
+
+当前示例是可测试教学 Harness；生产 durable 版本仍需 operation intent/result、崩溃恢复、幂等副作用和真正 sandbox，见 [成熟 Harness](/19-build-harness/architecture)。

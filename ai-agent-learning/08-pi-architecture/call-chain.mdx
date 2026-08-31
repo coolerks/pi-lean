@@ -1,0 +1,52 @@
+---
+title: "一次请求的完整调用链"
+description: "从 CLI 输入追到 Provider、Tool、Session 和 UI。"
+---
+
+# 一次请求的完整调用链
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant UI as CLI/TUI/RPC
+    participant S as AgentSession
+    participant A as Agent
+    participant L as agent-loop
+    participant P as pi-ai Provider
+    participant T as Tool
+    participant SM as SessionManager
+    U->>UI: 输入 prompt
+    UI->>S: prompt(options)
+    S->>S: expand template / skill / buildSystemPrompt
+    S->>A: agent.prompt
+    A->>L: runAgentLoop
+    L->>L: transformContext + convertToLlm
+    L->>P: streamSimple(model, context)
+    P-->>L: AssistantMessageEventStream
+    L-->>A: AgentEvent
+    L->>T: validate + execute
+    T-->>L: ToolResult
+    L->>P: assistant + toolResult
+    P-->>L: final assistant
+    L-->>S: agent_end
+    S->>SM: append message / usage / compaction
+    S-->>UI: event / transcript update
+```
+
+## 谁负责什么
+
+| 问题 | 当前入口 |
+| --- | --- |
+| 创建 session | coding-agent CLI/session manager 组合 |
+| 构建 system prompt | `buildSystemPrompt` + `AgentSession` |
+| 调用模型 | `Agent` 的 stream function，经 `pi-ai` dispatch |
+| 读取 streaming | `streamAssistantResponse` 消费 async stream |
+| 发现 Tool Call | assistant content 中的 `type: "toolCall"` |
+| 执行 Tool | `executeToolCalls`，工具实现来自 registry |
+| 放回 Tool Result | `createToolResultMessage` 后 append context |
+| 决定下一轮 | `runLoop` 的 tool/steering/follow-up 分支 |
+| 记录 Session | `AgentSession._handleAgentEvent` + `SessionManager` |
+| 发 Event | Agent listener、AgentSession event、ExtensionRunner |
+| 更新 UI | interactive mode 订阅 session/agent 事件 |
+
+源码事实和 durable `harness.v2.md` 的设计不要混写：当前请求链可运行，但新 Harness scaffold 不承担完整恢复。

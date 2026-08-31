@@ -1,0 +1,12 @@
+---
+title: "Go 10：Compaction"
+description: "在 context window 受限时保留前缀和最近消息。"
+---
+
+# Go 10：Compaction
+
+`Compact` 用近似字符/token 比例触发，把 system 前缀、摘要和 recent tail 组成新 history。它不是 tokenizer，也不是完整语义摘要；真实 Harness 还要保护 Tool Call/Result 配对、关键事实和 compaction entry。
+
+## 实验
+
+改变 `maxTokens`，观察何时触发；加入 tool call/result，检查不会留下孤立 result。把摘要输入模型后，比较压缩前后的可执行事实。

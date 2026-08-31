@@ -1,0 +1,32 @@
+---
+title: "Provider Adapter 与 Model"
+description: "理解统一 Model/Message/Stream 如何隔离厂商 API。"
+---
+
+# Provider Adapter 与 Model
+
+## 为什么不能让 Loop 依赖厂商 SDK
+
+如果 Loop 直接接收 OpenAI 的 response item，切换到 Anthropic 就会把 provider 分支散落在状态机、Tool、UI 和 Session 中。Adapter 把变化收在边界：Loop 只知道 `Context`、统一 `AssistantMessageEventStream`、`ToolCall` 和 `Usage`。
+
+## Pi 的三层
+
+| 层 | Pi 位置 | 责任 |
+| --- | --- | --- |
+| Model | `packages/ai/src/types.ts` 的 `Model` | 描述 `provider`、`id`、`api`、能力、窗口和成本。 |
+| Provider | `packages/ai/src/models.ts` 的 `Provider`/`Models` | 注册模型、选择 API stream 函数、处理 auth 和能力。 |
+| API adapter | `packages/ai/src/api/*.ts` | 拼 payload、转换消息、解析 stream、归一化 stop reason/usage。 |
+
+`packages/ai/src/providers/all.ts` 用 `builtinProviders()` 集中登记当前构建的 provider。当前列表包括 OpenAI、Anthropic、Google、Bedrock、Mistral、OpenRouter、xAI、DeepSeek 等多个适配器；不要把这份目录当成“每个都可用”，认证和模型目录仍由运行环境决定。
+
+## 三种常见 API
+
+- Chat Completions：消息数组和 `choices[].message`，工具结果多以 role 表示。
+- Responses：output item 可以是 message、function call、function output；流事件更细。
+- Anthropic Messages：`system` 单独传递，content block 表示文本、thinking、tool use/result。
+
+它们的语义相同部分是“模型请求 + 结构化工具 + 结果回传”，字段和流事件不同。教材示例固定自己的内部 DTO，不复制任何厂商 SDK 类型。
+
+## 重试边界
+
+`packages/ai/src/utils/provider-retry.ts` 的 `retryProviderRequest` 对 408、409、429、5xx 和显式 `x-should-retry` 做判断，支持 `retry-after` 与可中断退避。重试应发生在一次请求内部；Agent 层还要决定是否重做整个步骤，二者不能混为一个无限循环。

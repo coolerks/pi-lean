@@ -1,0 +1,12 @@
+---
+title: "Java 12：Plugin 与 SPI"
+description: "用 ServiceLoader、SPI 和生命周期装载可替换能力。"
+---
+
+# Java 12：Plugin 与 SPI
+
+`AgentPlugin` 提供 `register`/`close`；`PluginManager` 可显式加载，也可用 `ServiceLoader` 发现 `META-INF/services`。这对应 Pi Extension loader，但 Java 版本不执行动态 TypeScript 模块。
+
+## 实验
+
+注册一个 Tool plugin，测试重复名称、加载异常、关闭顺序和 classpath 缺 provider 的行为。

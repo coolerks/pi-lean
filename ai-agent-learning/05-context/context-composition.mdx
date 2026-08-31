@@ -1,0 +1,65 @@
+---
+title: "Context 是怎么组装的"
+description: "跟踪 System Prompt、项目指令、Skills、Tools 和 Session 消息进入模型的路径。"
+---
+
+# Context 是怎么组装的
+
+## 一次真实投影
+
+```text
+Provider request
+├── system: buildSystemPrompt(cwd, tools, guidelines, project files, skills)
+├── messages: Session path -> AgentMessage[] -> convertToLlm()
+├── tools: active tool definitions
+└── options: model, reasoning, maxTokens, cache, signal
+```
+
+System Prompt、消息历史、工具定义和请求选项都可能影响模型，但它们在 API 中不一定是同一个字段。Session 保存的 custom/UI 消息也不一定能直接发给 Provider。
+
+## Pi 的源码路径
+
+- `packages/coding-agent/src/core/resource-loader.ts`：按资源 scope 加载 `AGENTS.override.md`、`AGENTS.md`、`CLAUDE.md`，以及 extensions、skills、prompt templates；它还要处理项目可信度和去重。
+- `packages/coding-agent/src/core/system-prompt.ts`：`buildSystemPrompt` 组合工具列表、guidelines、项目 context、Skills、cwd、平台和运行模式。System Prompt 不是整个 Context。
+- `packages/coding-agent/src/core/skills.ts`：`formatSkillsForPrompt` 只把 Skill metadata 放入 prompt，完整内容通过资源读取按需展开。
+- `packages/coding-agent/src/core/agent-session.ts`：在 prompt 前解析模板/Skill，选择 active tools 和 model，并把 runtime 设置传给 Agent。
+- `packages/agent/src/agent-loop.ts`：每次 request 前运行 `transformContext`，再运行 `convertToLlm`，构造 `@earendil-works/pi-ai` 的 `Context`。
+- `packages/coding-agent/src/core/agent-session.ts`：刷新当前 model/tools/system prompt，并在 turn 间检查 compaction。
+
+## 一个结构真实的例子
+
+```text
+systemPrompt:
+  coding-agent base rules
+  + AGENTS.md
+  + available skill metadata
+  + read/bash/edit/write descriptions
+  + cwd
+messages:
+  user: “修复 parser”
+  assistant: toolCall(read, parser.ts)
+  toolResult: parser.ts excerpt
+tools:
+  read, bash, edit, write
+```
+
+模型这次没有看到未加载的 `SKILL.md` 全文，也没有看到被 `convertToLlm` 过滤的 UI notification。
+
+## 区分四种输入
+
+| 输入 | API 位置 | 例子 | 谁决定 |
+| --- | --- | --- | --- |
+| 模型参数 | Provider/model option | temperature、thinking、maxTokens | Model/Provider |
+| System Prompt | `Context.systemPrompt` 或等价字段 | 工作规则、项目指令 | Harness |
+| Message history | `Context.messages` | user、assistant、toolResult | Session + Harness |
+| Tool definitions | `Context.tools` | name、description、JSON Schema | Tool registry |
+
+Tool Result 是 history 中的一类消息，但它不是 Tool Definition；`AGENTS.md` 是资源来源，加载之后才可能影响 System Prompt。
+
+## 核心问题
+
+模型这一次到底看到了什么？不要猜，要打印最终的 `systemPrompt`、转换后的 messages、tools 和选项；“Session 中存在”不等于“请求中存在”。
+
+**观察实验**：在 faux provider 的调用点打印四类输入，依次新建 `AGENTS.md`、启用一个 Skill、关闭一个 Tool，再比较 request diff。
+
+**思考题**：若 project instruction 和 user message 冲突，应该在哪一层记录冲突？为什么不能靠把所有文本拼成一条 user message 解决？

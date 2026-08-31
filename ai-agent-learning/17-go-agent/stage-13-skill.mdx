@@ -1,0 +1,12 @@
+---
+title: "Go 13：Skill Discovery"
+description: "只在启动时暴露 metadata，按需读取 SKILL.md。"
+---
+
+# Go 13：Skill Discovery
+
+`DiscoverSkills` 扫描目录并解析 `name`、`description`、`path`；系统提示只放短 metadata，模型需要时再由 read/资源工具获取完整内容。这是 progressive disclosure，能避免 50 个 Skill 全文占满 context。
+
+## 实验
+
+加入缺 name、重复 name、路径越界和带脚本 Skill，定义拒绝或告警策略；不要因为 Skill 是文本就默认可信。

@@ -1,0 +1,12 @@
+---
+title: "Go 12：Plugin Registry"
+description: "用 interface、显式注册和 Close 生命周期实现插件。"
+---
+
+# Go 12：Plugin Registry
+
+Go 版不强行复刻 Node 动态 import，而使用 `Plugin.Register(*Registry)` 和 `Plugin.Close()`。调用方显式装配依赖，易测试、易交叉编译；代价是没有自动发现。
+
+## 实验
+
+实现一个注册 `count` Tool 的插件，测试重复名称、注册失败和关闭顺序；需要自动发现时再设计约定目录或独立进程协议。

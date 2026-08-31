@@ -1,0 +1,12 @@
+---
+title: "Go 14：MCP"
+description: "通过 newline JSON-RPC 把外部 Tool 适配进 Registry。"
+---
+
+# Go 14：MCP
+
+`McpClient` 处理 `tools/list`、`tools/call` 和 request id；返回的远端定义映射为本地 `Tool`，执行时再写回 JSON-RPC。Pi Core 当前不是默认内建 MCP；这里用最小 client 讲协议边界。
+
+## 实验
+
+模拟 calculator server，测试乱序 id、error response、断线、超时和恶意 schema。生产 client 还要 initialize、传输认证、并发 dispatcher、权限和重连策略。

@@ -1,0 +1,24 @@
+---
+title: "精读 SessionManager 与 AgentSession"
+description: "理解消息持久化、树投影、事件订阅和自动压缩的连接。"
+---
+
+# 精读 SessionManager 与 AgentSession
+
+**文件**：`packages/coding-agent/src/core/session-manager.ts`、`agent-session.ts`；**symbol**：`SessionManager`、`buildContextEntries`、`sessionEntryToContextMessages`、`AgentSession._handleAgentEvent`；**commit**：`853a80d26c90a14c1886f0ebb8ffaae133ca2185`。
+
+## 两个职责
+
+`SessionManager` 负责 header、entry、parentId、leaf 和 JSONL 读写；`AgentSession` 负责把 Agent 事件映射为保存、compaction、retry、Extension 事件和 UI 状态。Session entry 不等于每个 entry 都要发给模型。
+
+## 消息如何落盘
+
+`_handleAgentEvent` 在 `message_end` 看到 user/assistant/toolResult 时追加 `SessionMessageEntry`；custom message 用 custom entry；compaction/branch summary 走专门路径。这样 event lifecycle 是保存的触发点，而不是 TUI 自己抄一份 transcript。
+
+## Context 投影
+
+`buildContextEntries` 沿当前 leaf 构建路径，`sessionEntryToContextMessages` 将可投影 entry 转成 AgentMessage，之后 Agent Loop 再经 `convertToLlm`。这两层过滤避免 label、session info 或 UI-only 数据污染 Provider。
+
+## 恢复注意
+
+当前 Session v3 JSONL 与 `harness.v2.md` 设想的 operation log 不同。不要把 `CURRENT_SESSION_VERSION = 3` 写成 durable Harness 已经具备 operation recovery 的证据。

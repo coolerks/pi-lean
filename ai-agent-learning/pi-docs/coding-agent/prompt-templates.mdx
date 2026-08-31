@@ -1,0 +1,166 @@
+---
+title: "Prompt Templates"
+description: "模板位置、格式、参数提示和加载规则。"
+---
+
+# Prompt Templates
+
+> 本页是 `packages/coding-agent/docs/prompt-templates.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+模板位置、格式、参数提示和加载规则。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+
+## 中文译文
+
+Prompt template 是会展开成完整 prompt 的 Markdown 片段。在编辑器输入 `/name`，其中 `name` 是文件名去掉 `.md`；例如 `review.md` 注册成 `/review`。模板正文仍是用户意图的一部分，不会自动获得 Tool 权限。
+
+### 发现位置与信任
+
+Pi 从全局 `~/.pi/agent/prompts/*.md`、项目 `.pi/prompts/*.md`、package 的 `prompts/` 或 `package.json` 的 `pi.prompts`、settings 的 `prompts` 数组，以及重复传入的 `--prompt-template <path>` 发现模板。项目模板只有在项目 trusted 后才加载；`--no-prompt-templates` 可关闭发现。目录 `prompts/` 只做非递归扫描，子目录必须显式加入 settings 或 package manifest。
+
+### Frontmatter、命令和参数
+
+Frontmatter 中 `description` 可用于 autocomplete；不写时取正文第一行非空文本。`argument-hint` 只负责展示参数形状：用 `<PR-URL>` 表示必填，用 `[instructions]` 表示可选。它不会替你校验参数，也不会改变模板的展开语义。
+
+正文支持位置参数 `$1`、`$2`，`$@` 或 `$ARGUMENTS` 表示全部参数；`${1:-default}` 在第一个参数缺失/为空时使用默认值；`${@:-default}` 与 `${ARGUMENTS:-default}` 对全部参数同理；`${@:N}` 从第 N 个参数开始取，`${@:N:L}` 从 N 开始取 L 个参数。参数按 shell-like 使用方式传递时，应在包含空格的值外加引号，例如 `/component Button "onClick handler"`。
+
+最小模板如下：
+
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[extra instructions]"
+---
+Review staged changes (`git diff --cached`). Focus on bugs, security, and error handling.
+```
+
+> 译者注：template 是可复用 prompt 资源，Skill 通常还携带 references/assets 和能力说明；两者都能影响模型 Context，但都不能替代 Runtime 的权限检查。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| Prompt Templates | Prompt Templates |
+| Locations | 位置 |
+| Format | Format |
+| Argument Hints | Argument Hints |
+| Usage | 使用方式 |
+| Arguments | Arguments |
+| Loading Rules | Loading Rules |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/prompt-templates.md)
+
+````markdown
+> pi can create prompt templates. Ask it to build one for your workflow.
+
+# Prompt Templates
+
+Prompt templates are Markdown snippets that expand into full prompts. Type `/name` in the editor to invoke a template, where `name` is the filename without `.md`.
+
+## Locations
+
+Pi loads prompt templates from:
+
+- Global: `~/.pi/agent/prompts/*.md`
+- Project: `.pi/prompts/*.md` (only after the project is trusted)
+- Packages: `prompts/` directories or `pi.prompts` entries in `package.json`
+- Settings: `prompts` array with files or directories
+- CLI: `--prompt-template <path>` (repeatable)
+
+Disable discovery with `--no-prompt-templates`.
+
+## Format
+
+```markdown
+---
+description: Review staged git changes
+---
+Review the staged changes (`git diff --cached`). Focus on:
+- Bugs and logic errors
+- Security issues
+- Error handling gaps
+```
+
+- The filename becomes the command name. `review.md` becomes `/review`.
+- `description` is optional. If missing, the first non-empty line is used.
+- `argument-hint` is optional. When set, the hint is displayed before the description in the autocomplete dropdown.
+
+### Argument Hints
+
+Use `argument-hint` in frontmatter to show expected arguments in autocomplete. Use `<angle brackets>` for required arguments and `[square brackets]` for optional ones:
+
+```markdown
+---
+description: Review PRs from URLs with structured issue and code analysis
+argument-hint: "<PR-URL>"
+---
+```
+
+This renders in the autocomplete dropdown as:
+
+```
+→ pr   <PR-URL>       — Review PRs from URLs with structured issue and code analysis
+  is   <issue>        — Analyze GitHub issues (bugs or feature requests)
+  wr   [instructions] — Finish the current task end-to-end
+  cl   — Audit changelog entries before release
+```
+
+## Usage
+
+Type `/` followed by the template name in the editor. Autocomplete shows available templates with descriptions.
+
+```
+/review                           # Expands review.md
+/component Button                 # Expands with argument
+/component Button "click handler" # Multiple arguments
+```
+
+## Arguments
+
+Templates support positional arguments, defaults, and simple slicing:
+
+- `$1`, `$2`, ... positional args
+- `$@` or `$ARGUMENTS` for all args joined
+- `${1:-default}` uses arg 1 when present/non-empty, otherwise `default`
+- `${@:-default}` or `${ARGUMENTS:-default}` uses all arguments when present/non-empty, otherwise `default`
+- `${@:N}` for args from the Nth position (1-indexed)
+- `${@:N:L}` for `L` args starting at N
+
+Example:
+
+```markdown
+---
+description: Create a component
+---
+Create a React component named $1 with features: $@
+```
+
+Default values are useful for optional arguments:
+
+```markdown
+Summarize the current state in ${1:-7} bullet points.
+```
+
+Usage: `/component Button "onClick handler" "disabled support"`
+
+## Loading Rules
+
+- Template discovery in `prompts/` is non-recursive.
+- If you want templates in subdirectories, add them explicitly via `prompts` settings or a package manifest.
+
+````

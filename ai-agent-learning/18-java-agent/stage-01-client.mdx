@@ -1,0 +1,14 @@
+---
+title: "Java 01：最小 LLM Client"
+description: "使用 Java 21 HttpClient 发出一次非流式模型请求。"
+---
+
+# Java 01：最小 LLM Client
+
+`HttpModel.complete` 使用 `HttpRequest`、`HttpResponse<String>` 和 Jackson：构造 JSON、设置认证 header、检查 2xx、解析 assistant message。它只负责 Provider 边界，不执行 Tool。
+
+Java 的同步 `HttpClient.send` 适合先讲清协议；需要异步时可放入 `ExecutorService`/`CompletableFuture`，但 cancellation 仍要传给 Model 和 Tool。
+
+## 实验
+
+用本地 fake server 返回成功、429、500、空 choices 和 malformed JSON；断言错误不会泄露 API key。Loop 测试使用 `ScriptedModel`，不调用收费服务。

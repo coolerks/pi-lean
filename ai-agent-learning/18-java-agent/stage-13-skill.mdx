@@ -1,0 +1,12 @@
+---
+title: "Java 13：Skill Discovery"
+description: "扫描 SKILL.md frontmatter，按需加载正文。"
+---
+
+# Java 13：Skill Discovery
+
+`SkillDiscovery` 从目录得到 `name`、`description`、`path`，短信息可以进入 system prompt；完整 `SKILL.md` 由后续读取动作按需载入。Skill 是资源/提示，不等于带生命周期的 Plugin。
+
+## 实验
+
+测试缺字段、重复 name、路径越界、脚本附件和不可信 Skill 的策略。

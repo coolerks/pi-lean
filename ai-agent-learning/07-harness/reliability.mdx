@@ -1,0 +1,43 @@
+---
+title: "可靠性：崩溃恢复与幂等"
+description: "把 harness.v2.md 的设计原则转化为可测试的状态机。"
+---
+
+# 可靠性：崩溃恢复与幂等
+
+## 事实和设计分开
+
+`packages/agent/docs/harness.v2.md` 是工作区中的 durable AgentHarness 设计文档。它提出 lanes、append-only tree、operation log、intent/result、queue、usage ledger、manual drive 和恢复规则；当前 `agent-harness.ts` 还没有实现这些完整能力。下面是设计学习材料，不是已完成 API 的使用说明。
+
+## Intent → effect → result
+
+```text
+写入 assistant_attempt(intent, provisioned result id)
+  -> 调用 Provider（可失败、可重复）
+  -> 写入 assistant entry / error entry
+  -> checkpoint / terminal transaction
+```
+
+Tool 也是一样：执行前写入 `tool_started`，结果写入带同一 invocation identity 的 entry。崩溃后只有在 intent 和当前 Tool 都声明 safe 时重放；否则写 synthetic interrupted result。Hook 的外部 HTTP/文件副作用无法由 Harness 自动 exactly-once，必须由 Hook 自己设计幂等 key。
+
+## 恢复测试矩阵
+
+| 崩溃点 | 下次行为 |
+| --- | --- |
+| request intent 后 | 重试该 attempt，attempt 计数不能重置 |
+| assistant 已写、Tool Result 未写 | 按 replay policy 重放或合成 interrupted |
+| queue 已接受、entry 未消费 | 恢复 pending queue，在 checkpoint 消费 |
+| compaction 已决定、summary 未写 | 重新进入同一个 compaction reason |
+| abort marker 已写 | 只做 reconciliation，不再消费 steering/follow-up |
+| terminal transaction 后 | 发现 operation registers 不存在，读取 last result，不重复写 |
+
+## 需要测试的 invariant
+
+1. 同一 lane 至多一个 open operation。
+2. 每个 provisioned id 只能对应预期内容。
+3. 工具结果按 assistant source order 回传，执行可以并行。
+4. 每次 Provider request 的 usage 独立入账，即使 response 被丢弃。
+5. abort 与 response settlement 的两种顺序都可解释。
+6. `maxSteps`、retry cap 和 overflow recovery 都有界。
+
+这些原则比“能跑一次 demo”更能证明 Harness 具备工程可靠性。

@@ -1,0 +1,12 @@
+---
+title: "Java 09：Session"
+description: "用 Jackson JSONL 和原子替换保存可恢复 transcript。"
+---
+
+# Java 09：Session
+
+`Session.save` 写临时文件后 move 到目标路径；`Session.load` 逐行解析并报告坏行。它保留的是教学版消息前缀；成熟实现还要 header/version、树节点、并发锁和崩溃恢复。
+
+## 实验
+
+保存后新建 Session 再 load，注入 malformed JSON、空 role 和文件不存在，观察明确错误。

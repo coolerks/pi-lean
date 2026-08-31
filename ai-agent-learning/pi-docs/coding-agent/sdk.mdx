@@ -1,0 +1,1394 @@
+---
+title: "SDK"
+description: "以 SDK 创建 AgentSession、配置资源、运行模式和导出。"
+---
+
+# SDK
+
+> 本页是 `packages/coding-agent/docs/sdk.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+
+## 中文导读
+
+以 SDK 创建 `AgentSession`、配置资源、运行模式和导出。本页先给出完整的中文操作说明，再保留源文件的完整内容供逐段核对。API 名称、命令、路径、配置字段和 TypeScript 标识符保持原样；实现行为以研究 commit 的源码和测试为准。
+
+## 中文译文
+
+### SDK 的用途、安装与快速开始
+
+SDK 是在程序中调用 Pi Agent 能力的入口。它适合嵌入 Web、桌面或移动 UI，接入已有后端工作流，构建自动化 pipeline，注册自定义 Tool，或者在测试中用代码观察 Agent 行为。它不是一个新的模型 Provider：SDK 负责把 `AgentSession`、资源加载、事件和运行模式组合成应用可调用的接口。
+
+安装主 package 即可：
+
+```bash
+npm install @earendil-works/pi-coding-agent
+```
+
+最小流程是创建 `ModelRuntime`，用 `createAgentSession` 创建 session，订阅 `message_update` 中的 `text_delta`，然后调用 `session.prompt`。`SessionManager.inMemory()` 适合测试和临时 UI；需要跨进程继续时，应选择持久化 SessionManager。订阅回调只负责显示事件，`prompt()` 的 Promise 仍要等待整个 accepted run（包括重试）结束。
+
+### `createAgentSession()` 与 `AgentSession`
+
+`createAgentSession()` 是单个 `AgentSession` 的工厂。它会使用 `ResourceLoader` 提供 extensions、skills、prompt templates、themes 和 context files；不传 loader 时使用 `DefaultResourceLoader` 做标准发现。可在 options 中指定 `model`、`tools`、`customTools`、`sessionManager`、`settingsManager`、`cwd` 和 `modelRuntime`。
+
+`AgentSession` 是一次 Coding Agent 生命周期的编排对象。它维护 Agent 消息、当前 model 和 thinking level，处理 compaction、Session 写入、事件流以及运行中的队列。常用方法和状态如下：
+
+- `prompt(text, options?)` 发送输入并等待接受的运行完成；`images` 可传入图像内容。
+- `steer(text)` 在当前工作仍进行时排队纠偏；`followUp(text)` 在当前 Agent 原本要结束时追加请求。
+- `subscribe(listener)` 返回取消订阅函数；不要把旧 session 的订阅误认为会自动跟随新 session。
+- `setModel`、`setThinkingLevel`、`cycleModel` 和 `cycleThinkingLevel` 改变运行配置。
+- `agent.state`、`messages`、`isStreaming` 提供当前状态；`navigateTree` 在当前文件中移动 branch，`compact` 触发压缩，`abort` 取消当前 operation，`dispose` 释放资源。
+
+`AgentSession` 不负责替换活动 session。`newSession`、`switchSession`、`fork` 和 import 属于 `AgentSessionRuntime`；这是“当前 Agent”与“承载当前 Agent 的运行时”的边界。
+
+### `createAgentSessionRuntime()` 与 `AgentSessionRuntime`
+
+当应用需要执行 `/new`、`/resume`、`/fork`、`/clone` 或从 JSONL 导入时，使用 runtime API。`createAgentSessionRuntime()` 接受一个 runtime factory 和初始 `cwd`/session target。factory 根据有效 cwd 创建 cwd 绑定的 services，再解析 session options，返回 session、services 和 diagnostics。
+
+runtime 会替换 `runtime.session`。原 session 上的订阅不会迁移，所以替换后要取消旧 listener、读取新 session 并重新订阅；如果使用 extensions，还要对新 session 再次执行 `bindExtensions`。创建或替换失败会抛异常，由调用者决定显示、重试或退出。`runtime.diagnostics` 用来查看资源和模型发现时的诊断，而不是把 warning 当作 Agent message。
+
+### Prompt、队列与 `AgentState`
+
+`PromptOptions` 控制模板展开、图像、流式期间的消息投递方式以及 preflight 回调。`preflightResult(true)` 表示 prompt 已被接受、排队或立即处理；`false` 表示在 acceptance 之前被拒绝。它只回调一次，不能用来判断 accepted run 最终成功与否；accepted run 的失败应从事件和消息中观察。
+
+流式运行期间必须明确 `streamingBehavior`，可取 `steer` 或 `followUp`；省略会抛错。Extension command 会立即执行，并由 extension 自己通过 `pi.sendMessage()` 管理模型交互；file-based prompt template 会在发送或排队前展开；extension command 不能排进 `steer()`/`followUp()`。因此“当前输入”“纠偏”“完成后追加”是三个不同的队列语义，不是同一个字符串列表。
+
+底层 `Agent`（来自 `@earendil-works/pi-agent-core`）通过 `session.agent` 暴露。`AgentState` 至少包含 `messages`、`model`、`thinkingLevel`、`systemPrompt`、`tools`、部分生成中的 `streamingMessage` 和最新错误。替换 state.messages 或 state.tools 会复制顶层数组，但调用者仍要保证消息结构合法；`waitForIdle()` 等待核心 Agent 结束。`Agent` 负责 Loop 和队列，SDK session 负责把它接到资源、持久化和 UI。
+
+### Events：从流式 delta 到生命周期
+
+`session.subscribe` 收到的是运行事件，而非只有最终文本。`message_update` 的 `assistantMessageEvent.type` 可以是 `text_delta` 或 `thinking_delta`；`tool_execution_start/update/end` 描述 Tool 的开始、增量输出和结束；`message_start/end` 包住消息生命周期；`agent_start/end` 包住一次 Agent 运行；`turn_start/end` 表示一次 assistant response 加其 Tool batch。
+
+`queue_update` 观察 steering/follow-up 队列，`compaction_start/end` 观察压缩，`auto_retry_start/end` 观察 Provider retry，`summarization_retry_*` 观察摘要重试。事件 handler 应该短小、可容错并脱敏；不要在 `message_update` 中假定已经有完整 assistant message，也不要把 `tool_execution_end` 当作 Session 已经成功提交的唯一证明。
+
+### Options：目录、模型、认证和系统提示
+
+`cwd` 是 `DefaultResourceLoader` 的项目发现根，影响 project extensions、`.pi/skills/`、`.agents/skills/`、`.pi/prompts/`、向上查找的 `AGENTS.md`/`CLAUDE.md`、Session 命名和工具路径。`agentDir` 是全局配置根，包含 global extensions/skills/prompts、settings、models、credentials 和 sessions。传入自定义 `ResourceLoader` 后，二者不再决定资源发现，但仍会影响 session 命名和 Tool 路径解析。
+
+`ModelRuntime` 负责模型目录、认证和 Provider 选择。`getModel`/`runtime.getModel` 只查找模型定义，不保证已有 API key；`getAvailable` 才筛出已有有效认证的模型。`thinkingLevel` 和 `scopedModels` 控制当前模型及 cycling。未显式传 model 时，SDK 依次尝试从继续中的 Session 恢复、使用 settings 默认值、再选择第一个可用模型。
+
+认证解析优先级是 runtime override（`setRuntimeApiKey`，不写盘）、`auth.json` 中的 API key/OAuth、环境变量，再到 custom provider resolver。`authPath`、`modelsPath` 和自定义 `CredentialStore` 适合测试或多租户应用；不要把 key 放入 prompt、源码或 project 文件。模型目录 refresh 可带 `signal`、`allowNetwork`、`force` 和 timeout；网络刷新失败不应撤销已经成功的 credential mutation。
+
+`ResourceLoader` 的 `systemPromptOverride` 可以替换系统提示。系统提示、Session messages、Tool definitions 和 model options 是不同输入：不要把工具 schema 或历史消息拼成一段 user text。若要调试，应分别打印最终 system prompt、投影后的 messages、active tools 和 request options，并脱敏。
+
+### Options：Tools 与 Custom Tools
+
+`tools` 是 active tool allowlist；内建名称包括 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find`、`ls`，默认是 `read`、`bash`、`edit`、`write`。`noTools: "all"` 关闭全部；`noTools: "builtin"` 只关闭默认内建工具而保留 extension/custom tools；`excludeTools` 在 allowlist 后继续排除指定名称。自定义 `cwd` 时，选中的内建工具也按该 cwd 创建。
+
+`defineTool()` 用 TypeBox schema 和 `execute` 定义一个 `customTool`。definition 只告诉模型 name、description 和 parameters；真正的 `execute` 在 Runtime 中运行，并应自己处理权限、超时、取消、输出上限和敏感数据。`customTools` 会与 Extension 注册的工具合并；如果同时传 `tools`，还必须把自定义工具名加入 allowlist。`edit` 的 `details.diff` 面向 TUI，`details.patch` 是 SDK 消费者可处理的 unified patch。
+
+### Options：Extensions、Skills、Context files 与 Slash Commands
+
+`DefaultResourceLoader` 从 global/project 目录和 `settings.json` 发现 Extensions，也可以接收 `additionalExtensionPaths` 与 `extensionFactories`。Extension 能注册 Tool、Command、事件 handler、共享 event bus 和 UI 行为；inline factory 可以通过 `InlineExtension.name` 获得稳定显示名。Extension 的错误、权限和生命周期属于宿主边界，不因为它运行在同一进程就自动安全。
+
+Skill 是包含 `name`、`description`、`filePath`、`baseDir` 和 `source` 的资源描述。`skillsOverride` 可增加或过滤 Skill；通常只把 metadata 放入 system prompt，模型需要时再通过 read/资源操作读取 `SKILL.md`。这就是 progressive disclosure：Skill 与 Extension 的代码生命周期不同，不能把 Skill 文本当成可信可执行代码。
+
+`agentsFilesOverride` 可加入虚拟 `AGENTS.md`，影响 system prompt 的 project instructions。`promptsOverride` 可加入 `PromptTemplate`，使 `/deploy` 之类 slash command 展开成 prompt；模板只是输入资源，不应静默覆盖用户原始请求。修改后调用 `loader.reload()`，并在创建 session 前确认 diagnostics。
+
+### Options：Session 与 Settings
+
+`SessionManager.inMemory()` 不写文件，适合单元测试；`create(cwd)` 创建持久化 Session；`continueRecent` 恢复最近 session；`open(path)` 打开指定 JSONL；`list`/`listAll` 列出项目或全局 sessions。Session 以 `id`/`parentId` 连接树，`branch`/`navigateTree` 改变当前 leaf，保留共享前缀而不复制全部历史。`newSession`、`switchSession`、`fork`、`importFromJsonl` 通过 runtime 替换活动 session。
+
+`SettingsManager.create` 合并 global `~/.pi/agent/settings.json` 和 project `.pi/settings.json`；项目设置覆盖全局，嵌套对象按 key 合并。`inMemory` 不读写文件，适合测试；setter 更新内存后异步排队写入，必须在进程退出或测试断言前 `await flush()`。设置 I/O 错误从 `drainErrors()` 取出，不能假设 setter resolve 就表示磁盘已完成。
+
+### `ResourceLoader` 与返回值
+
+调用 `loader.reload()` 后，可以分别读取 `getExtensions()`、`getSkills()`、`getPrompts()`、`getThemes()` 和 `getAgentsFiles().agentsFiles`。这些结果是资源发现/诊断，不是自动赋予每个资源执行权限。
+
+`createAgentSession()` 返回 `session`、`extensionsResult` 和可选的 `modelFallbackMessage`。`extensionsResult` 包含成功加载的 extensions、带 path/error 的失败数组和 `ExtensionRuntime`。模型从旧 Session 恢复失败时，fallback message 是诊断提示；不能把它当作模型已执行的回答。应用应展示可操作的 error，同时让测试断言失败 extension 是否影响 fail-fast 策略。
+
+### 完整示例的阅读方法
+
+官方完整示例依次创建自定义 `ModelRuntime`、从环境变量读取 runtime API key、定义 `statusTool`、选择 model、配置 in-memory settings、定制 `systemPromptOverride`、限制 active tools、创建 in-memory session、订阅事件并调用 `session.prompt`。这里的关键不是复制某个模型 id，而是观察装配顺序：Provider/auth → resources → Tool registry → Session → event consumer → prompt。
+
+示例中 `statusTool` 返回结构化 text content 和 details；它仍需通过 schema、权限和 output policy。将 `SessionManager.inMemory()` 换成持久化 manager，将 `SettingsManager.inMemory()` 换成文件 manager，就会改变 durability 边界，而不会改变 Agent Loop 的 Tool Calling 语义。
+
+### `InteractiveMode`、`runPrintMode` 与 `runRpcMode`
+
+SDK 导出三种建立在 runtime 之上的运行模式。`InteractiveMode` 提供完整 TUI、编辑器、聊天历史和内建命令；`runPrintMode` 发送初始消息和 follow-up 后输出结果并退出，适合脚本；`runRpcMode` 通过 stdin/stdout 运行 JSON-RPC，适合远程或其他进程控制。三者都通过同一个 `CreateAgentSessionRuntimeFactory` 创建 services 和 session，因此运行模式不应各自复制 Agent Loop。
+
+Interactive mode 需要提供 `initialMessage`、`initialImages` 和 `initialMessages` 等 UI 输入；print mode 需要明确输出 `mode` 和初始 prompt；RPC mode 的 framing、commands、events、UI request/response 和错误处理见 RPC 文档。SDK 使用者应确保 stdout 不被调试日志污染 RPC 帧。
+
+### RPC alternative、Exports 与 Java/Go 边界
+
+如果调用方不在 Node.js 进程内，或希望进程隔离，可以直接运行 `pi --mode rpc --no-session`，让其他语言通过协议控制 Agent。SDK 适合同进程、类型安全、直接访问状态和程序化注册 Tool；RPC 适合 Java/Go 客户端、语言无关集成和隔离。RPC 与 MCP 都可能使用 JSON，但 RPC 控制 Pi Agent，MCP 发现和调用外部 Tool，不能互换。
+
+主入口导出 factory、`ModelRuntime`/`ModelRegistry`、认证同步错误、模型 resolver、`DefaultResourceLoader`、`createEventBus`、路径 helper、`SessionManager`、`SettingsManager`、内建 Tool factory，以及 `CreateAgentSessionOptions`、`ExtensionFactory`、`ToolDefinition`、`Skill`、`PromptTemplate` 等类型。需要 Extension 的完整方法时查看 Extensions 文档，不要根据导出名猜测生命周期。
+
+Java/Go 实现不应复制 TypeScript 的动态 module loading：Java 可把 `AgentSession`/runtime 理解成 interface + service object，用 `ServiceLoader`/Listener 组合资源与事件；Go 可用 interface、显式 registry、struct 和 `context.Context`。`Promise`/`async` 对应 Java `Future` 或 Go goroutine/channel，但 cancellation、Session persistence、Tool permission 和 event ordering 仍是应用必须定义的语义。
+
+**实验**：先用 `SessionManager.inMemory()` 和一个只返回文本的 fake model，订阅并打印所有 `AgentSessionEvent`；再注册 `statusTool`，比较 `tools` allowlist 和 `excludeTools` 的行为；最后通过 `runPrintMode` 或 RPC 驱动同一 session。记录每次请求的 system prompt、messages、tools、事件和 Session entry，并说明哪些状态在重启后仍存在。
+
+## 章节对照
+
+| 源文档标题 | 中文阅读标题 |
+| --- | --- |
+| SDK | SDK |
+| Quick Start | 快速开始 |
+| Installation | Installation |
+| Core Concepts | Core Concepts |
+| createAgentSession() | createAgentSession() |
+| AgentSession | AgentSession |
+| createAgentSessionRuntime() and AgentSessionRuntime | createAgentSessionRuntime() and AgentSessionRuntime |
+| Prompting and Message Queueing | Prompting and Message Queueing |
+| Agent and AgentState | Agent and AgentState |
+| Events | 事件 |
+| Options Reference | Options Reference |
+| Directories | Directories |
+| Model | Model |
+| API Keys and OAuth | API Keys and OAuth |
+| System Prompt | System Prompt |
+| Tools | Tools |
+| Custom Tools | 自定义工具 |
+| Extensions | Extensions |
+| Skills | Skills |
+| Context Files | Context Files |
+| Slash Commands | Slash Commands |
+| Session Management | Session 管理 |
+| Settings Management | Settings Management |
+| ResourceLoader | ResourceLoader |
+| Return Value | Return Value |
+| Complete Example | Complete Example |
+| Run Modes | 运行模式 |
+| InteractiveMode | InteractiveMode |
+| runPrintMode | runPrintMode |
+| runRpcMode | runRpcMode |
+| RPC Mode Alternative | RPC Mode Alternative |
+| Exports | Exports |
+
+## 使用建议
+
+1. 先阅读本页标题和章节对照，明确你要解决的操作。
+2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
+3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+
+<Note>
+
+以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+
+</Note>
+
+## 完整原文对照
+
+[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/sdk.md)
+
+````markdown
+> pi can help you use the SDK. Ask it to build an integration for your use case.
+
+# SDK
+
+The SDK provides programmatic access to pi's agent capabilities. Use it to embed pi in other applications, build custom interfaces, or integrate with automated workflows.
+
+**Example use cases:**
+- Build a custom UI (web, desktop, mobile)
+- Integrate agent capabilities into existing applications
+- Create automated pipelines with agent reasoning
+- Build custom tools that spawn sub-agents
+- Test agent behavior programmatically
+
+See [examples/sdk/](../examples/sdk/) for working examples from minimal to full control.
+
+## Quick Start
+
+```typescript
+import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+
+const modelRuntime = await ModelRuntime.create();
+const { session } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(),
+  modelRuntime,
+});
+
+session.subscribe((event) => {
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta);
+  }
+});
+
+await session.prompt("What files are in the current directory?");
+```
+
+## Installation
+
+```bash
+npm install @earendil-works/pi-coding-agent
+```
+
+The SDK is included in the main package. No separate installation needed.
+
+## Core Concepts
+
+### createAgentSession()
+
+The main factory function for a single `AgentSession`.
+
+`createAgentSession()` uses a `ResourceLoader` to supply extensions, skills, prompt templates, themes, and context files. If you do not provide one, it uses `DefaultResourceLoader` with standard discovery.
+
+```typescript
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+
+// Minimal: defaults with DefaultResourceLoader
+const { session } = await createAgentSession();
+
+// Custom: override specific options
+const { session } = await createAgentSession({
+  model: myModel,
+  tools: ["read", "bash"],
+  sessionManager: SessionManager.inMemory(),
+});
+```
+
+### AgentSession
+
+The session manages agent lifecycle, message history, model state, compaction, and event streaming.
+
+```typescript
+interface AgentSession {
+  // Send a prompt and wait for completion
+  prompt(text: string, options?: PromptOptions): Promise<void>;
+
+  // Queue messages during streaming
+  steer(text: string): Promise<void>;
+  followUp(text: string): Promise<void>;
+
+  // Subscribe to events (returns unsubscribe function)
+  subscribe(listener: (event: AgentSessionEvent) => void): () => void;
+
+  // Session info
+  sessionFile: string | undefined;
+  sessionId: string;
+
+  // Model control
+  setModel(model: Model): Promise<void>;
+  setThinkingLevel(level: ThinkingLevel): void;
+  cycleModel(): Promise<ModelCycleResult | undefined>;
+  cycleThinkingLevel(): ThinkingLevel | undefined;
+
+  // State access
+  agent: Agent;
+  model: Model | undefined;
+  thinkingLevel: ThinkingLevel;
+  messages: AgentMessage[];
+  isStreaming: boolean;
+
+  // In-place tree navigation within the current session file
+  navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }): Promise<{ editorText?: string; cancelled: boolean }>;
+
+  // Compaction
+  compact(customInstructions?: string): Promise<CompactionResult>;
+  abortCompaction(): void;
+
+  // Abort current operation
+  abort(): Promise<void>;
+
+  // Cleanup
+  dispose(): void;
+}
+```
+
+Session replacement APIs such as new-session, resume, fork, and import live on `AgentSessionRuntime`, not on `AgentSession`.
+
+### createAgentSessionRuntime() and AgentSessionRuntime
+
+Use the runtime API when you need to replace the active session and rebuild cwd-bound runtime state.
+This is the same layer used by the built-in interactive, print, and RPC modes.
+
+`createAgentSessionRuntime()` takes a runtime factory plus the initial cwd/session target. The factory closes over process-global fixed inputs, recreates cwd-bound services for the effective cwd, resolves session options against those services, and returns a full runtime result.
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({
+      services,
+      sessionManager,
+      sessionStartEvent,
+    })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+```
+
+`AgentSessionRuntime` owns replacement of the active runtime across:
+
+- `newSession()`
+- `switchSession()`
+- `fork()`
+- clone flows via `fork(entryId, { position: "at" })`
+- `importFromJsonl()`
+
+Important behavior:
+
+- `runtime.session` changes after those operations
+- event subscriptions are attached to a specific `AgentSession`, so re-subscribe after replacement
+- if you use extensions, call `runtime.session.bindExtensions(...)` again for the new session
+- creation returns diagnostics on `runtime.diagnostics`
+- if runtime creation or replacement fails, the method throws and the caller decides how to handle it
+
+```typescript
+let session = runtime.session;
+let unsubscribe = session.subscribe(() => {});
+
+await runtime.newSession();
+
+unsubscribe();
+session = runtime.session;
+unsubscribe = session.subscribe(() => {});
+```
+
+### Prompting and Message Queueing
+
+`PromptOptions` controls prompt expansion, queueing behavior while streaming, and prompt preflight notifications:
+
+```typescript
+interface PromptOptions {
+  expandPromptTemplates?: boolean;
+  images?: ImageContent[];
+  streamingBehavior?: "steer" | "followUp";
+  source?: InputSource;
+  preflightResult?: (success: boolean) => void;
+}
+```
+
+`preflightResult` is called once per `prompt()` invocation:
+
+- `true` when the prompt was accepted, queued, or handled immediately
+- `false` when prompt preflight rejected before acceptance
+
+It fires before `prompt()` resolves. `prompt()` still resolves only after the full accepted run finishes, including retries. Failures after acceptance are reported through the normal event and message stream, not through `preflightResult(false)`.
+
+The `prompt()` method handles prompt templates, extension commands, and message sending:
+
+```typescript
+// Basic prompt (when not streaming)
+await session.prompt("What files are here?");
+
+// With images
+await session.prompt("What's in this image?", {
+  images: [{ type: "image", source: { type: "base64", mediaType: "image/png", data: "..." } }]
+});
+
+// During streaming: must specify how to queue the message
+await session.prompt("Stop and do this instead", { streamingBehavior: "steer" });
+await session.prompt("After you're done, also check X", { streamingBehavior: "followUp" });
+```
+
+**Behavior:**
+- **Extension commands** (e.g., `/mycommand`): Execute immediately, even during streaming. They manage their own LLM interaction via `pi.sendMessage()`.
+- **File-based prompt templates** (from `.md` files): Expanded to their content before sending or queueing.
+- **During streaming without `streamingBehavior`**: Throws an error. Use `steer()` or `followUp()` directly, or specify the option.
+- **`preflightResult(true)`**: Means the prompt was accepted, queued, or handled immediately.
+- **`preflightResult(false)`**: Means preflight rejected before acceptance.
+
+For explicit queueing during streaming:
+
+```typescript
+// Queue a steering message for delivery after the current assistant turn finishes its tool calls
+await session.steer("New instruction");
+
+// Wait for agent to finish (delivered only when agent stops)
+await session.followUp("After you're done, also do this");
+```
+
+Both `steer()` and `followUp()` expand file-based prompt templates but error on extension commands (extension commands cannot be queued).
+
+### Agent and AgentState
+
+The `Agent` class (from `@earendil-works/pi-agent-core`) handles the core LLM interaction. Access it via `session.agent`.
+
+```typescript
+// Access current state
+const state = session.agent.state;
+
+// state.messages: AgentMessage[] - conversation history
+// state.model: Model - current model
+// state.thinkingLevel: ThinkingLevel - current thinking level
+// state.systemPrompt: string - system prompt
+// state.tools: AgentTool[] - available tools
+// state.streamingMessage?: AgentMessage - current partial assistant message
+// state.errorMessage?: string - latest assistant error
+
+// Replace messages (useful for branching or restoration)
+session.agent.state.messages = messages; // copies the top-level array
+
+// Replace tools
+session.agent.state.tools = tools; // copies the top-level array
+
+// Wait for agent to finish processing
+await session.agent.waitForIdle();
+```
+
+### Events
+
+Subscribe to events to receive streaming output and lifecycle notifications.
+
+```typescript
+session.subscribe((event) => {
+  switch (event.type) {
+    // Streaming text from assistant
+    case "message_update":
+      if (event.assistantMessageEvent.type === "text_delta") {
+        process.stdout.write(event.assistantMessageEvent.delta);
+      }
+      if (event.assistantMessageEvent.type === "thinking_delta") {
+        // Thinking output (if thinking enabled)
+      }
+      break;
+    
+    // Tool execution
+    case "tool_execution_start":
+      console.log(`Tool: ${event.toolName}`);
+      break;
+    case "tool_execution_update":
+      // Streaming tool output
+      break;
+    case "tool_execution_end":
+      console.log(`Result: ${event.isError ? "error" : "success"}`);
+      break;
+    
+    // Message lifecycle
+    case "message_start":
+      // New message starting
+      break;
+    case "message_end":
+      // Message complete
+      break;
+    
+    // Agent lifecycle
+    case "agent_start":
+      // Agent started processing prompt
+      break;
+    case "agent_end":
+      // Agent finished (event.messages contains new messages)
+      break;
+    
+    // Turn lifecycle (one LLM response + tool calls)
+    case "turn_start":
+      break;
+    case "turn_end":
+      // event.message: assistant response
+      // event.toolResults: tool results from this turn
+      break;
+    
+    // Session events (queue, compaction, retry)
+    case "queue_update":
+      console.log(event.steering, event.followUp);
+      break;
+    case "compaction_start":
+    case "compaction_end":
+    case "auto_retry_start":
+    case "auto_retry_end":
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
+      break;
+  }
+});
+```
+
+## Options Reference
+
+### Directories
+
+```typescript
+const { session } = await createAgentSession({
+  // Working directory for DefaultResourceLoader discovery
+  cwd: process.cwd(), // default
+  
+  // Global config directory
+  agentDir: "~/.pi/agent", // default (expands ~)
+});
+```
+
+`cwd` is used by `DefaultResourceLoader` for:
+- Project extensions (`.pi/extensions/`)
+- Project skills:
+  - `.pi/skills/`
+  - `.agents/skills/` in `cwd` and ancestor directories (up to git repo root, or filesystem root when not in a repo)
+- Project prompts (`.pi/prompts/`)
+- Context files (`AGENTS.md` walking up from cwd)
+- Session directory naming
+
+`agentDir` is used by `DefaultResourceLoader` for:
+- Global extensions (`extensions/`)
+- Global skills:
+  - `skills/` under `agentDir` (for example `~/.pi/agent/skills/`)
+  - `~/.agents/skills/`
+- Global prompts (`prompts/`)
+- Global context file (`AGENTS.md`)
+- Settings (`settings.json`)
+- Custom models (`models.json`)
+- Credentials (`auth.json`)
+- Sessions (`sessions/`)
+
+When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control resource discovery. They still influence session naming and tool path resolution.
+
+### Model
+
+```typescript
+import { getModel } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+
+const modelRuntime = await ModelRuntime.create();
+
+// create() restores cached catalogs but does not refresh them from pi.dev by default.
+// Opt in to a create-time network refresh and bound how long it may take:
+const refreshedRuntime = await ModelRuntime.create({
+  allowModelNetwork: true,
+  modelRefreshTimeoutMs: 15_000,
+});
+
+// Find specific built-in model (doesn't check if API key exists)
+const opus = getModel("anthropic", "claude-opus-4-5");
+if (!opus) throw new Error("Model not found");
+
+// Find any model by provider/id, including custom models from models.json
+// (doesn't check if API key exists)
+const customModel = modelRuntime.getModel("my-provider", "my-model");
+
+// Get only models that have valid authentication configured
+const available = await modelRuntime.getAvailable();
+
+const { session } = await createAgentSession({
+  model: opus,
+  thinkingLevel: "medium", // off, minimal, low, medium, high, xhigh, max
+  
+  // Models for cycling (Ctrl+P in interactive mode)
+  scopedModels: [
+    { model: opus, thinkingLevel: "high" },
+    { model: haiku, thinkingLevel: "off" },
+  ],
+  
+  modelRuntime,
+});
+```
+
+If no model is provided:
+1. Tries to restore from session (if continuing)
+2. Uses default from settings
+3. Falls back to first available model
+
+Remote catalogs are persisted locally so later runtimes can restore them without a network request. The default file is `~/.pi/agent/models-store.json`; set `modelsStorePath` to choose another location, or inject `modelsStore` to control persistence. Network refreshes are throttled to once per provider every four hours unless forced. To force an immediate refresh, call `await modelRuntime.refresh({ allowNetwork: true, force: true, signal })`. Setting `PI_OFFLINE` disables model network access.
+
+To match CLI model parsing, use the exported resolver helpers:
+
+```typescript
+import {
+  resolveCliModel,
+  resolveModelScopeWithDiagnostics,
+} from "@earendil-works/pi-coding-agent";
+
+const cliModel = resolveCliModel({
+  cliModel: "anthropic/claude-opus-4-5:high",
+  modelRuntime,
+});
+if (cliModel.error) throw new Error(cliModel.error);
+if (cliModel.warning) console.warn(cliModel.warning);
+
+const { scopedModels, diagnostics } = await resolveModelScopeWithDiagnostics(
+  ["anthropic/*:high", "gpt-5"],
+  modelRuntime,
+);
+for (const diagnostic of diagnostics) {
+  console.warn(diagnostic.message);
+}
+```
+
+`resolveCliModel()` uses all registered models so `--api-key` style first-time setup can resolve a model before stored auth exists. `resolveModelScopeWithDiagnostics()` matches `--models` and `enabledModels` semantics while returning warnings instead of printing them.
+
+> See [examples/sdk/02-custom-model.ts](../examples/sdk/02-custom-model.ts)
+
+### API Keys and OAuth
+
+Authentication resolution priority (handled by `ModelRuntime`):
+1. Runtime overrides (via `setRuntimeApiKey`, not persisted)
+2. Stored credentials in `auth.json` (API keys or OAuth tokens)
+3. Environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
+4. Fallback resolver (for custom provider keys from `models.json`)
+
+```typescript
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { createAgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
+
+// Default: uses ~/.pi/agent/auth.json and ~/.pi/agent/models.json
+const modelRuntime = await ModelRuntime.create();
+
+// Provider-owned auth methods and current status
+for (const provider of modelRuntime.getProviders()) {
+  const status = await modelRuntime.checkAuth(provider.id);
+  console.log(provider.name, provider.auth, status);
+}
+
+// Runtime API key override (not persisted to disk)
+await modelRuntime.setRuntimeApiKey("anthropic", "sk-my-temp-key");
+
+// Custom credential and model locations
+const customRuntime = await ModelRuntime.create({
+  authPath: "/my/app/auth.json",
+  modelsPath: "/my/app/models.json",
+});
+
+// Or inject any pi-ai CredentialStore
+const credentials = new InMemoryCredentialStore();
+const inMemoryRuntime = await ModelRuntime.create({ credentials });
+
+const { session } = await createAgentSession({
+  modelRuntime: customRuntime,
+});
+```
+
+`login()`, `logout()`, `setRuntimeApiKey()`, and `removeRuntimeApiKey()` resolve after the affected provider's cached/built-in catalog, composition, and availability snapshot are locally consistent. They do not wait for remote catalog freshness. If credentials were committed but local synchronization fails, they reject with the exported `CredentialSynchronizationError`; inspect its `providerId`, `operation`, `credential`, and `cause` fields instead of retrying the credential mutation blindly.
+
+Public model/auth operations and `ModelRuntime.create({ signal })` accept optional abort signals and are unbounded when omitted. SDK applications own deadline policy for remote catalog freshness:
+
+```typescript
+const signal = AbortSignal.timeout(15_000);
+const result = await modelRuntime.refresh({
+  providers: ["anthropic"],
+  signal,
+});
+if (result.aborted) console.warn("Catalog refresh timed out; using cached models");
+for (const [providerId, error] of result.errors) {
+  console.warn(`Could not refresh ${providerId}:`, error);
+}
+```
+
+A failed or timed-out network refresh does not undo a successful credential operation. `refresh()` starts a new provider generation, so it does not wait behind an older stalled refresh and stale generations cannot publish afterward.
+
+> See [examples/sdk/09-api-keys-and-oauth.ts](../examples/sdk/09-api-keys-and-oauth.ts)
+
+### System Prompt
+
+Use a `ResourceLoader` to override the system prompt:
+
+```typescript
+import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+
+const loader = new DefaultResourceLoader({
+  systemPromptOverride: () => "You are a helpful assistant.",
+});
+await loader.reload();
+
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+> See [examples/sdk/03-custom-prompt.ts](../examples/sdk/03-custom-prompt.ts)
+
+### Tools
+
+Specify which built-in tools to enable:
+
+- Built-in tool names: `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`
+- Default built-ins: `read`, `bash`, `edit`, `write`
+- `noTools: "all"` disables all tools
+- `noTools: "builtin"` disables default built-ins while keeping extension and custom tools enabled
+- `excludeTools` disables specific built-in, extension, or custom tool names after any `tools` allowlist is applied
+
+The `edit` tool returns `details.diff` for Pi's TUI display and `details.patch` as a standard unified patch for SDK consumers.
+
+```typescript
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
+
+// Read-only mode
+const { session } = await createAgentSession({
+  tools: ["read", "grep", "find", "ls"],
+});
+
+// Pick specific tools
+const { session } = await createAgentSession({
+  tools: ["read", "bash", "grep"],
+});
+
+// Use PowerShell instead of Bash on Windows
+const { session } = await createAgentSession({
+  tools: ["read", "powershell", "edit", "write"],
+});
+
+// Disable one tool while keeping the rest available
+const { session } = await createAgentSession({
+  excludeTools: ["ask_question"],
+});
+```
+
+#### Tools with Custom cwd
+
+When you pass a custom `cwd`, `createAgentSession()` builds selected built-in tools for that cwd.
+
+```typescript
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+
+const cwd = "/path/to/project";
+
+// Use default tools for custom cwd
+const { session } = await createAgentSession({
+  cwd,
+  sessionManager: SessionManager.inMemory(cwd),
+});
+
+// Or pick specific tools for custom cwd
+const { session } = await createAgentSession({
+  cwd,
+  tools: ["read", "bash", "grep"],
+  sessionManager: SessionManager.inMemory(cwd),
+});
+```
+
+> See [examples/sdk/05-tools.ts](../examples/sdk/05-tools.ts)
+
+### Custom Tools
+
+```typescript
+import { Type } from "typebox";
+import { createAgentSession, defineTool } from "@earendil-works/pi-coding-agent";
+
+// Inline custom tool
+const myTool = defineTool({
+  name: "my_tool",
+  label: "My Tool",
+  description: "Does something useful",
+  parameters: Type.Object({
+    input: Type.String({ description: "Input value" }),
+  }),
+  execute: async (_toolCallId, params) => ({
+    content: [{ type: "text", text: `Result: ${params.input}` }],
+    details: {},
+  }),
+});
+
+// Pass custom tools directly
+const { session } = await createAgentSession({
+  customTools: [myTool],
+});
+```
+
+Use `defineTool()` for standalone definitions and arrays like `customTools: [myTool]`. Inline `pi.registerTool({ ... })` already infers parameter types correctly.
+
+Custom tools passed via `customTools` are combined with extension-registered tools. Extensions loaded by the ResourceLoader can also register tools via `pi.registerTool()`.
+
+If you pass `tools`, include each custom or extension tool name you want enabled, for example `tools: ["read", "bash", "my_tool"]`.
+
+> See [examples/sdk/05-tools.ts](../examples/sdk/05-tools.ts)
+
+### Extensions
+
+Extensions are loaded by the `ResourceLoader`. `DefaultResourceLoader` discovers extensions from `~/.pi/agent/extensions/`, `.pi/extensions/`, and settings.json extension sources.
+
+```typescript
+import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+
+const loader = new DefaultResourceLoader({
+  additionalExtensionPaths: ["/path/to/my-extension.ts"],
+  extensionFactories: [
+    (pi) => {
+      pi.on("agent_start", () => {
+        console.log("[Inline Extension] Agent starting");
+      });
+    },
+  ],
+});
+await loader.reload();
+
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+Extensions can register tools, subscribe to events, add commands, and more. See [extensions.md](extensions.md) for the full API.
+
+**Named inline extensions:** By default, inline factories display as `<inline:1>`, `<inline:2>`, etc. in the startup Extensions list. To show a descriptive name instead, wrap the factory:
+
+```typescript
+import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+
+const myProvider: InlineExtension = {
+  name: "my-provider",
+  factory: (pi) => {
+    pi.on("agent_start", () => {
+      console.log("[my-provider] Agent starting");
+    });
+  },
+};
+
+const loader = new DefaultResourceLoader({
+  extensionFactories: [myProvider],
+});
+```
+
+This displays as `<inline:my-provider>` instead of `<inline:1>`. Bare factory functions are still accepted for backward compatibility.
+
+**Event Bus:** Extensions can communicate via `pi.events`. Pass a shared `eventBus` to `DefaultResourceLoader` if you need to emit or listen from outside:
+
+```typescript
+import { createEventBus, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+
+const eventBus = createEventBus();
+const loader = new DefaultResourceLoader({
+  eventBus,
+});
+await loader.reload();
+
+eventBus.on("my-extension:status", (data) => console.log(data));
+```
+
+> See [examples/sdk/06-extensions.ts](../examples/sdk/06-extensions.ts) and [docs/extensions.md](extensions.md)
+
+### Skills
+
+```typescript
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  type Skill,
+} from "@earendil-works/pi-coding-agent";
+
+const customSkill: Skill = {
+  name: "my-skill",
+  description: "Custom instructions",
+  filePath: "/path/to/SKILL.md",
+  baseDir: "/path/to",
+  source: "custom",
+};
+
+const loader = new DefaultResourceLoader({
+  skillsOverride: (current) => ({
+    skills: [...current.skills, customSkill],
+    diagnostics: current.diagnostics,
+  }),
+});
+await loader.reload();
+
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+> See [examples/sdk/04-skills.ts](../examples/sdk/04-skills.ts)
+
+### Context Files
+
+```typescript
+import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+
+const loader = new DefaultResourceLoader({
+  agentsFilesOverride: (current) => ({
+    agentsFiles: [
+      ...current.agentsFiles,
+      { path: "/virtual/AGENTS.md", content: "# Guidelines\n\n- Be concise" },
+    ],
+  }),
+});
+await loader.reload();
+
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+> See [examples/sdk/07-context-files.ts](../examples/sdk/07-context-files.ts)
+
+### Slash Commands
+
+```typescript
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  type PromptTemplate,
+} from "@earendil-works/pi-coding-agent";
+
+const customCommand: PromptTemplate = {
+  name: "deploy",
+  description: "Deploy the application",
+  source: "(custom)",
+  content: "# Deploy\n\n1. Build\n2. Test\n3. Deploy",
+};
+
+const loader = new DefaultResourceLoader({
+  promptsOverride: (current) => ({
+    prompts: [...current.prompts, customCommand],
+    diagnostics: current.diagnostics,
+  }),
+});
+await loader.reload();
+
+const { session } = await createAgentSession({ resourceLoader: loader });
+```
+
+> See [examples/sdk/08-prompt-templates.ts](../examples/sdk/08-prompt-templates.ts)
+
+### Session Management
+
+Sessions use a tree structure with `id`/`parentId` linking, enabling in-place branching.
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+// In-memory (no persistence)
+const { session } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(),
+});
+
+// New persistent session
+const { session: persisted } = await createAgentSession({
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+// Continue most recent
+const { session: continued, modelFallbackMessage } = await createAgentSession({
+  sessionManager: SessionManager.continueRecent(process.cwd()),
+});
+if (modelFallbackMessage) {
+  console.log("Note:", modelFallbackMessage);
+}
+
+// Open specific file
+const { session: opened } = await createAgentSession({
+  sessionManager: SessionManager.open("/path/to/session.jsonl"),
+});
+
+// List sessions
+const currentProjectSessions = await SessionManager.list(process.cwd());
+const allSessions = await SessionManager.listAll(process.cwd());
+
+// Session replacement API for /new, /resume, /fork, /clone, and import flows.
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({
+      services,
+      sessionManager,
+      sessionStartEvent,
+    })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+// Replace the active session with a fresh one
+await runtime.newSession();
+
+// Replace the active session with another saved session
+await runtime.switchSession("/path/to/session.jsonl");
+
+// Replace the active session with a fork from a specific user entry
+await runtime.fork("entry-id");
+
+// Clone the active path through a specific entry
+await runtime.fork("entry-id", { position: "at" });
+```
+
+**SessionManager tree API:**
+
+```typescript
+const sm = SessionManager.open("/path/to/session.jsonl");
+
+// Session listing
+const currentProjectSessions = await SessionManager.list(process.cwd());
+const allSessions = await SessionManager.listAll(process.cwd());
+
+// Tree traversal
+const entries = sm.getEntries();        // All entries (excludes header)
+const tree = sm.getTree();              // Full tree structure
+const path = sm.getPath();              // Path from root to current leaf
+const leaf = sm.getLeafEntry();         // Current leaf entry
+const entry = sm.getEntry(id);          // Get entry by ID
+const children = sm.getChildren(id);    // Direct children of entry
+
+// Labels
+const label = sm.getLabel(id);          // Get label for entry
+sm.appendLabelChange(id, "checkpoint"); // Set label
+
+// Branching
+sm.branch(entryId);                     // Move leaf to earlier entry
+sm.branchWithSummary(id, "Summary...");  // Branch with context summary
+sm.createBranchedSession(leafId);       // Extract path to new file
+```
+
+> See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [Session Format](session-format.md)
+
+### Settings Management
+
+```typescript
+import { createAgentSession, SettingsManager, SessionManager } from "@earendil-works/pi-coding-agent";
+
+// Default: loads from files (global + project merged)
+const { session } = await createAgentSession({
+  settingsManager: SettingsManager.create(),
+});
+
+// With overrides
+const settingsManager = SettingsManager.create();
+settingsManager.applyOverrides({
+  compaction: { enabled: false },
+  retry: { enabled: true, maxRetries: 5 },
+});
+const { session } = await createAgentSession({ settingsManager });
+
+// In-memory (no file I/O, for testing)
+const { session } = await createAgentSession({
+  settingsManager: SettingsManager.inMemory({ compaction: { enabled: false } }),
+  sessionManager: SessionManager.inMemory(),
+});
+
+// Custom directories
+const { session } = await createAgentSession({
+  settingsManager: SettingsManager.create("/custom/cwd", "/custom/agent"),
+});
+```
+
+**Static factories:**
+- `SettingsManager.create(cwd?, agentDir?)` - Load from files
+- `SettingsManager.inMemory(settings?)` - No file I/O
+
+**Project-specific settings:**
+
+Settings load from two locations and merge:
+1. Global: `~/.pi/agent/settings.json`
+2. Project: `<cwd>/.pi/settings.json`
+
+Project overrides global. Nested objects merge keys. Setters modify global settings by default.
+
+**Persistence and error handling semantics:**
+
+- Settings getters/setters are synchronous for in-memory state.
+- Setters enqueue persistence writes asynchronously.
+- Call `await settingsManager.flush()` when you need a durability boundary (for example, before process exit or before asserting file contents in tests).
+- `SettingsManager` does not print settings I/O errors. Use `settingsManager.drainErrors()` and report them in your app layer.
+
+> See [examples/sdk/10-settings.ts](../examples/sdk/10-settings.ts)
+
+## ResourceLoader
+
+Use `DefaultResourceLoader` to discover extensions, skills, prompts, themes, and context files.
+
+```typescript
+import {
+  DefaultResourceLoader,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
+
+const loader = new DefaultResourceLoader({
+  cwd,
+  agentDir: getAgentDir(),
+});
+await loader.reload();
+
+const extensions = loader.getExtensions();
+const skills = loader.getSkills();
+const prompts = loader.getPrompts();
+const themes = loader.getThemes();
+const contextFiles = loader.getAgentsFiles().agentsFiles;
+```
+
+## Return Value
+
+`createAgentSession()` returns:
+
+```typescript
+interface CreateAgentSessionResult {
+  // The session
+  session: AgentSession;
+  
+  // Extensions result (for runner setup)
+  extensionsResult: LoadExtensionsResult;
+  
+  // Warning if session model couldn't be restored
+  modelFallbackMessage?: string;
+}
+
+interface LoadExtensionsResult {
+  extensions: Extension[];
+  errors: Array<{ path: string; error: string }>;
+  runtime: ExtensionRuntime;
+}
+```
+
+## Complete Example
+
+```typescript
+import { getModel } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  defineTool,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+
+const modelRuntime = await ModelRuntime.create({
+  authPath: "/custom/agent/auth.json",
+  modelsPath: "/custom/agent/models.json",
+});
+if (process.env.MY_KEY) {
+  await modelRuntime.setRuntimeApiKey("anthropic", process.env.MY_KEY);
+}
+
+// Inline tool
+const statusTool = defineTool({
+  name: "status",
+  label: "Status",
+  description: "Get system status",
+  parameters: Type.Object({}),
+  execute: async () => ({
+    content: [{ type: "text", text: `Uptime: ${process.uptime()}s` }],
+    details: {},
+  }),
+});
+
+const model = getModel("anthropic", "claude-opus-4-5");
+if (!model) throw new Error("Model not found");
+
+// In-memory settings with overrides
+const settingsManager = SettingsManager.inMemory({
+  compaction: { enabled: false },
+  retry: { enabled: true, maxRetries: 2 },
+});
+
+const loader = new DefaultResourceLoader({
+  cwd: process.cwd(),
+  agentDir: "/custom/agent",
+  settingsManager,
+  systemPromptOverride: () => "You are a minimal assistant. Be concise.",
+});
+await loader.reload();
+
+const { session } = await createAgentSession({
+  cwd: process.cwd(),
+  agentDir: "/custom/agent",
+
+  model,
+  thinkingLevel: "off",
+  modelRuntime,
+
+  tools: ["read", "bash", "status"],
+  customTools: [statusTool],
+  resourceLoader: loader,
+
+  sessionManager: SessionManager.inMemory(),
+  settingsManager,
+});
+
+session.subscribe((event) => {
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    process.stdout.write(event.assistantMessageEvent.delta);
+  }
+});
+
+await session.prompt("Get status and list files.");
+```
+
+## Run Modes
+
+The SDK exports run mode utilities for building custom interfaces on top of `createAgentSession()`:
+
+### InteractiveMode
+
+Full TUI interactive mode with editor, chat history, and all built-in commands:
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  InteractiveMode,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+const mode = new InteractiveMode(runtime, {
+  migratedProviders: [],
+  modelFallbackMessage: undefined,
+  initialMessage: "Hello",
+  initialImages: [],
+  initialMessages: [],
+});
+
+await mode.run();
+```
+
+### runPrintMode
+
+Single-shot mode: send prompts, output result, exit:
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  runPrintMode,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+await runPrintMode(runtime, {
+  mode: "text",
+  initialMessage: "Hello",
+  initialImages: [],
+  messages: ["Follow up"],
+});
+```
+
+### runRpcMode
+
+JSON-RPC mode for subprocess integration:
+
+```typescript
+import {
+  type CreateAgentSessionRuntimeFactory,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
+  getAgentDir,
+  runRpcMode,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd });
+  return {
+    ...(await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent })),
+    services,
+    diagnostics: services.diagnostics,
+  };
+};
+const runtime = await createAgentSessionRuntime(createRuntime, {
+  cwd: process.cwd(),
+  agentDir: getAgentDir(),
+  sessionManager: SessionManager.create(process.cwd()),
+});
+
+await runRpcMode(runtime);
+```
+
+See [RPC documentation](rpc.md) for the JSON protocol.
+
+## RPC Mode Alternative
+
+For subprocess-based integration without building with the SDK, use the CLI directly:
+
+```bash
+pi --mode rpc --no-session
+```
+
+See [RPC documentation](rpc.md) for the JSON protocol.
+
+The SDK is preferred when:
+- You want type safety
+- You're in the same Node.js process
+- You need direct access to agent state
+- You want to customize tools/extensions programmatically
+
+RPC mode is preferred when:
+- You're integrating from another language
+- You want process isolation
+- You're building a language-agnostic client
+
+## Exports
+
+The main entry point exports:
+
+```typescript
+// Factory
+createAgentSession
+createAgentSessionRuntime
+AgentSessionRuntime
+
+// Auth and Models
+ModelRuntime // implements pi-ai Models and owns credential storage
+ModelRegistry // synchronous extension compatibility facade
+CredentialSynchronizationError
+resolveCliModel
+resolveModelScopeWithDiagnostics
+
+// Resource loading
+DefaultResourceLoader
+type ResourceLoader
+createEventBus
+
+// Constants and helpers
+CONFIG_DIR_NAME
+defineTool
+getAgentDir
+getPackageDir
+getReadmePath
+getDocsPath
+getExamplesPath
+
+// Session management
+SessionManager
+SettingsManager
+
+// Tool factories
+createCodingTools
+createReadOnlyTools
+createReadTool, createBashTool, createPowerShellTool, createEditTool, createWriteTool
+createGrepTool, createFindTool, createLsTool
+
+// Types
+type CreateAgentSessionOptions
+type CreateAgentSessionResult
+type ExtensionFactory
+type InlineExtension
+type ExtensionAPI
+type ToolDefinition
+type Skill
+type PromptTemplate
+type Tool
+```
+
+For extension types, see [extensions.md](extensions.md) for the full API.
+
+````

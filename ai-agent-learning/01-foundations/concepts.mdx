@@ -1,0 +1,48 @@
+---
+title: "核心概念"
+description: "Token、Context Window、Sampling、Thinking、Usage 和 Stop Reason 的工程含义。"
+---
+
+# 核心概念
+
+## 一次请求的组成
+
+| 概念 | 工程解释 |
+| --- | --- |
+| Token | Provider 计费和窗口限制使用的离散文本单位，不等同于字符或 Java `String.length()`。 |
+| Context Window | 一次请求可处理的输入加输出上限；输入过长和输出过长是不同故障。 |
+| Message | 带 role 和 content 的结构；Pi 还保留图像、thinking、tool call 等块。 |
+| System Prompt | 宿主给模型的最高优先级指令之一；不是全部 Context。 |
+| Sampling | `temperature`、`top_p` 等影响生成分布的选项；并不保证正确性。 |
+| Streaming | 响应尚未完成时按事件增量传回。 |
+| Structured Output | 约束输出为 JSON 或 schema；schema 校验仍应在 Runtime 做。 |
+| Tool Calling | 模型生成工具名和参数的结构化消息。 |
+| Stop Reason | `stop`、`toolUse`、`length`、`error`、`aborted` 等控制流信号。 |
+| Usage | 输入、输出、缓存读写、总 token 和成本；Pi 的 `Usage` 还可带 reasoning。 |
+| Thinking | Provider 可能返回的 reasoning 内容或预算；不能把它当作可依赖的业务结果。 |
+
+## 不要误读 `length`
+
+`length` 只说明响应在某个输出边界停止。它可能是调用者预期的最大输出，也可能是上下文或 Provider 的限制。成熟 Runtime 需要结合“意图中的输出上限”和实际 usage 判断是否做 overflow recovery，而不是看到 `length` 就无限 compaction。
+
+## TypeScript 映射
+
+```typescript
+interface Context {
+  systemPrompt?: string;
+  messages: Message[];
+  tools?: Tool[];
+}
+```
+
+Java 可以把它理解为不可变 DTO，Go 可以理解为含切片的 struct。Pi 在 `packages/ai/src/types.ts` 将 `AssistantMessage`、`ToolCall`、`ToolResultMessage`、`Usage` 和 `AssistantMessageEvent` 分开，Provider 适配器只需实现统一流契约。
+
+## 练习：分类一次返回
+
+观察一个模拟响应，把每个字段归入三类：
+
+1. 模型内容：文本、thinking、tool call。
+2. 控制信号：stop reason、error、deferred。
+3. 账务/诊断：usage、response id、raw stop reason。
+
+如果把 usage 放进聊天文本，或者把 tool call 当成已经执行，后面的设计都会出错。
