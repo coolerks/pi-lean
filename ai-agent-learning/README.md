@@ -1,6 +1,6 @@
 # AI Agent 工程教材
 
-这是一个独立的 Mintlify 文档站，使用当前工作区的 Pi 源码作为案例，并提供 Go、Java 的离线可测试 Agent 实现。它不修改 Pi 原有英文文档、核心业务源码，也不负责 Vercel 部署。
+这是一个独立的 Mintlify 文档站，使用当前工作区的 Pi 源码作为案例，并提供 Go、Java 的离线可测试 Agent 实现。它不修改 Pi 原有英文文档或核心业务源码；生产发布通过关联的 GitHub 仓库触发 Vercel 自动部署。
 
 ## 阅读方式
 
@@ -25,7 +25,15 @@ npx --yes mint@latest broken-links
 npx --yes mint@latest dev
 ```
 
-`mint dev` 默认提供本地预览。不要运行任何 Vercel 部署命令。
+`mint dev` 默认提供本地预览。生产部署通过 GitHub 的 `main` 分支触发，不要从本地直接执行 Vercel CLI 部署，以免绕过仓库集成。
+
+## Vercel 部署
+
+当前 Vercel 项目为 `pi-agent-learning`，关联 GitHub 仓库 `coolerks/pi-lean`，项目根目录为 `ai-agent-learning`。向 `main` 推送后，Vercel 会自动构建并发布文档站。
+
+Vercel 项目设置中的 `Vercel Toolbar → Production` 已关闭。这个开关属于 Vercel 项目设置，不是 Mintlify `docs.json` 或受支持的 `vercel.json` 配置项，因此不要在仓库中添加同名字段伪造配置。
+
+如果页面源码和匿名访问正常，但当前 Chrome 仍显示黑色圆形按钮，它来自本机的 Vercel Chrome 扩展叠加层，不是文档页面内容；需要在扩展或 Toolbar 菜单中关闭当前站点的显示。
 
 ## 运行 Go 示例
 

@@ -13,6 +13,10 @@
 | Java | `21.0.1` |
 | Maven | `Apache Maven 3.9.6` |
 | Mintlify CLI | `4.2.842`；client `0.0.3535`（`npx --yes mint@latest version`） |
+| Vercel project | `pi-agent-learning`；root `ai-agent-learning`；production branch `main` |
+| GitHub integration | `https://github.com/coolerks/pi-lean.git` |
+| Production URL | `https://pi-agent-learning.vercel.app` |
+| Vercel Toolbar | Project Settings 中 `Production: Off` |
 
 ## 文档完整性
 
@@ -45,6 +49,7 @@
 | `cd examples/java-agent && java -jar target/agent-harness-1.0.0.jar --demo` | 通过；输出 final `2 + 3 = 5` |
 | `python3` 导航/manifest/frontmatter/appendix 检查 | 通过；导航 138/138，翻译附录 34/34 byte-equivalent |
 | `npm run check`（根依赖安装后） | 失败：`tsgo --noEmit` 在现有 Pi `packages/ai/src/providers/*.models.ts` 首先报告 JSON manifest 为 `unknown`，随后 `packages/ai/test`、`packages/coding-agent/test` 出现大量 models catalog 类型为 `never`/未知模型错误；未修改 Pi 核心或 `models.generated.ts`，保留该真实失败 |
+| `curl` 生产页面并检查 HTML | 通过；生产页面返回 HTTP 200，HTML 未包含 `vercel.live` Toolbar 注入标记 |
 
 ## 覆盖的测试重点
 
@@ -56,4 +61,4 @@ Go/Java 测试使用 `ScriptedModel` 或本地 HTTP/JSON-RPC fake，不访问收
 - `mint a11y` 只有颜色总体 WARN，不是结构性 MDX 错误；已修复原先 dark color 对暗背景低于 3:1 的 FAIL。
 - Go/Java PermissionPolicy 是教学级路径/命令门，不是生产 sandbox；示例没有把 API key 写入代码。
 - Go/Java 示例组合了可测试 Harness，但没有冒充 `packages/agent/docs/harness.v2.md` 的完整 durable operation ledger、crash recovery 或 exactly-once 外部副作用。
-- 没有执行 Vercel 部署、Git push、PR 或线上资源创建。
+- Vercel production 项目已关联 GitHub `main` 并启用自动部署；Production Toolbar 已关闭。未创建 PR 或其他线上资源。
