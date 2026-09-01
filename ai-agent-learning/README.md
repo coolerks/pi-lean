@@ -33,7 +33,7 @@ npx --yes mint@latest dev
 
 Vercel 项目设置中的 `Vercel Toolbar → Production` 已关闭。这个开关属于 Vercel 项目设置，不是 Mintlify `docs.json` 或受支持的 `vercel.json` 配置项，因此不要在仓库中添加同名字段伪造配置。
 
-如果页面源码和匿名访问正常，但当前 Chrome 仍显示黑色圆形按钮，它来自本机的 Vercel Chrome 扩展叠加层，不是文档页面内容；需要在扩展或 Toolbar 菜单中关闭当前站点的显示。
+黑色圆形按钮实际是 `mint export` 客户端中的 Mintlify Hot Reloader 状态组件，不是 Vercel Toolbar。`style.css` 用稳定的 `role="status"`、`fixed` 和 `z-999` 选择器将它从生产页面隐藏；本地 `mint dev` 仍可显示自己的开发状态。
 
 ## 运行 Go 示例
 
@@ -66,6 +66,7 @@ Java 示例的单元测试同样使用 `ScriptedModel`；真实请求只在显�
 ```text
 ai-agent-learning/
 ├── docs.json                 # Mintlify 当前配置
+├── style.css                 # 隐藏生产静态导出中的 Hot Reloader 状态组件
 ├── index.mdx                 # 课程首页
 ├── PROGRESS.md               # 阶段进度与事实边界
 ├── VALIDATION.md             # 实际验证记录

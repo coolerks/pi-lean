@@ -61,4 +61,5 @@ Go/Java 测试使用 `ScriptedModel` 或本地 HTTP/JSON-RPC fake，不访问收
 - `mint a11y` 只有颜色总体 WARN，不是结构性 MDX 错误；已修复原先 dark color 对暗背景低于 3:1 的 FAIL。
 - Go/Java PermissionPolicy 是教学级路径/命令门，不是生产 sandbox；示例没有把 API key 写入代码。
 - Go/Java 示例组合了可测试 Harness，但没有冒充 `packages/agent/docs/harness.v2.md` 的完整 durable operation ledger、crash recovery 或 exactly-once 外部副作用。
+- 生产页面客户端 DOM 中已确认存在 Mintlify `HotReloader` 状态组件：`body` 直接子节点、`role="status"`、`aria-live="polite"`、`fixed z-999`；`style.css` 针对该组件隐藏它。
 - Vercel production 项目已关联 GitHub `main` 并启用自动部署；Production Toolbar 已关闭。未创建 PR 或其他线上资源。

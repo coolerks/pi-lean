@@ -1,0 +1,8 @@
+/*
+ * `mint export` includes Mintlify's local Hot Reloader status widget in the
+ * client bundle. It is useful during local previews but must not cover the
+ * production documentation on small screens.
+ */
+body > div[role="status"][aria-live="polite"][class~="fixed"][class~="z-999"] {
+  display: none !important;
+}

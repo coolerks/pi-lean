@@ -31,4 +31,4 @@
 - 当前 Coding Agent 的可运行主路径是 `Agent` + `AgentSession` + `SessionManager` + `ExtensionRunner`，不是新的 durable harness。
 - MCP 不在 `pi-ai` / `pi-agent-core` 的默认核心 provider 列表中；教材把 MCP 作为协议和可接入扩展来讲，不假定 Pi Core 内建 MCP。
 - 权限/项目可信度和沙箱能力要以 `packages/coding-agent/docs/security.md`、`src/core/project-trust.ts`、`trust-manager.ts` 及启动配置为准；示例自己的 Permission Layer 只提供教学级路径/命令检查。
-- Vercel production 已关联 GitHub `main` 并启用自动部署；Production Toolbar 已关闭。未创建 PR 或其他线上资源，也未写入 API key。
+- Vercel production 已关联 GitHub `main` 并启用自动部署；Production Toolbar 已关闭。已增加 `style.css` 隐藏 `mint export` 客户端中的 Hot Reloader 状态组件。未创建 PR 或其他线上资源，也未写入 API key。
