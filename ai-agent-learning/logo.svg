@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="logo-title logo-description">
+  <title id="logo-title">AI Agent 小溪</title>
+  <desc id="logo-description">圆角矩形中的流动小溪，代表 AI 的连续信息流。</desc>
+  <defs>
+    <linearGradient id="background" x1="12" y1="8" x2="116" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172554"/>
+      <stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="stream" x1="12" y1="92" x2="116" y2="42" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#A7F3D0"/>
+    </linearGradient>
+    <linearGradient id="highlight" x1="18" y1="88" x2="110" y2="52" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#BAE6FD"/>
+      <stop offset="1" stop-color="#F0FDFA"/>
+    </linearGradient>
+    <clipPath id="rounded-clip">
+      <rect x="4" y="4" width="120" height="120" rx="30"/>
+    </clipPath>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#background)"/>
+
+  <g clip-path="url(#rounded-clip)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-12 94C12 70 28 66 47 78c18 12 29 17 45 4 13-11 22-25 48-19" stroke="#0B4F5A" stroke-width="26" opacity=".65"/>
+    <path d="M-12 88C12 64 28 60 47 72c18 12 29 17 45 4 13-11 22-25 48-19" stroke="url(#stream)" stroke-width="16"/>
+    <path d="M-8 86C15 65 30 63 47 74c17 11 28 14 43 2 13-10 22-22 42-18" stroke="url(#highlight)" stroke-width="3.5" opacity=".9"/>
+    <path d="M10 42c10-7 19-8 29-2M88 91c9-6 17-7 27-3" stroke="#99F6E4" stroke-width="4" opacity=".65"/>
+  </g>
+
+  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="29.25" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="1.5"/>
+</svg>

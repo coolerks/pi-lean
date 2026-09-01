@@ -7,6 +7,11 @@
     "light": "#60A5FA",
     "dark": "#2563EB"
   },
+  "logo": {
+    "light": "/logo.svg",
+    "dark": "/logo.svg",
+    "href": "/"
+  },
   "navigation": {
     "groups": [
       {
