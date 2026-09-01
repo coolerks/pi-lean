@@ -23,6 +23,7 @@
 
 - [x] 对所有原创 MDX 做最终链接、组件、代码块和中文教学内容检查；删除重复的 Go/Java Harness 终稿入口，保留并导航唯一的 stage 15 终稿；将 stage 04 runtime 改为路线总览；Mintlify `validate`、`broken-links`、`a11y` 和本地 dev/curl 已执行。
 - [x] 对 `pi-docs` 的 34 个源文件完成中文技术译文、章节对照、完整原文附录和来源说明；遥测 schema 已逐字段补全；已提交文件绑定固定 commit，工作区未跟踪的 `harness.v2.md` 单独标注；机器清单与 byte-equivalence 34/34 检查通过。
+- [x] 组装并审计 `extensions.mdx`、`rpc.mdx` 和 `sdk.mdx` 的完整正文；代码块、标题、链接和中文正文检查通过，并修复 TUI 翻译遗漏的小节标题。
 - [x] 将 Go/Java/Mintlify 最终命令输出写入 `VALIDATION.md`，清理构建产物；修正插件文档的 `PluginManager.Load/load`、`AgentPlugin.register(ToolRegistry)`、关闭幂等性和 nil registry 边界；根 Pi monorepo `npm run check` 的现有 models catalog 类型错误已如实记录。
 
 ## 事实边界和已知问题

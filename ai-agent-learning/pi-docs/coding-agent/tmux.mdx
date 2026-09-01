@@ -1,239 +1,77 @@
 ---
-title: "tmux 设置"
-description: "Pi TUI 使用 tmux 时的推荐配置和键盘协议。"
+title: "tmux 配置"
+description: "在 tmux 中运行 Pi 时启用可靠的修饰键传递。"
 ---
 
-# tmux 设置
+# tmux 配置
 
-> 本页是 `packages/coding-agent/docs/tmux.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+> 本页根据 `packages/coding-agent/docs/tmux.md` 从英文源文件重新翻译。研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。配置项、快捷键和转义序列保持原样。
 
-## 中文导读
+Pi 可以在 tmux 中运行，但 tmux 默认会去掉某些按键的修饰键信息。没有额外配置时，`Shift+Enter` 和 `Ctrl+Enter` 通常无法与普通 `Enter` 区分。
 
-Pi TUI 使用 tmux 时的推荐配置和键盘协议。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+## 推荐配置
 
-## 中文译文
-
-### 先明确问题：tmux 不是 Pi 的按键配置器
-
-Pi 可以在 tmux 窗格里正常运行，但按键要经过一条链路：键盘 → 终端模拟器 → tmux server/client → Pi 的 TUI 输入解析器 → keybinding action。链路中任何一层丢失修饰键（modifier）信息，Pi 最后看到的就可能只是普通 `Enter`。
-
-例如，用户按下 `Shift+Enter`，期望插入换行；如果终端或 tmux 只转发回车字符 `\\r`，Pi 无法从这个字符判断它原来带过 `Shift`。这不是 keybinding JSON 写错了，而是输入事件在到达 keybinding 层之前已经退化。
-
-<Info>
-
-本文只解决 tmux 转发修饰键的问题。它不改变 Pi 的 action 绑定，也不负责修复终端本身不支持的键盘协议。
-
-</Info>
-
-### 推荐配置：tmux 3.5+
-
-把下面两行加入用户的 `~/.tmux.conf`：
+将以下内容加入 `~/.tmux.conf`：
 
 ```tmux
 set -g extended-keys on
 set -g extended-keys-format csi-u
 ```
 
-第一行打开 tmux 的扩展按键转发；第二行选择 CSI-u 编码。配置文件由 tmux server 读取，所以仅仅保存文件还不一定影响已经运行的 server。
-
-完全重启 tmux：
+然后完整重启 tmux：
 
 ```bash
 tmux kill-server
 tmux
 ```
 
-`tmux kill-server` 会结束该用户下的 tmux server 以及所有 session、window 和 pane。若里面有未保存的交互任务，先确认它们可以被关闭；不要把这条命令当成无副作用的 reload。
+当 Kitty keyboard protocol 不可用时，Pi 会自动请求扩展按键报告。配合 `extended-keys-format csi-u`，tmux 会以 CSI-u 格式转发修饰键，这是最可靠的配置。`extended-keys-format` 选项要求 tmux 3.5 或更新版本。
 
-> 译者注：tmux 的配置作用域容易误解。`~/.tmux.conf` 是 server 启动时读取的配置，而 pane 中运行的 Pi 是 client。重开一个 pane 不一定重开 server，因此“改完配置后新建 pane 仍无效”是常见现象。
+## 为什么推荐 `csi-u`
 
-验证版本和配置：
-
-```bash
-tmux -V
-tmux show-options -g extended-keys
-tmux show-options -g extended-keys-format
-```
-
-预期应看到 tmux 版本至少为 3.5，且两个选项分别为 `on` 和 `csi-u`。如果 `show-options` 报未知选项，先检查实际运行的 tmux，而不是只检查系统中某个安装包的版本。
-
-### Pi 如何参与这条链路
-
-当 Kitty keyboard protocol 不可用时，Pi 会自动请求 extended key reporting。这个请求是应用发送给终端/中间层的协商信号，不是 Pi 自己生成完整按键事件。
-
-tmux 负责把终端传来的修饰键编码转发给 Pi。设置 `extended-keys-format csi-u` 后，tmux 使用 CSI-u 格式；如果只启用 `extended-keys on`，tmux 默认采用 xterm `modifyOtherKeys` 格式。Pi 支持两种格式，但文档推荐 CSI-u。
-
-因此排查时要区分三件事：
-
-1. 终端模拟器是否支持 extended keys。
-2. tmux 是否打开并正确编码 extended keys。
-3. Pi 的 action 是否确实绑定到了你按下的组合键。
-
-只改第三项，无法修复第一、第二项丢失的信息。
-
-### 为什么推荐 `csi-u`
-
-只设置：
+只设置下面这一项时：
 
 ```tmux
 set -g extended-keys on
 ```
 
-tmux 会使用 `extended-keys-format xterm`。当应用请求扩展按键报告时，修饰键会使用 xterm `modifyOtherKeys` 形式，例如：
+tmux 默认使用 `extended-keys-format xterm`。当应用请求扩展按键报告时，修饰键会以 xterm `modifyOtherKeys` 格式转发，例如：
 
-- `Ctrl+C` → `\\x1b[27;5;99~`
-- `Ctrl+D` → `\\x1b[27;5;100~`
-- `Ctrl+Enter` → `\\x1b[27;5;13~`
+- `Ctrl+C` → `\x1b[27;5;99~`
+- `Ctrl+D` → `\x1b[27;5;100~`
+- `Ctrl+Enter` → `\x1b[27;5;13~`
 
-改成 CSI-u 后，同一组按键是：
+使用 `extended-keys-format csi-u` 后，相同按键会转发为：
 
-- `Ctrl+C` → `\\x1b[99;5u`
-- `Ctrl+D` → `\\x1b[100;5u`
-- `Ctrl+Enter` → `\\x1b[13;5u`
+- `Ctrl+C` → `\x1b[99;5u`
+- `Ctrl+D` → `\x1b[100;5u`
+- `Ctrl+Enter` → `\x1b[13;5u`
 
-这里的 `\\x1b` 表示 ESC 字节。它们是终端协议中的转义序列，不是让用户在 shell 里输入的可见字符串。CSI-u 的好处是格式更直接：按键的字符码、修饰键掩码和结尾 `u` 都在同一序列里。
+Pi 同时支持两种格式，但推荐使用 `csi-u`。
 
-> 译者注：不要把“Pi 支持两种格式”理解成“任何 tmux 版本都能正确转发”。Pi 只能解析已经收到的序列；如果旧 tmux 或终端根本没有转发 `Shift`，上层支持再多格式也无法恢复原始意图。
+## 它解决什么问题
 
-### 对照表：普通键与修饰键
+没有 tmux 扩展按键支持时，带修饰键的 Enter 会退化成传统序列：
 
-没有 tmux extended keys 时，修饰版 Enter 可能折叠为旧式序列：
+| 按键 | 没有扩展按键 | 使用 `csi-u` |
+|---|---|---|
+| Enter | `\r` | `\r` |
+| Shift+Enter | `\r` | `\x1b[13;2u` |
+| Ctrl+Enter | `\r` | `\x1b[13;5u` |
+| Alt/Option+Enter | `\x1b\r` | `\x1b[13;3u` |
 
-| 按键 | 未启用 extkeys | 使用 `csi-u` |
-| --- | --- | --- |
-| Enter | `\\r` | `\\r` |
-| Shift+Enter | `\\r` | `\\x1b[13;2u` |
-| Ctrl+Enter | `\\r` | `\\x1b[13;5u` |
-| Alt/Option+Enter | `\\x1b\\r` | `\\x1b[13;3u` |
+这会影响默认按键绑定（`Enter` 提交，`Shift+Enter` 插入换行），也会影响使用修饰键 Enter 的自定义绑定。
 
-这会直接影响默认 keybindings：`Enter` 用来提交，`Shift+Enter` 用来换行。它也会影响你在 keybindings 配置中绑定的 `Ctrl+Enter`、`Alt+Enter` 等自定义 action。
+## 版本要求
 
-一个具体 trace 是：
+- tmux 3.5 或更新版本，才能使用 `extended-keys-format csi-u`（运行 `tmux -V` 检查）。
+- 支持扩展按键的终端模拟器，例如 Ghostty、Kitty、iTerm2、WezTerm、Windows Terminal。
 
-```text
-用户按 Shift+Enter
-  -> 终端生成带 modifier 的按键事件
-  -> tmux 未启用 extkeys，转成 \r
-  -> Pi 输入解析器只看到 Enter
-  -> action 变成 submit，而不是 newLine
-```
-
-启用 CSI-u 后：
-
-```text
-用户按 Shift+Enter
-  -> tmux 转发 \x1b[13;2u
-  -> Pi 解析出 key=Enter、modifier=Shift
-  -> keybinding 命中 newline action
-  -> 编辑器插入换行，不提交 prompt
-```
-
-> 译者注：这也是为什么应在 Pi 内部调试前先做传输层验证。输入事件若在 tmux 层已变成 `\\r`，在 Java Listener 或 Go callback 中只能观察到错误后的普通事件，不能凭业务逻辑“猜回” Shift。
-
-### 版本兼容矩阵
-
-| tmux 版本 | 配置 | 结果 |
-| --- | --- | --- |
-| 3.5 或更高 | `extended-keys on` + `extended-keys-format csi-u` | 推荐；使用 CSI-u |
-| 3.2–3.4 | 只设置 `extended-keys on` | 使用 tmux 默认 xterm 格式，Pi 仍支持 |
-| 更旧版本 | 没有扩展按键选项 | 修饰键可能退化；应升级 tmux |
-
-`extended-keys-format` 选项要求 tmux 3.5 或更新版本。不要把不认识该选项的旧 tmux 配置成 `csi-u`，否则 server 可能拒绝加载配置或忽略后续选项。
-
-### 终端模拟器要求
-
-源文档列出的支持 extended keys 的终端包括 Ghostty、Kitty、iTerm2、WezTerm 和 Windows Terminal。这里的“支持”要同时考虑终端版本、键盘协议设置和远程连接路径。
-
-如果你在本地终端中有效、进入 SSH 后失效，链路可能变成：本地终端 → SSH → 远端 tmux → 远端 Pi。SSH 通常会转发字节，但远端 tmux 版本和 `$TERM` 仍可能不同。不要只在本地运行 `tmux -V`；应在启动 Pi 的同一环境里检查。
-
-> 译者注：`$TERM` 主要描述终端能力，但不是扩展键是否工作的唯一证据。先观察实际序列，再调整 terminfo 或配置；凭 `$TERM` 名称猜测会把终端能力问题和 tmux 配置问题混在一起。
-
-### 可执行实验：确认按键没有被折叠
-
-#### 实验目标
-
-确认 `Shift+Enter`、`Ctrl+Enter` 和 `Alt+Enter` 在 tmux 中仍然与普通 Enter 不同，并把结果映射到 Pi 的 keybinding 行为。
-
-#### 准备
-
-1. 确认正在 Pi 使用的同一个 shell 环境中执行 `tmux -V`。
-2. 备份 `~/.tmux.conf`，尤其是已有的 `extended-keys` 配置。
-3. 确保当前 tmux session 中没有未保存的交互任务，或在另一个测试用户/临时 session 中验证。
-
-#### 步骤
-
-1. 写入推荐的两行配置。
-2. 执行 `tmux kill-server`，再运行 `tmux`。
-3. 重新启动 Pi，并在编辑器中分别按普通 Enter 与 `Shift+Enter`。
-4. 在 Pi 的 keybindings 文档中确认 `Enter` 是 submit、`Shift+Enter` 是 newline。
-5. 临时把某个 action 映射到 `Ctrl+Enter`，观察它是否能单独触发。
-6. 若仍失败，先在不经过 tmux 的终端窗口测试同一按键。
-
-#### 观察点
-
-- 普通 Enter 应提交或触发当前 action。
-- `Shift+Enter` 应插入换行，而不是提交。
-- `Ctrl+Enter` 若未绑定 action，可能没有可见效果；这不代表序列一定没有到达。
-- 不经过 tmux 能工作、经过 tmux 不能工作，说明问题集中在 tmux 配置或版本。
-
-#### 预期结果
-
-启用 CSI-u 后，Pi 能区分修饰版 Enter。tmux 3.2–3.4 虽不能使用 `extended-keys-format csi-u`，但启用 `extended-keys on` 后仍应走 Pi 支持的 xterm 格式。
-
-#### 故障排查表
-
-| 现象 | 优先检查 | 处理 |
-| --- | --- | --- |
-| `unknown option extended-keys-format` | tmux 版本 | 升级到 3.5+，或删除该行并只启用 `extended-keys on` |
-| 配置写了但无变化 | server 未重启 | 执行 `tmux kill-server` 后重新启动 |
-| tmux 外正常、tmux 内失效 | tmux 转发配置 | 检查两个 global options 和终端支持 |
-| 只有 SSH 内失效 | 远端 tmux/终端链路 | 在远端执行版本检查；逐段缩短链路 |
-| 普通 Enter 也不工作 | Pi action 或 TUI 状态 | 先排除 keybinding 覆盖和当前焦点 |
-
-### Go 与 Java 对照
-
-Go 示例把 `context.Context` 用于取消，把 callback 或事件结构交给上层；Java 示例使用 Listener 和 token。两者收到的都是应用层已解析的事件，不负责解码 CSI-u。
-
-如果要自己实现输入边界，可以把 tmux 看成 Transport Adapter：
-
-| 层 | Go/Java 类比 | 责任 |
-| --- | --- | --- |
-| 终端/底层字节 | `io.Reader` / `InputStream` | 产生原始字节 |
-| tmux 转发 | transport adapter | 保留或丢失 modifier 信息 |
-| Pi TUI parser | decoder | 转成 key event |
-| keybinding registry | map/registry | 把 key event 映射到 action |
-| handler | callback/Listener | 修改编辑器或提交请求 |
-
-不要在 handler 中添加“看到 `Enter` 就猜 `Shift+Enter`”的逻辑，因为这个猜测会误触发提交或换行。
-
-### 小结
-
-tmux 只是在 Pi 与终端之间的中间层，却可能决定 TUI 能否知道用户按下了哪个键。推荐使用 tmux 3.5+ 的 `extended-keys on` 和 `csi-u`，修改后完全重启 server；旧版本省略格式选项，使用 Pi 支持的 xterm 格式。排障顺序应是终端支持 → tmux 版本/配置 → 实际转发序列 → Pi keybinding，而不是先修改业务 action。
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| tmux Setup | tmux Setup |
-| Recommended Configuration | Recommended 配置 |
-| Why `csi-u` Is Recommended | Why csi-u Is Recommended |
-| What This Fixes | What This Fixes |
-| Requirements | Requirements |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+使用 tmux 3.2 至 3.4 时，省略 `extended-keys-format csi-u` 即可；Pi 仍支持 tmux 默认的 xterm `modifyOtherKeys` 格式。
 
 ## 完整原文对照
 
-[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/tmux.md)
+[在 GitHub 打开固定 commit 的英文源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/tmux.md)
 
 ````markdown
 # tmux Setup

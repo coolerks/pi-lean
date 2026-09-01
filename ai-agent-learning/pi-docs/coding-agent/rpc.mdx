@@ -1,1318 +1,1620 @@
 ---
-title: "RPC Mode"
-description: "RPC framing、命令、事件、UI 请求、类型和客户端示例。"
+title: "RPC 模式"
+description: "完整说明 RPC 的启动方式、JSONL 协议、命令、事件、扩展 UI 和客户端实现。"
 ---
 
-# RPC Mode
+# RPC 模式
 
-> 本页是 `packages/coding-agent/docs/rpc.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+RPC 模式通过 stdin/stdout 上的 JSON 协议，让 coding agent 以无界面方式运行。这适合将 agent 嵌入其他应用、IDE 或自定义 UI。
 
-## 中文导读
+**Node.js/TypeScript 用户注意：**如果你正在构建 Node.js 应用，可以直接从 `@earendil-works/pi-coding-agent` 使用 `AgentSession`，而不是启动子进程。API 参见 [`src/core/agent-session.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/core/agent-session.ts)。如果要使用基于子进程的 TypeScript 客户端，参见 [`src/modes/rpc/rpc-client.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/rpc/rpc-client.ts)。
 
-RPC Mode 是 Coding Agent 的无界面进程接口：客户端向 `stdin` 写入一条一行 JSON 命令，Pi 向 `stdout` 写出 response 和异步 event。它适合 IDE、自定义 TUI、测试驱动器或其他宿主进程；如果 Node.js 程序与 Agent 在同一进程，优先使用 `AgentSession`，不必为每个调用创建子进程。
-
-## 源码级中文译文
-
-本节按 `rpc.md` 的原文章节顺序翻译。每一节先说明协议事实，再给出客户端实现时需要观察的状态和失败点。示例代码保持原样，命令名、字段名、事件名、路径和 TypeScript 类型不翻译。
-
-### 1. RPC Mode 是什么
-
-RPC Mode 是 Coding Agent 的无界面运行模式。
-
-它通过标准输入接收命令。
-
-它通过标准输出发送 response 和 event。
-
-每个协议记录都是一个 JSON object。
-
-每条记录占一行。
-
-这使它适合 IDE、桌面 UI、测试程序和后端服务嵌入。
-
-它也适合用另一种语言包装 Pi。
-
-但它不是一个通用的模型协议。
-
-它首先是“控制一个 Pi 进程”的应用协议。
-
-Node.js/TypeScript 应用如果可以直接使用 `AgentSession`，通常不必启动子进程。
-
-直接使用 `AgentSession` 可以少经过一层 JSONL framing。
-
-直接使用 `AgentSession` 也可以少处理 stdout/stderr 和进程退出。
-
-子进程 RPC 适合进程隔离、语言隔离和独立升级。
-
-因此选择 RPC 还是 SDK 是部署边界的决定，不是功能高低的决定。
-
-> 译者注：RPC 和 MCP 都可能出现 JSON-RPC 或 JSON，但它们的方向不同。RPC 是宿主控制 Agent；MCP 是 Agent 连接外部工具、资源和 prompt server。把 `pi --mode rpc` 误当成 MCP server，会导致命令方向、生命周期和权限设计全部颠倒。
-
-### 2. 启动参数与进程边界
-
-启动命令是：
+## 启动 RPC 模式
 
 ```bash
 pi --mode rpc [options]
 ```
 
-`--provider <name>` 选择默认 Provider。
+常用选项：
+- `--provider <name>`：设置 LLM provider（anthropic、openai、google 等）。
+- `--model <pattern>`：模型模式或 ID（支持 `provider/id` 和可选的 `:<thinking>`）。
+- `--name <name>` / `-n <name>`：在启动时设置会话显示名称。
+- `--no-session`：禁用会话持久化。
+- `--session-dir <path>`：自定义会话存储目录。
 
-`--model <pattern>` 选择模型或模型模式。
+## 协议总览
 
-模型可以写成 `provider/id`。
+- **命令**：发送到 stdin 的 JSON 对象，每行一个。
+- **响应**：带有 `type: "response"` 的 JSON 对象，用于表示命令成功或失败。
+- **事件**：以 JSON 行的形式流式输出到 stdout 的 Agent 事件。
 
-模型后面可以附加 `:<thinking>`。
+所有命令都支持可选的 `id` 字段，用于关联请求和响应。如果提供了该字段，对应响应会包含相同的 `id`。`bash_execution_update` 事件也会包含其来源 `bash` 命令的 `id`。
 
-`--name <name>` 或 `-n <name>` 设置 session 显示名。
+### 帧格式
 
-`--no-session` 关闭 session 持久化。
+RPC 模式使用严格的 JSONL 语义，只把 LF（`\n`）作为记录分隔符。
 
-`--session-dir <path>` 修改 session 文件所在目录。
+这对客户端很重要：
+- 只能按 `\n` 拆分记录。
+- 输入可以接受可选的 `\r\n`，方法是去掉末尾的 `\r`。
+- 不要使用把 Unicode 分隔符当作换行符的通用行读取器。
 
-客户端启动进程后，应立即分别保存三个句柄。
+特别是，Node 的 `readline` 不符合 RPC 协议，因为它还会按 `U+2028` 和 `U+2029` 拆分；而这两个字符在 JSON 字符串中是有效内容。
 
-`stdin` 用于写入命令。
+## 命令
 
-`stdout` 用于读取协议记录。
+### 提示
 
-`stderr` 用于读取诊断信息。
+#### prompt
 
-stdout 不能混入普通日志。
-
-stdout 不能打印启动 banner。
-
-stdout 不能打印调试 `console.log`。
-
-stdout 不能打印 Python traceback。
-
-任何非 JSON 行都可能使客户端解析失败。
-
-stderr 可以包含诊断信息。
-
-stderr 也应该由宿主持续读取。
-
-如果不读取 stderr，缓冲区写满后子进程可能阻塞。
-
-客户端应监听 stdout 的 `data`、`end` 和 `error`。
-
-客户端应监听 stderr 的 `data` 和 `error`。
-
-客户端还应监听子进程的 `exit`。
-
-进程退出不是一条普通 event。
-
-进程退出意味着后续 response 不会再到达。
-
-仍处于 pending 状态的请求必须结束或标记为未知。
-
-### 3. JSONL framing
-
-RPC 使用严格的 JSONL framing。
-
-记录分隔符是 LF，也就是字节 `0x0A`。
-
-一条 JSON 记录内部可以包含转义后的 `\n`。
-
-字符串里的 `\n` 不是记录边界。
-
-只有真实的 LF 字节才切分记录。
-
-客户端不应按任意 Unicode 行分隔符切分。
-
-`U+2028` 可以合法出现在 JSON 字符串中。
-
-`U+2029` 也可以合法出现在 JSON 字符串中。
-
-Node 的 `readline` 会额外处理这些 Unicode 分隔符。
-
-因此 Node `readline` 不是这个协议的严格 reader。
-
-客户端可以接受输入端的 CRLF。
-
-接受 CRLF 时只去掉一行末尾的 CR。
-
-不要删除 JSON 字符串内部的 CR。
-
-不要把空格或 tab 当作记录边界。
-
-不要按 chunk 边界解析 JSON。
-
-一次 `data` chunk 可能只包含半个 JSON。
-
-一次 `data` chunk 也可能包含多条 JSON。
-
-正确的 reader 必须维护字符串 buffer。
-
-每次收到 bytes 时先用 UTF-8 decoder 解码。
-
-然后在 buffer 中寻找真实 LF。
-
-找到 LF 后取出前面的完整行。
-
-如果该行以 CR 结尾，去掉最后一个 CR。
-
-把剩余内容保留在 buffer 中。
-
-stream `end` 时必须 flush decoder。
-
-如果 flush 后还有非空 buffer，要处理最后一条记录。
-
-协议发送方通常会以 LF 结束每条记录。
-
-健壮客户端仍应处理 EOF 前的残留 buffer。
-
-```text
-chunk 1: {"type":"res
-chunk 2: ponse"}\n{"type":"event"}\n
-```
-
-上面的 chunk 不能按 chunk 1 和 chunk 2 分别调用 JSON.parse。
-
-正确结果是先拼出完整字符串，再按 LF 切出两条记录。
-
-> 译者注：Go 中不要直接假定 `bufio.Scanner` 的默认 token 长度足够。RPC 的大消息、HTML 路径或 widget 可能超过默认限制；可以提高 buffer，或使用 `bufio.Reader.ReadString('\n')`。Java 中 `BufferedReader.readLine()` 能处理 LF/CRLF，但仍要确认它没有把 stdout 的诊断文本混进 JSON parser。
-
-### 4. 请求、响应与 correlation id
-
-命令由客户端写入 stdin。
-
-命令必须是单行 JSON。
-
-response 由 Pi 写入 stdout。
-
-response 的 `type` 是 `response`。
-
-response 的 `command` 表示对应命令。
-
-response 的 `success` 表示命令是否被接受或处理成功。
-
-每条命令可以带可选的 `id`。
-
-如果带了 `id`，response 会复制同一个 id。
-
-客户端可以用 `id` 找到等待中的请求。
-
-不同命令的 id 应保持唯一。
-
-不要把数组下标作为长期 correlation id。
-
-不要仅凭 response 到达顺序匹配请求。
-
-因为 prompt 接受后会异步产生 events。
-
-event 通常没有原始 command id。
-
-`bash_execution_update` 会带发起 bash 的 id（如果命令提供了 id）。
-
-扩展 UI request 有它自己的唯一 id。
-
-工具事件使用 `toolCallId`。
-
-这些 id 属于不同的命名空间。
-
-客户端应为 command id 建立 pending map。
-
-客户端应为 extension UI id 建立 dialog map。
-
-客户端应为 toolCallId 建立工具显示状态。
-
-response 只解决 command 层的接受结果。
-
-event 解决运行时进度和最终状态。
-
-不能用 `success: true` 推断最终答案成功。
-
-`success: true` 可能只表示消息已经排队。
-
-`success: false` 表示命令在接受前就被拒绝。
-
-接受后的 Provider error 不会再产生第二个 response。
-
-接受后的 Tool error 应从 event/message 流观察。
-
-### 5. `prompt` 命令
-
-最小 prompt 命令如下：
+向 agent 发送用户提示。命令响应会在提示被接受、排队或处理后发出。接受之后，事件仍会异步继续流式输出。
 
 ```json
-{"id":"req-1","type":"prompt","message":"Hello, world!"}
+{"id": "req-1", "type": "prompt", "message": "Hello, world!"}
 ```
 
-`type` 必须是 `prompt`。
+带图像：
+```json
+{"type": "prompt", "message": "What's in this image?", "images": [{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}]}
+```
 
-`message` 是用户输入的文本。
-
-`id` 用于关联接受 response。
-
-prompt response 可能在模型完成前到达。
-
-因此 prompt response 不是 final answer。
-
-通常 response 是：
+**流式传输期间：**如果 agent 已经在流式运行，必须指定 `streamingBehavior`，才能将消息排队：
 
 ```json
-{"id":"req-1","type":"response","command":"prompt","success":true}
+{"type": "prompt", "message": "New instruction", "streamingBehavior": "steer"}
 ```
 
-这表示消息已被接受、排队或立即交给处理器。
+- `"steer"`：agent 运行时将消息排队。当前 assistant 回合完成工具调用后、下一次 LLM 调用前，消息会被传递。
+- `"followUp"`：等待 agent 完成。只有 agent 停止时才会传递消息。
 
-如果消息在输入校验阶段失败，success 为 false。
+如果 agent 正在流式运行而没有指定 `streamingBehavior`，命令会返回错误。
 
-如果模型随后返回 429，原 prompt 不会获得第二个 response。
+**扩展命令：**如果消息是扩展命令（例如 `/mycommand`），即使在流式运行期间也会立即执行。扩展命令通过 `pi.sendMessage()` 自行管理 LLM 交互。
 
-客户端必须继续读取 events。
+**输入展开：**Skill 命令（`/skill:name`）和 prompt template（`/template`）会在发送或排队前展开。
 
-客户端必须继续读取 message_end。
+响应：
+```json
+{"id": "req-1", "type": "response", "command": "prompt", "success": true}
+```
 
-客户端应把 `agent_settled` 作为一次完整工作的结束候选。
+`success: true` 表示提示已被接受、排队或立即处理。`success: false` 表示提示在接受前被拒绝。接受后的失败会通过正常的事件和消息流报告，不会针对同一个请求 id 再发送第二个 `response`。
 
-如果只等待 prompt response，客户端会过早显示 idle。
+`images` 字段是可选的。每张图片使用 `ImageContent` 格式：`{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}`。
 
-prompt 可以携带图片。
+#### steer
 
-图片使用 `ImageContent` 格式。
+在 agent 运行时将 steering message 排队。当前 assistant 回合完成工具调用后、下一次 LLM 调用前，消息会被传递。Skill 命令和 prompt template 会展开。不允许使用扩展命令（请改用 `prompt`）。
 
-图片的 `data` 是 base64 文本。
+```json
+{"type": "steer", "message": "Stop and do this instead"}
+```
 
-图片的 `mimeType` 描述媒体类型。
+带图像：
+```json
+{"type": "steer", "message": "Look at this instead", "images": [{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}]}
+```
 
-图像会增加上下文和请求成本。
+`images` 字段是可选的。每张图片使用 `ImageContent` 格式（与 `prompt` 相同）。
 
-客户端应限制图片大小。
+响应：
+```json
+{"type": "response", "command": "steer", "success": true}
+```
 
-客户端不应把未经授权的本地文件自动编码上传。
+参见 [set_steering_mode](#set_steering_mode)，了解如何控制 steering message 的处理方式。
 
-### 6. streamingBehavior、steer 与 follow_up
+#### follow_up
 
-Agent 正在 streaming 时再次发送 prompt，需要声明 `streamingBehavior`。
+将 follow-up message 排队，以便在 agent 完成后处理。只有 agent 不再有工具调用或 steering message 时才会传递。Skill 命令和 prompt template 会展开。不允许使用扩展命令（请改用 `prompt`）。
 
-`streamingBehavior: "steer"` 把消息放入 steering queue。
+```json
+{"type": "follow_up", "message": "After you're done, also do this"}
+```
 
-steer 在当前 assistant turn 的 Tool batch 完成后交付。
+带图像：
+```json
+{"type": "follow_up", "message": "Also check this image", "images": [{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}]}
+```
 
-交付发生在下一次 LLM request 之前。
+`images` 字段是可选的。每张图片使用 `ImageContent` 格式（与 `prompt` 相同）。
 
-它适合“停止做 X，改做 Y”这类纠偏。
+响应：
+```json
+{"type": "response", "command": "follow_up", "success": true}
+```
 
-`streamingBehavior: "followUp"` 把消息放入 follow-up queue。
+参见 [set_follow_up_mode](#set_follow_up_mode)，了解如何控制 follow-up message 的处理方式。
 
-follow-up 要等当前工作自然结束。
+#### abort
 
-它适合“完成后再检查文档”这类追加任务。
+中止当前 agent 操作。
 
-不提供 streamingBehavior 时，正在运行的 Agent 会拒绝普通 prompt。
+```json
+{"type": "abort"}
+```
 
-`steer` 命令本身只适用于 active run。
+响应：
+```json
+{"type": "response", "command": "abort", "success": true}
+```
 
-`follow_up` 命令表示完成后追加。
+#### clear_queue
 
-两者都可以带图片。
+移除排队中的 steering 和 follow-up message，并返回它们的文本。
 
-两者都不允许直接执行 Extension command。
+```json
+{"type": "clear_queue"}
+```
 
-Skill 命令会在发送或排队前展开。
+响应：
+```json
+{
+  "type": "response",
+  "command": "clear_queue",
+  "success": true,
+  "data": {
+    "steering": ["Change direction"],
+    "followUp": ["Summarize when finished"]
+  }
+}
+```
 
-Prompt template 也会在发送或排队前展开。
+要实现交互式 Escape 行为，请先发送 `clear_queue`，再发送 `abort`，然后在客户端编辑器中恢复返回的文本。如果会话中仍有排队消息，`abort` 会继续处理它们。
 
-Extension command 通过 `prompt` 发送时可能立即处理。
+#### new_session
 
-Extension command 的 LLM 工作由 Extension 自己管理。
-
-队列不是把文本插进当前正在发送的 HTTP body。
-
-队列消息要在安全的 turn boundary 注入。
-
-这样可以保持 provider message 顺序。
-
-这样也可以避免同时修改正在遍历的数组。
-
-### 7. abort、clear_queue 与 new_session
-
-`abort` 取消当前 Agent operation。
-
-它不是一条新的用户消息。
-
-它也不是强制杀死远端 HTTP server 的保证。
-
-Provider 是否停止远端请求取决于 transport。
-
-已发生的外部副作用不能因为 abort 就自动回滚。
-
-`clear_queue` 移除 steering 和 follow-up。
-
-clear_queue 的 data 会返回被移除的文本。
-
-交互式 Esc 可以先 clear_queue。
-
-客户端可以把返回文本放回编辑器。
-
-然后客户端再发送 abort。
-
-如果直接 abort，已经排队的消息可能继续处理。
-
-这正是 TUI 需要区分“取消当前动作”和“清空待处理输入”的原因。
-
-`new_session` 创建或切换到新 session。
-
-可选 `parentSession` 用于保存父 session 关联。
-
-Extension 可以通过 `session_before_switch` 取消切换。
-
-被取消时 response 仍可能 success 为 true。
-
-此时 `data.cancelled` 为 true。
-
-success 表示 command 被处理。
-
-cancelled 表示业务动作没有发生。
-
-客户端必须同时读取这两个字段。
-
-### 8. state、messages、model 与 thinking
-
-`get_state` 读取当前运行状态。
-
-`model` 是完整 Model 对象或 null。
-
-`thinkingLevel` 是当前 reasoning level。
-
-`isStreaming` 表示是否正在处理 Agent 流。
-
-`isCompacting` 表示是否正在做 context compaction。
-
-`steeringMode` 描述 steering 一次消费一条还是全部。
-
-`followUpMode` 描述 follow-up 的消费策略。
-
-`sessionFile` 是当前 session 文件路径。
-
-`sessionId` 是当前 session 标识。
-
-`sessionName` 是可选显示名。
-
-`autoCompactionEnabled` 表示是否自动压缩。
-
-`messageCount` 是当前消息投影的数量。
-
-`pendingMessageCount` 是队列中待处理消息数量。
-
-`get_messages` 返回当前对话消息。
-
-它不是 append-only session tree 的完整快照。
-
-它可能不包含 abandoned branch。
-
-它也不能替代 `get_entries` 的 durable cursor。
-
-`set_model` 用 provider 和 modelId 切换模型。
-
-成功 response 的 data 是完整 Model。
-
-`cycle_model` 选择下一个可用模型。
-
-只有一个可用模型时 data 可能为 null。
-
-`get_available_models` 返回所有配置模型。
-
-模型信息可能包含 contextWindow 和 cost。
-
-客户端不要只显示 name 而丢掉 provider/id。
-
-因为不同 Provider 可能有同名模型。
-
-`set_thinking_level` 支持 off、minimal、low、medium、high、xhigh、max。
-
-xhigh 和 max 必须由当前模型能力决定。
-
-不支持 reasoning 的模型通常只有 off。
-
-`cycle_thinking_level` 在可用 level 中循环。
-
-### 9. queue modes
-
-`set_steering_mode` 控制 steering 消费方式。
-
-`all` 在当前 turn 完成后一次交付全部 steering。
-
-`one-at-a-time` 每个完成的 assistant turn 交付一条。
-
-默认是 `one-at-a-time`。
-
-`set_follow_up_mode` 控制 follow-up 消费方式。
-
-`all` 在 Agent 完成时交付全部 follow-up。
-
-`one-at-a-time` 每次完成只交付一条。
-
-默认同样是 `one-at-a-time`。
-
-queue mode 不改变消息的含义。
-
-queue mode 也不等于 abort。
-
-客户端应把 mode 持久化在自己的 UI 状态中。
-
-如果用户修改 mode，下一次 get_state 应重新读取。
-
-### 10. compact、retry 与 context overflow
-
-`compact` 手动减少当前 context 的 token 压力。
-
-它可以带 `customInstructions`。
-
-返回值包含 summary。
-
-返回值包含 `firstKeptEntryId`。
-
-返回值包含 tokensBefore。
-
-返回值包含 estimatedTokensAfter。
-
-返回值可能包含生成 summary 的 usage。
-
-estimatedTokensAfter 是 heuristic。
-
-它不是 Provider 精确 tokenizer 的承诺。
-
-不同 Provider 的 token 计数可能不同。
-
-自定义 compaction handler 可能省略 usage。
-
-`set_auto_compaction` 开关控制接近上限时的自动压缩。
-
-overflow compaction 成功后通常会设置 `willRetry: true`。
-
-这意味着 Pi 会有限度地重试原 prompt。
-
-compaction 被 abort 时 result 为 null 且 aborted 为 true。
-
-compaction 失败时 result 为 null 且 errorMessage 提供原因。
-
-`set_auto_retry` 控制 transient error 的自动重试。
-
-常见 transient error 是 overloaded、rate limit 和 5xx。
-
-`abort_retry` 取消等待中的 delay。
-
-它也阻止后续 retry attempt。
-
-retry attempt 不是新的用户输入。
-
-retry 可能产生新的 usage 和成本。
-
-客户端显示 retry 时应显示 attempt/maxAttempts。
-
-### 11. `bash` 与 stdout/stderr
-
-`bash` 是直接 RPC command。
-
-它不是模型返回的 Tool Call。
-
-它立即在当前 cwd 执行 shell command。
-
-请求可以带 command id。
-
-输出通过 `bash_execution_update` events 流出。
-
-最终 response 包含 output。
-
-最终 response 包含 exitCode。
-
-最终 response 包含 cancelled。
-
-最终 response 包含 truncated。
-
-如果输出被截断，可能包含 fullOutputPath。
-
-流式 event 的 chunk 仍可能覆盖整个执行期间的输出。
-
-`bash` 的 stdout/stderr 由 Pi 合并或按实现转换为结果。
-
-外层 RPC 的 stdout 仍只允许 JSONL。
-
-shell 命令产生的文字不能直接写入外层 stdout。
-
-这就是“被执行命令的 stdout”和“RPC server 的 stdout”必须分开的原因。
-
-直接 bash 的结果先形成 `BashExecutionMessage`。
-
-它不会在 bash response 发出时自动成为下一次 LLM 的消息。
-
-下一次 prompt 构建 context 时才会投影它。
-
-投影形式包含 `Ran \`command\`` 和 fenced output。
-
-多个 bash 可以先后执行。
-
-后续 prompt 会一次看到这些 bash 结果。
-
-`abort_bash` 只取消正在运行的直接 bash。
-
-它不等同于 `abort` 当前 Agent operation。
-
-> 译者注：这是最容易踩坑的两个 stdout。协议 stdout 是机器接口，shell stdout 是业务数据。Go/Java client 必须只从 Pi 的 stdout 解析 JSON；如果你自己启动 MCP 或 shell server，也应为其 stdout 建立独立 pipe，不能把两个进程的输出拼在一起。
-
-### 12. session、stats、fork 与 tree
-
-`get_session_stats` 返回 session 级统计。
-
-统计包括 userMessages。
-
-统计包括 assistantMessages。
-
-统计包括 toolCalls 和 toolResults。
-
-统计包括 tokens。
-
-统计包括 cost。
-
-统计包括 contextUsage。
-
-Tool 内部的 LLM 工作可能进入统计。
-
-compaction 和 branch summary 的 usage 也可能进入统计。
-
-刚完成 compaction 时 tokens/percent 可能是 null。
-
-因为新的 assistant usage 还没有产生。
-
-`export_html` 把 session 导出成 HTML。
-
-默认路径由 Pi 决定。
-
-也可以传入 outputPath。
-
-`switch_session` 载入另一个 JSONL session。
-
-它可能被 `session_before_switch` 取消。
-
-`fork` 从 active branch 的 user entry 创建新分支。
-
-它返回被 fork 的原文本。
-
-`clone` 把当前 branch 复制到新 session。
-
-`get_fork_messages` 返回可供 fork 的 user messages。
-
-`get_entries` 按 append 顺序读取 entry。
-
-它不包含 session header。
-
-它包含 compaction 前历史。
-
-它包含 abandoned branch。
-
-`since` 是 entry id cursor。
-
-正确的 cursor 可以跨客户端重启使用。
-
-找不到 since 时 response 为失败。
-
-`leafId` 表示当前活动叶子。
-
-空 session 的 leafId 为 null。
-
-`get_tree` 返回 entry、children、label 和 labelTimestamp。
-
-parent chain 断裂的 entry 也会作为 root 出现。
-
-`get_last_assistant_text` 没有 assistant 时返回 text null。
-
-`set_session_name` 修改当前显示名。
-
-启动时也可以用 `--name` 设置初始名称。
-
-### 13. commands、skills 与 prompt templates
-
-`get_commands` 返回可用的 extension commands。
-
-它也返回 prompt templates。
-
-它还返回 skills。
-
-extension command 的 source 是 `extension`。
-
-prompt template 的 source 是 `prompt`。
-
-skill 的 source 是 `skill`。
-
-skill 名称通常带 `skill:` 前缀。
-
-location 可以是 user。
-
-location 可以是 project。
-
-location 也可以来自显式 path。
-
-path 可能是绝对路径。
-
-客户端应把 path 当作提示信息，不应无条件读取或执行。
-
-`/settings`、`/hotkeys` 等 TUI 内建命令不会出现在列表中。
-
-它们依赖交互式 TUI。
-
-RPC 客户端可以把 get_commands 结果渲染成自己的 palette。
-
-调用时仍应通过 prompt 发送正确的 `/name`。
-
-### 14. events 总体模型
-
-events 是 Agent operation 的观察流。
-
-它们以 JSONL 写入 stdout。
-
-event 通常不带原始 prompt id。
-
-客户端必须用事件字段和本地状态进行关联。
-
-`agent_start` 表示低层 Agent run 开始。
-
-`agent_end` 表示一个低层 run 结束。
-
-`agent_end` 后仍可能发生 retry。
-
-`agent_end` 后仍可能发生 compaction retry。
-
-`agent_end` 后仍可能处理 queued continuation。
-
-`agent_settled` 表示 session 级工作真正稳定。
-
-UI busy 状态更适合等待 agent_settled。
-
-`turn_start` 开始一个 assistant turn。
-
-`turn_end` 结束该 turn。
-
-一个 turn 可能包含多个 Tool result。
-
-`message_start` 和 `message_end` 包围一条消息。
-
-`message_end.message` 是最终权威消息。
-
-### 15. message_update 与流式拼装
-
-`message_update` 提供增量事件。
-
-它不是完整的累计 message 快照。
-
-`usage` 是最新累计 usage。
-
-有些 Provider 直到结束才报告 usage。
-
-因此流中 usage 可能暂时是零。
-
-`text_start` 表示文本 block 开始。
-
-`text_delta` 表示文本片段。
-
-`text_end` 表示文本 block 结束。
-
-`thinking_start` 表示 thinking block 开始。
-
-`thinking_delta` 表示 thinking 片段。
-
-`thinking_end` 表示 thinking block 结束。
-
-`toolcall_start` 提供 id 和 toolName。
-
-`toolcall_delta` 提供参数片段。
-
-`toolcall_end` 提供完整 toolCall。
-
-客户端应按 contentIndex 保存多个 block。
-
-不能把不同 contentIndex 的 delta 拼在一起。
-
-工具参数通常需要把多个字符串片段连接起来。
-
-连接后还要解析 JSON。
-
-解析前不能执行工具。
-
-`message_update` 不再保证旧的 partial 字段存在。
-
-客户端应从 message_start 加 delta 自己构建展示状态。
-
-完成时用 message_end 覆盖本地 partial。
-
-### 16. 工具 events 与队列 events
-
-`bash_execution_update` 关联直接 bash command。
-
-它的 id 复制命令 id。
-
-`tool_execution_start` 表示 LLM Tool 开始。
-
-`tool_execution_update` 表示工具的累计 partial result。
-
-`tool_execution_end` 表示工具完成。
-
-工具 event 使用 `toolCallId` 关联。
-
-`partialResult` 是累计值，不只是本次 delta。
-
-UI 可以直接用最新 partialResult 替换旧显示。
-
-不要把累计结果重复追加，否则界面会重复文本。
-
-`queue_update` 表示 pending steering/follow-up 变化。
-
-它不是 message_end。
-
-它也不是 durable session tree 的完整记录。
-
-`compaction_start` 携带 manual、threshold 或 overflow reason。
-
-`compaction_end` 携带 result、aborted 和 willRetry。
-
-`auto_retry_start` 携带 attempt、delayMs 和错误。
-
-`auto_retry_end` 表示 retry 成功或最终失败。
-
-摘要 retry 有三个独立事件。
-
-`extension_error` 记录 extensionPath、event 和 error。
-
-客户端遇到未知 event type 时应保留原始 JSON。
-
-这样新版本增加 event 时旧客户端仍可诊断。
-
-### 17. Extension UI 子协议
-
-Extension UI 是建立在 RPC 基础流之上的第二层协议。
-
-dialog 方法会暂停 Extension，等待 response。
-
-fire-and-forget 方法只发送 request，不等待 response。
-
-所有 UI request 都有 `type: "extension_ui_request"`。
-
-所有 UI request 都有唯一 id。
-
-所有 UI request 都有 method。
-
-`select` 请求包含 title 和 options。
-
-客户端返回 value 或 cancelled。
-
-`confirm` 请求包含 title 和 message。
-
-客户端返回 confirmed 或 cancelled。
-
-`input` 请求要求自由文本。
-
-客户端返回 value 或 cancelled。
-
-`editor` 请求可以携带 prefill。
-
-返回值是编辑后的多行文本。
-
-`notify` 是无需响应的通知。
-
-`notifyType` 可以是 info、warning 或 error。
-
-`setStatus` 使用 statusKey 更新状态。
-
-省略 statusText 可以清除状态。
-
-`setWidget` 使用 widgetKey 和 widgetLines。
-
-widgetPlacement 可以是 aboveEditor 或 belowEditor。
-
-RPC 只支持字符串数组 widget。
-
-component factory 不会在 RPC 中执行。
-
-`setTitle` 修改 terminal title。
-
-`set_editor_text` 修改输入编辑器文本。
-
-dialog 的 id 必须精确匹配。
-
-错误 id 不应被接受为当前 dialog 的回答。
-
-超时由 Agent 端自动解决。
-
-客户端不需要另起 timer 模拟 Agent timeout。
-
-RPC 中 `ctx.mode` 是 `rpc`。
-
-RPC 中 `ctx.hasUI` 是 true。
-
-这不表示存在真实 TUI。
-
-`custom()` 返回 undefined。
-
-working indicator、footer、header 等 TUI 专属方法是 no-op。
-
-`getEditorText()` 返回空字符串。
-
-`getToolsExpanded()` 返回 false。
-
-`getAllThemes()` 返回空数组。
-
-`getTheme()` 返回 undefined。
-
-`setTheme()` 返回失败结果。
-
-需要真实 TUI 组件时应检查 `ctx.mode === "tui"`。
-
-> 译者注：`hasUI: true` 在这里的意思是“对话框协议可用”，不是“可以安全调用所有 TUI API”。Java 客户端应把 UI request 当成异步 RPC，并用 `CompletableFuture`/Future 按 id 保存等待者；Go 客户端可以用 channel 或 callback 分发 response。fire-and-forget 不应误发送 response。
-
-### 18. 错误、取消和进程退出
-
-命令未被接受时返回 `success: false`。
-
-未知 command 是输入错误。
-
-缺少必填字段是输入错误。
-
-model 不存在是业务校验错误。
-
-JSON 解析失败会返回 parse error。
-
-解析失败不应使客户端继续猜测字段。
-
-接受后的模型错误通过正常 event/message 流发送。
-
-接受后的 tool error 也通过正常流发送。
-
-compaction 失败通过 compaction event 体现。
-
-retry 耗尽通过 auto_retry_end 体现。
-
-abort 是一种终止原因。
-
-客户端必须区分 rejected 和 failed。
-
-rejected 表示没有创建工作。
-
-failed 表示工作已接受但执行失败。
-
-abort 不保证远端计费停止。
-
-abort_bash 不保证已经启动的子进程回滚。
-
-session corrupted 时客户端应保留错误并停止自动写入。
-
-EOF 表示 Pi 进程已离开协议循环。
-
-进程 exit code 需要和最后一个 event 一起判断。
-
-stdout 解析失败时应记录原始行，但注意脱敏。
-
-stderr 不应被当作协议 response。
-
-API key、Authorization 和工具参数不应无条件写日志。
-
-### 19. Types 的中文解释
-
-`Model` 是模型能力和计费 metadata 的 JSON 投影。
-
-它包含 id、name、api 和 provider。
-
-它可以包含 reasoning。
-
-它可以包含 input 能力。
-
-它可以包含 contextWindow 和 maxTokens。
-
-它可以包含 cost。
-
-`UserMessage` 表示用户消息。
-
-它可以是字符串 content。
-
-它也可以是 TextContent/ImageContent block 数组。
-
-`AssistantMessage` 可以包含 text。
-
-它可以包含 thinking。
-
-它可以包含 toolCall。
-
-它还包含 api、provider 和 model。
-
-usage 与 stopReason 需要单独处理。
-
-`stop` 表示自然结束。
-
-`length` 表示达到输出长度上限。
-
-`toolUse` 表示产生了工具调用。
-
-`error` 表示模型处理失败。
-
-`aborted` 表示被取消。
-
-`ToolResultMessage` 必须用 toolCallId 配对。
-
-它还应保留 toolName。
-
-isError 表示工具结果是否失败。
-
-nested usage 表示工具内部做过 LLM 工作。
-
-`BashExecutionMessage` 只由直接 bash command 创建。
-
-它不是模型生成的 ToolResultMessage。
-
-`Attachment` 保存图像及其提取信息。
-
-base64 数据可能很大，客户端应避免无意复制多份。
-
-### 20. Python client 逐行解释
-
-Python 示例使用 `subprocess.Popen` 启动 RPC 子进程。
-
-`stdin=subprocess.PIPE` 让客户端发送命令。
-
-`stdout=subprocess.PIPE` 让客户端读取 JSONL。
-
-`text=True` 让 Python 以文本流处理。
-
-生产代码仍应明确 UTF-8 编码策略。
-
-`send(cmd)` 使用 `json.dumps` 序列化命令。
-
-末尾加真实换行。
-
-调用 flush 让命令及时进入子进程。
-
-`read_events()` 逐行读取 stdout。
-
-每行调用 `json.loads`。
-
-坏行应捕获 JSONDecodeError。
-
-不能让一个坏 event 使整个进程无提示退出。
-
-示例监听 `message_update`。
-
-它取出 `assistantMessageEvent`。
-
-它只输出 text_delta。
-
-thinking 和 toolcall 应由更完整的 UI 另行处理。
-
-示例用 agent_end 结束循环。
-
-严谨客户端应等待 agent_settled。
-
-客户端还应开线程或异步任务读取 stderr。
-
-收到 EOF 时应结束所有 pending promise。
-
-### 21. Node.js client 逐步解释
-
-Node 示例用 `spawn` 启动 Pi。
-
-`StringDecoder("utf8")` 防止多字节字符跨 chunk 被拆坏。
-
-不能对每个 Buffer 直接调用 `toString` 后简单拼接未完成字符。
-
-`buffer` 保存尚未切出的文本。
-
-reader 只寻找 `\n`。
-
-找到后切出一行。
-
-去掉末尾 `\r` 以兼容 CRLF。
-
-`end` 时调用 decoder.end。
-
-最后残留内容也要交给 onLine。
-
-解析出的 JSON 可能是 response 或 event。
-
-二者都必须依据 `type` 分流。
-
-`message_update` 的 text_delta 可以立即渲染。
-
-`SIGINT` 时发送 abort 是友好取消。
-
-直接 `agent.kill()` 可能丢失末尾 event。
-
-kill 仍是超时后的兜底措施。
-
-stdin 写入后应保存 pending command id。
-
-UI request response 要使用另一个 id map。
-
-子进程退出后不能永久等待没有 response 的 request。
-
-> 译者注：Java 的 `ProcessBuilder` 对应 Node `spawn`，`BufferedReader` 对应严格 JSONL reader，Jackson 对应 `JSON.parse`，`ExecutorService`/Future 对应异步读取和取消；Java `HttpClient` 适合模型或远端 RPC 的 HTTP transport，但不能替代本地进程的 stdin/stdout pipe。Go 的 `exec.Cmd`、`StdoutPipe`、`bufio.Reader` 和 `encoding/json` 也能实现同一边界，需要自己定义 id map、EOF 和 context cancellation 语义。
-
-### 22. RPC 与 MCP 的最终辨析
-
-RPC 的 client 是宿主应用。
-
-RPC 的 server 是 Pi coding agent 进程。
-
-RPC 命令控制 prompt、model、session、bash 和 UI。
-
-RPC event 描述 Pi 的运行过程。
-
-MCP 的 client 通常属于 Agent Runtime。
-
-MCP 的 server 提供工具、资源或 prompt。
-
-MCP 的典型方法包括 initialize。
-
-MCP 还包括 tools/list。
-
-MCP 还包括 tools/call。
-
-MCP 可能使用 stdio。
-
-MCP 也可能使用 HTTP transport。
-
-RPC 的 prompt 方向是 client 到 Agent。
-
-MCP 的 tools/call 方向是 Agent 到外部 server。
-
-RPC 的 event 是 Agent 到 client。
-
-MCP server 的 response 是对 MCP request 的回应。
-
-RPC 的 session 是 Pi 对话状态。
-
-MCP 的 session/connection 是协议能力协商状态。
-
-二者的权限主体也不同。
-
-RPC client 可能获得 bash 和 session 控制能力。
-
-MCP server 只应获得明确注册的工具能力。
-
-不要把 RPC stdout 当成 MCP transport。
-
-不要把 `extension_ui_request` 当成 MCP request。
-
-不要把 `tool_execution_start` 当成 JSON-RPC response。
-
-### 23. 一个完整请求 trace
-
-用户在 UI 中输入“检查测试并修复失败”。
-
-客户端创建 command id `req-7`。
-
-客户端写入一行 prompt JSON。
-
-Pi 解析这一行。
-
-Pi 校验 model、session 和 streaming state。
-
-Pi 返回 success response。
-
-此时请求已接受，但还没有 final。
-
-Pi 发出 agent_start。
-
-Pi 发出 turn_start。
-
-Provider stream 产生 message_start。
-
-Provider stream 产生 message_update。
-
-模型产生 toolcall_start。
-
-模型产生 toolcall_delta。
-
-模型产生 toolcall_end。
-
-Pi 发出 message_end。
-
-Pi 发出 tool_execution_start。
-
-Tool 执行 read 或 bash。
-
-Pi 发出 tool_execution_update。
-
-Pi 发出 tool_execution_end。
-
-Pi 发出 turn_end。
-
-如果队列为空，Pi 进入下一轮。
-
-如果有 steering，Pi 先发 queue_update 并注入它。
-
-如果 context 超限，Pi 发出 compaction_start。
-
-compaction 完成后发 compaction_end。
-
-需要重试时继续发 auto retry events。
-
-最终 assistant message 发出 message_end。
-
-低层 run 发出 agent_end。
-
-如果还有自动 continuation，不应立即宣布 idle。
-
-全部工作结束后发 agent_settled。
-
-客户端用本地状态机展示完成。
-
-客户端用 response id 记录“接受”。
-
-客户端用 event 记录“进展”。
-
-客户端用 agent_settled 记录“稳定结束”。
-
-### 24. 客户端实现检查清单
-
-先实现一个严格的 LF reader。
-
-再实现 JSON parse 和未知 event 保留。
-
-再实现 command id pending map。
-
-再实现 response 与 event 分流。
-
-再实现 message_update partial assembler。
-
-再实现 toolCallId 的工具显示。
-
-再实现 extension UI dialog map。
-
-再实现 EOF 和 exit code 处理。
-
-再实现 stderr 独立消费。
-
-再实现 abort 超时兜底。
-
-再实现 session cursor 和 get_entries。
-
-再实现重连前的 session 恢复策略。
-
-不要把一次成功 response 当作 final answer。
-
-不要把 stdout 的 shell 输出当作协议记录。
-
-不要使用 `readline` 代替严格 LF reader。
-
-不要在没有权限策略时暴露任意 bash。
-
-不要把 RPC client 当成 MCP client。
-
-不要把事件顺序当成跨重启的 durable log。
-
-先用 `--no-session` 做协议单元测试。
-
-再加入 session、fork、compaction 和 retry 测试。
-
-测试空行、CRLF、Unicode 分隔符和半包 JSON。
-
-测试 command rejection、accepted failure 和 EOF。
-
-测试 UI response id 错配。
-
-测试 bash output truncation。
-
-测试 abort 与 agent_settled 的先后关系。
-
-### 25. 小结
-
-RPC 的最小单位是一行 JSON。
-
-stdin 是命令入口。
-
-stdout 是协议出口。
-
-stderr 是诊断出口。
-
-response 说明命令层是否接受。
-
-event 说明运行时发生了什么。
-
-message_end 是消息完成边界。
-
-agent_settled 是 session 级稳定边界。
-
-id 负责相关性。
-
-toolCallId 负责工具相关性。
-
-UI request id 负责对话框相关性。
-
-steer 和 follow_up 是不同队列。
-
-abort、abort_retry、abort_bash 是不同取消层级。
-
-Session tree 和 message projection 不是同一个视图。
-
-Compaction 改变 context 投影，不等于删除全部历史。
-
-RPC 和 MCP 解决不同的连接问题。
-
-Go 和 Java 都能从标准库实现客户端。
-
-但客户端必须把 framing、取消、错误和安全边界写清楚。
-
-这才是一个可维护的 Agent RPC 集成，而不是“启动进程然后读几行文本”。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| RPC Mode | RPC Mode |
-| Starting RPC Mode | Starting RPC Mode |
-| Protocol Overview | Protocol 概览 |
-| Framing | Framing |
-| Commands | Commands |
-| Prompting | Prompting |
-| State | State |
-| Model | Model |
-| Thinking | Thinking |
-| Queue Modes | Queue Modes |
-| Compaction | Compaction |
-| Retry | Retry |
-| Bash | Bash |
-| Session | Session |
-| Commands | Commands |
-| Events | 事件 |
-| Event Types | Event Types |
-| agent_start | agent_start |
-| agent_end | agent_end |
-| agent_settled | agent_settled |
-| turn_start / turn_end | turn_start / turn_end |
-| message_start / message_end | message_start / message_end |
-| message_update (Streaming) | message_update (Streaming) |
-| bash_execution_update | bash_execution_update |
-| tool_execution_start / tool_execution_update / tool_execution_end | tool_execution_start / tool_execution_update / tool_execution_end |
-| queue_update | queue_update |
-| compaction_start / compaction_end | Compaction_start / compaction_end |
-| auto_retry_start / auto_retry_end | auto_retry_start / auto_retry_end |
-| summarization_retry_scheduled / summarization_retry_attempt_start / summarization_retry_finished | summarization_retry_scheduled / summarization_retry_attempt_start / summarization_retry_finished |
-| extension_error | extension_error |
-| Extension UI Protocol | Extension UI Protocol |
-| Extension UI Requests (stdout) | Extension UI Requests (stdout) |
-| Extension UI Responses (stdin) | Extension UI Responses (stdin) |
-| Error Handling | 错误处理 |
-| Types | Types |
-| Model | Model |
-| UserMessage | UserMessage |
-| AssistantMessage | AssistantMessage |
-| ToolResultMessage | ToolResultMessage |
-| BashExecutionMessage | BashExecutionMessage |
-| Attachment | Attachment |
-| Example: Basic Client (Python) | Example: Basic Client (Python) |
-| Send prompt | Send prompt |
-| Process events | Process 事件 |
-| Example: Interactive Client (Node.js) | Example: Interactive Client (Node.js) |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+启动新会话。它可以被 `session_before_switch` 扩展事件处理器取消。
+
+```json
+{"type": "new_session"}
+```
+
+带可选的父会话跟踪：
+```json
+{"type": "new_session", "parentSession": "/path/to/parent-session.jsonl"}
+```
+
+响应：
+```json
+{"type": "response", "command": "new_session", "success": true, "data": {"cancelled": false}}
+```
+
+如果扩展取消了操作：
+```json
+{"type": "response", "command": "new_session", "success": true, "data": {"cancelled": true}}
+```
+
+### 状态
+
+#### get_state
+
+获取当前会话状态。
+
+```json
+{"type": "get_state"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_state",
+  "success": true,
+  "data": {
+    "model": {...},
+    "thinkingLevel": "medium",
+    "isStreaming": false,
+    "isCompacting": false,
+    "steeringMode": "all",
+    "followUpMode": "one-at-a-time",
+    "sessionFile": "/path/to/session.jsonl",
+    "sessionId": "abc123",
+    "sessionName": "my-feature-work",
+    "autoCompactionEnabled": true,
+    "messageCount": 5,
+    "pendingMessageCount": 0
+  }
+}
+```
+
+`model` 字段是完整的 [Model](#model) 对象或 `null`。`sessionName` 字段是通过 `set_session_name` 设置的显示名称；如果未设置则省略。
+
+#### get_messages
+
+获取对话中的所有消息。
+
+```json
+{"type": "get_messages"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_messages",
+  "success": true,
+  "data": {"messages": [...]}
+}
+```
+
+消息是 `AgentMessage` 对象（参见 [类型](#类型)）。
+
+### 模型
+
+#### set_model
+
+切换到指定模型。
+
+```json
+{"type": "set_model", "provider": "anthropic", "modelId": "claude-sonnet-4-20250514"}
+```
+
+响应包含完整的 [Model](#model) 对象：
+```json
+{
+  "type": "response",
+  "command": "set_model",
+  "success": true,
+  "data": {...}
+}
+```
+
+#### cycle_model
+
+切换到下一个可用模型。如果只有一个模型可用，则返回 `null` 数据。
+
+```json
+{"type": "cycle_model"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "cycle_model",
+  "success": true,
+  "data": {
+    "model": {...},
+    "thinkingLevel": "medium",
+    "isScoped": false
+  }
+}
+```
+
+`model` 字段是完整的 [Model](#model) 对象。
+
+#### get_available_models
+
+列出所有已配置的模型。
+
+```json
+{"type": "get_available_models"}
+```
+
+响应包含完整 [Model](#model) 对象的数组：
+```json
+{
+  "type": "response",
+  "command": "get_available_models",
+  "success": true,
+  "data": {
+    "models": [...]
+  }
+}
+```
+
+### 思考级别
+
+#### set_thinking_level
+
+为支持该功能的模型设置推理/思考级别。
+
+```json
+{"type": "set_thinking_level", "level": "high"}
+```
+
+级别：`"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"`
+
+仅当选定模型支持时才会暴露 `"xhigh"` 和 `"max"`。包括 GPT-5.6 在内的部分模型同时暴露二者。
+
+响应：
+```json
+{"type": "response", "command": "set_thinking_level", "success": true}
+```
+
+#### cycle_thinking_level
+
+在可用的思考级别之间循环。如果模型不支持思考，则返回 `null` 数据。
+
+```json
+{"type": "cycle_thinking_level"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "cycle_thinking_level",
+  "success": true,
+  "data": {"level": "high"}
+}
+```
+
+#### get_available_thinking_levels
+
+列出当前模型支持的思考级别。不支持推理的模型返回 `["off"]`。
+
+```json
+{"type": "get_available_thinking_levels"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_available_thinking_levels",
+  "success": true,
+  "data": {
+    "levels": ["off", "minimal", "low", "medium", "high"]
+  }
+}
+```
+
+### 队列模式
+
+#### set_steering_mode
+
+控制 steering message（来自 `steer`）的传递方式。
+
+```json
+{"type": "set_steering_mode", "mode": "one-at-a-time"}
+```
+
+模式：
+- `"all"`：当前 assistant 回合完成工具调用后，传递全部 steering message。
+- `"one-at-a-time"`：每个已完成的 assistant 回合传递一条 steering message（默认）。
+
+响应：
+```json
+{"type": "response", "command": "set_steering_mode", "success": true}
+```
+
+#### set_follow_up_mode
+
+控制 follow-up message（来自 `follow_up`）的传递方式。
+
+```json
+{"type": "set_follow_up_mode", "mode": "one-at-a-time"}
+```
+
+模式：
+- `"all"`：agent 完成时传递全部 follow-up message。
+- `"one-at-a-time"`：每次 agent 完成时传递一条 follow-up message（默认）。
+
+响应：
+```json
+{"type": "response", "command": "set_follow_up_mode", "success": true}
+```
+
+### 压缩
+
+#### compact
+
+手动压缩对话上下文，以减少 token 用量。
+
+```json
+{"type": "compact"}
+```
+
+使用自定义指令：
+```json
+{"type": "compact", "customInstructions": "Focus on code changes"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "compact",
+  "success": true,
+  "data": {
+    "summary": "Summary of conversation...",
+    "firstKeptEntryId": "abc123",
+    "tokensBefore": 150000,
+    "estimatedTokensAfter": 32000,
+    "usage": {
+      "input": 32000,
+      "output": 1200,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "totalTokens": 33200,
+      "cost": {"input": 0.01, "output": 0.02, "cacheRead": 0, "cacheWrite": 0, "total": 0.03}
+    },
+    "details": {}
+  }
+}
+```
+
+`estimatedTokensAfter` 是对压缩后立即重建的消息上下文所做的启发式估算，并不等同于提供方的精确 token 计数。`usage` 报告生成摘要所使用的一次或多次 LLM 调用的用量；如果使用自定义压缩处理器，也可能省略该字段。
+
+#### set_auto_compaction
+
+在上下文即将占满时，启用或禁用自动压缩。
+
+```json
+{"type": "set_auto_compaction", "enabled": true}
+```
+
+响应：
+```json
+{"type": "response", "command": "set_auto_compaction", "success": true}
+```
+
+### Retry
+
+#### set_auto_retry
+
+在遇到临时错误（过载、速率限制、5xx）时，启用或禁用自动重试。
+
+```json
+{"type": "set_auto_retry", "enabled": true}
+```
+
+响应：
+```json
+{"type": "response", "command": "set_auto_retry", "success": true}
+```
+
+#### abort_retry
+
+中止正在进行的重试（取消等待并停止重试）。
+
+```json
+{"type": "abort_retry"}
+```
+
+响应：
+```json
+{"type": "response", "command": "abort_retry", "success": true}
+```
+
+### Bash
+
+#### bash
+
+执行 shell 命令，并将输出加入对话上下文。命令运行期间，输出会以 `bash_execution_update` 事件流式发送；响应包含最终结果。
+
+```json
+{"id": "req-1", "type": "bash", "command": "ls -la"}
+```
+
+加入 `id` 后，可以将流式 `bash_execution_update` 事件与此命令关联。
+
+响应：
+```json
+{
+  "id": "req-1",
+  "type": "response",
+  "command": "bash",
+  "success": true,
+  "data": {
+    "output": "total 48\ndrwxr-xr-x ...",
+    "exitCode": 0,
+    "cancelled": false,
+    "truncated": false
+  }
+}
+```
+
+如果输出被截断，则包含 `fullOutputPath`：
+```json
+{
+  "type": "response",
+  "command": "bash",
+  "success": true,
+  "data": {
+    "output": "truncated output...",
+    "exitCode": 0,
+    "cancelled": false,
+    "truncated": true,
+    "fullOutputPath": "/tmp/pi-bash-abc123.log"
+  }
+}
+```
+
+**bash 结果如何到达 LLM：**
+
+`bash` 命令会立即执行并返回 `BashResult`。内部会创建 `BashExecutionMessage`，并将其存入 Agent 的消息状态。
+
+发送下一条 `prompt` 命令时，所有消息（包括 `BashExecutionMessage`）都会在发送给 LLM 前进行转换。`BashExecutionMessage` 会按以下格式转换为 `UserMessage`：
+
+````
+Ran `ls -la`
+```
+total 48
+drwxr-xr-x ...
+```
+````
+
+这意味着：
+1. Bash 输出会在**下一条 prompt** 中加入 LLM 上下文，而不是立即加入
+2. 可以在发送 prompt 前执行多条 bash 命令；所有输出都会被加入
+
+#### abort_bash
+
+中止正在运行的 bash 命令。
+
+```json
+{"type": "abort_bash"}
+```
+
+响应：
+```json
+{"type": "response", "command": "abort_bash", "success": true}
+```
+
+### Session
+
+#### get_session_stats
+
+获取 token 用量、成本统计和当前上下文窗口用量。
+
+```json
+{"type": "get_session_stats"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_session_stats",
+  "success": true,
+  "data": {
+    "sessionFile": "/path/to/session.jsonl",
+    "sessionId": "abc123",
+    "userMessages": 5,
+    "assistantMessages": 5,
+    "toolCalls": 12,
+    "toolResults": 12,
+    "totalMessages": 22,
+    "tokens": {
+      "input": 50000,
+      "output": 10000,
+      "cacheRead": 40000,
+      "cacheWrite": 5000,
+      "total": 105000
+    },
+    "cost": 0.45,
+    "contextUsage": {
+      "tokens": 60000,
+      "contextWindow": 200000,
+      "percent": 30
+    }
+  }
+}
+```
+
+`tokens` 和 `cost` 包含整个 session 中 assistant 消息、工具报告的用量，以及压缩/分支摘要生成的用量。`contextUsage` 包含用于压缩和页脚显示的实际当前上下文窗口估算值。
+
+没有模型或上下文窗口可用时，会省略 `contextUsage`。压缩刚完成后，在新的压缩后 assistant 响应提供有效用量数据前，`contextUsage.tokens` 和 `contextUsage.percent` 为 `null`。
+
+#### export_html
+
+将 session 导出为 HTML 文件。
+
+```json
+{"type": "export_html"}
+```
+
+使用自定义路径：
+```json
+{"type": "export_html", "outputPath": "/tmp/session.html"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "export_html",
+  "success": true,
+  "data": {"path": "/tmp/session.html"}
+}
+```
+
+#### switch_session
+
+加载另一个 session 文件。`session_before_switch` 扩展事件处理器可以取消该操作。
+
+```json
+{"type": "switch_session", "sessionPath": "/path/to/session.jsonl"}
+```
+
+响应：
+```json
+{"type": "response", "command": "switch_session", "success": true, "data": {"cancelled": false}}
+```
+
+如果扩展取消了切换：
+```json
+{"type": "response", "command": "switch_session", "success": true, "data": {"cancelled": true}}
+```
+
+#### fork
+
+从当前活动分支中的某条历史用户消息创建新分支。`session_before_fork` 扩展事件处理器可以取消该操作。响应会返回作为分叉起点的消息文本。
+
+```json
+{"type": "fork", "entryId": "abc123"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "fork",
+  "success": true,
+  "data": {"text": "The original prompt text...", "cancelled": false}
+}
+```
+
+如果扩展取消了分叉：
+```json
+{
+  "type": "response",
+  "command": "fork",
+  "success": true,
+  "data": {"text": "The original prompt text...", "cancelled": true}
+}
+```
+
+#### clone
+
+将当前活动分支在当前位置复制到新的 session。`session_before_fork` 扩展事件处理器可以取消该操作。
+
+```json
+{"type": "clone"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "clone",
+  "success": true,
+  "data": {"cancelled": false}
+}
+```
+
+如果扩展取消了复制：
+```json
+{
+  "type": "response",
+  "command": "clone",
+  "success": true,
+  "data": {"cancelled": true}
+}
+```
+
+#### get_fork_messages
+
+获取可用于分叉的用户消息。
+
+```json
+{"type": "get_fork_messages"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_fork_messages",
+  "success": true,
+  "data": {
+    "messages": [
+      {"entryId": "abc123", "text": "First prompt..."},
+      {"entryId": "def456", "text": "Second prompt..."}
+    ]
+  }
+}
+```
+
+#### get_entries
+
+按追加顺序获取 session 的所有条目（不含 session header）。Session 是由稳定 id 标识的只追加条目树，因此条目 id 可以作为持久化游标：将最近看到的条目 id 作为 `since` 传入，即使跨客户端重启，也只会获取严格位于其后的条目。与 `get_messages` 不同，此命令包含压缩前历史和已放弃的分支。
+
+```json
+{"type": "get_entries"}
+```
+
+使用游标：
+```json
+{"type": "get_entries", "since": "abc123"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_entries",
+  "success": true,
+  "data": {
+    "entries": [
+      {"type": "message", "id": "def456", "parentId": "abc123", "timestamp": "...", "message": {"role": "user", "...": "..."}}
+    ],
+    "leafId": "def456"
+  }
+}
+```
+
+`leafId` 是当前叶条目的 id（空 session 时为 `null`），因此客户端通过一次往返就能判断活动分支是否发生了移动。如果 `since` 与任何条目 id 都不匹配，响应的 `success` 为 `false`。
+
+#### get_tree
+
+以条目树的形式获取 session。每个节点的形状是 `{entry, children, label?, labelTimestamp?}`。格式正确的 session 只有一个根；父链损坏的孤立条目也会作为根出现。
+
+```json
+{"type": "get_tree"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_tree",
+  "success": true,
+  "data": {
+    "tree": [
+      {
+        "entry": {"type": "message", "id": "abc123", "parentId": null, "...": "..."},
+        "children": [
+          {"entry": {"type": "message", "id": "def456", "parentId": "abc123", "...": "..."}, "children": []}
+        ]
+      }
+    ],
+    "leafId": "def456"
+  }
+}
+```
+
+#### get_last_assistant_text
+
+获取最后一条 assistant 消息的文本内容。
+
+```json
+{"type": "get_last_assistant_text"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_last_assistant_text",
+  "success": true,
+  "data": {"text": "The assistant's response..."}
+}
+```
+
+如果不存在 assistant 消息，则返回 `{"text": null}`。
+
+#### set_session_name
+
+为当前 session 设置显示名称。该名称会显示在 session 列表中，帮助识别 session。
+
+```json
+{"type": "set_session_name", "name": "my-feature-work"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "set_session_name",
+  "success": true
+}
+```
+
+当前 session 名称可通过 `get_state` 的 `sessionName` 字段获取。要在启动 RPC 模式时设置初始名称，请向 `pi --mode rpc` 进程传入 `--name <name>` 或 `-n <name>`。
+
+### Commands
+
+#### get_commands
+
+获取可用命令（扩展命令、prompt template 和 skill）。这些命令可以在 `prompt` 命令中通过添加 `/` 前缀调用。
+
+```json
+{"type": "get_commands"}
+```
+
+响应：
+```json
+{
+  "type": "response",
+  "command": "get_commands",
+  "success": true,
+  "data": {
+    "commands": [
+      {"name": "session-name", "description": "Set or clear session name", "source": "extension", "path": "/home/user/.pi/agent/extensions/session.ts"},
+      {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt", "location": "project", "path": "/home/user/myproject/.pi/agent/prompts/fix-tests.md"},
+      {"name": "skill:brave-search", "description": "Web search via Brave API", "source": "skill", "location": "user", "path": "/home/user/.pi/agent/skills/brave-search/SKILL.md"}
+    ]
+  }
+}
+```
+
+每个命令包含：
+- `name`：命令名称（使用 `/name` 调用）
+- `description`：人类可读的描述（扩展命令可选）
+- `source`：命令类型：
+  - `"extension"`：通过扩展中的 `pi.registerCommand()` 注册
+  - `"prompt"`：从 prompt template 的 `.md` 文件加载
+  - `"skill"`：从 skill 目录加载（名称带有 `skill:` 前缀）
+- `location`：加载位置（扩展命令没有此字段，可选）：
+  - `"user"`：用户级（`~/.pi/agent/`）
+  - `"project"`：项目级（`./.pi/agent/`）
+  - `"path"`：通过 CLI 或设置指定的显式路径
+- `path`：命令源文件的绝对路径（可选）
+
+**注意**：不包含内置 TUI 命令（`/settings`、`/hotkeys` 等）。这些命令只在交互模式中处理，通过 `prompt` 发送时不会执行。
+
+## 事件
+
+Agent 运行期间，事件会以 JSON 行流写入 stdout。事件通常不包含 `id` 字段；如果直接 RPC bash 命令提供了 `id`，`bash_execution_update` 会包含该命令的 `id`。
+
+### 事件类型
+
+| 事件 | 说明 |
+|-------|-------------|
+| `agent_start` | Agent 开始处理 |
+| `agent_end` | 一次底层 Agent 运行完成（之后可能仍会进行重试、压缩或处理排队的继续消息） |
+| `agent_settled` | Agent 运行完全结算；不再有自动重试、压缩重试或排队的继续消息 |
+| `turn_start` | 新回合开始 |
+| `turn_end` | 回合完成（包含 assistant 消息和工具结果） |
+| `message_start` | 消息开始 |
+| `message_update` | 流式更新（文本/思考/工具调用增量） |
+| `message_end` | 消息完成 |
+| `bash_execution_update` | 直接 RPC bash 命令的输出块 |
+| `tool_execution_start` | 工具开始执行 |
+| `tool_execution_update` | 工具执行进度（流式输出） |
+| `tool_execution_end` | 工具完成 |
+| `queue_update` | 待处理的 steering/follow-up 队列发生变化 |
+| `compaction_start` | 压缩开始 |
+| `compaction_end` | 压缩完成 |
+| `auto_retry_start` | 自动重试开始（发生暂时性错误后） |
+| `auto_retry_end` | 自动重试完成（成功或最终失败） |
+| `summarization_retry_scheduled` | 为暂时性的压缩或分支摘要总结错误安排重试 |
+| `summarization_retry_attempt_start` | 重试的总结请求开始 |
+| `summarization_retry_finished` | 总结重试循环完成 |
+| `extension_error` | Extension 抛出错误 |
+
+### agent_start
+
+Agent 开始处理 prompt 时发出。
+
+```json
+{"type": "agent_start"}
+```
+
+### agent_end
+
+一次底层 Agent 运行完成时发出。事件包含本次运行生成的所有消息。如果 `willRetry` 为 true，随后会进行自动重试。
+
+```json
+{
+  "type": "agent_end",
+  "messages": [...],
+  "willRetry": false
+}
+```
+
+### agent_settled
+
+整个 session 级运行结算后发出。此时 Pi 不会再通过重试、压缩重试或排队的 follow-up 消息继续自动运行。
+
+```json
+{"type": "agent_settled"}
+```
+
+### turn_start / turn_end
+
+一个回合由一次 assistant 响应，以及由此产生的工具调用和结果组成。
+
+```json
+{"type": "turn_start"}
+```
+
+```json
+{
+  "type": "turn_end",
+  "message": {...},
+  "toolResults": [...]
+}
+```
+
+### message_start / message_end
+
+消息开始和完成时发出。`message` 字段包含一个 `AgentMessage`。
+
+```json
+{"type": "message_start", "message": {...}}
+{"type": "message_end", "message": {...}}
+```
+
+### message_update（流式）
+
+assistant 消息流式传输期间发出。它包含增量事件，不包含累积的消息快照。
+
+```json
+{
+  "type": "message_update",
+  "usage": {
+    "input": 100,
+    "output": 1,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 101,
+    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+  },
+  "assistantMessageEvent": {
+    "type": "text_delta",
+    "contentIndex": 0,
+    "delta": "Hello "
+  }
+}
+```
+
+`assistantMessageEvent` 字段包含以下某一种增量类型：
+
+| 类型 | 说明 |
+|------|-------------|
+| `text_start` | 文本内容块开始 |
+| `text_delta` | 文本内容块增量 |
+| `text_end` | 文本内容块结束 |
+| `thinking_start` | 思考块开始 |
+| `thinking_delta` | 思考内容增量 |
+| `thinking_end` | 思考块结束 |
+| `toolcall_start` | 工具调用开始（包含 `id` 和 `toolName`） |
+| `toolcall_delta` | 工具调用参数增量 |
+| `toolcall_end` | 工具调用结束（包含完整的 `toolCall` 对象） |
+
+流式传输文本响应的示例：
+```json
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_start","contentIndex":0}}
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":" world"}}
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello world"}}
+```
+
+顶层的 `usage` 字段包含提供方最近一次报告的累积用量。如果提供方在流式传输期间不报告用量，它可能在完成前一直为零。
+
+开始工具调用的示例：
+```json
+{"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"call_abc123","toolName":"write"}}
+```
+
+`message_update` 有意省略了原先的累积 `message` 字段和 `assistantMessageEvent.partial`。需要实时部分消息的客户端，必须使用 `contentIndex`，从 `message_start` 和后续事件组装它。应以 `message_end.message` 为权威结果。对于工具调用，`toolcall_start` 提供调用的 `id` 和 `toolName`；应缓冲 `toolcall_delta.delta` 作为参数。`toolcall_end.toolCall` 包含完整的调用。
+
+### bash_execution_update
+
+直接 `bash` 命令的每个输出块发出一次。`id` 与命令的 `id` 相同，客户端可以据此将输出关联到正确的命令。
+
+命令运行期间会流式发送全部输出，即使最终 `bash` 响应的 `output` 被截断，也不影响这里的事件。
+
+```json
+{
+  "type": "bash_execution_update",
+  "id": "req-1",
+  "delta": "total 48\n"
+}
+```
+
+### tool_execution_start / tool_execution_update / tool_execution_end
+
+工具开始、流式报告进度和完成执行时发出。
+
+```json
+{
+  "type": "tool_execution_start",
+  "toolCallId": "call_abc123",
+  "toolName": "bash",
+  "args": {"command": "ls -la"}
+}
+```
+
+执行期间，`tool_execution_update` 事件会流式发送部分结果（例如，bash 输出到达时逐步发送）：
+
+```json
+{
+  "type": "tool_execution_update",
+  "toolCallId": "call_abc123",
+  "toolName": "bash",
+  "args": {"command": "ls -la"},
+  "partialResult": {
+    "content": [{"type": "text", "text": "partial output so far..."}],
+    "details": {"truncation": null, "fullOutputPath": null}
+  }
+}
+```
+
+完成时：
+
+```json
+{
+  "type": "tool_execution_end",
+  "toolCallId": "call_abc123",
+  "toolName": "bash",
+  "result": {
+    "content": [{"type": "text", "text": "total 48\n..."}],
+    "details": {...}
+  },
+  "isError": false
+}
+```
+
+使用 `toolCallId` 关联事件。`tool_execution_update` 中的 `partialResult` 包含截至当前的累积输出，而不只是增量，因此客户端可以在每次更新时直接替换显示内容。
+
+### queue_update
+
+待处理的 steering 或 follow-up 队列发生变化时发出。
+
+```json
+{
+  "type": "queue_update",
+  "steering": ["Focus on error handling"],
+  "followUp": ["After that, summarize the result"]
+}
+```
+
+### compaction_start / compaction_end
+
+无论是手动还是自动压缩，压缩运行时都会发出。
+
+```json
+{"type": "compaction_start", "reason": "threshold"}
+```
+
+`reason` 字段是 `"manual"`、`"threshold"` 或 `"overflow"`。
+
+```json
+{
+  "type": "compaction_end",
+  "reason": "threshold",
+  "result": {
+    "summary": "Summary of conversation...",
+    "firstKeptEntryId": "abc123",
+    "tokensBefore": 150000,
+    "estimatedTokensAfter": 32000,
+    "usage": {
+      "input": 32000,
+      "output": 1200,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "totalTokens": 33200,
+      "cost": {"input": 0.01, "output": 0.02, "cacheRead": 0, "cacheWrite": 0, "total": 0.03}
+    },
+    "details": {}
+  },
+  "aborted": false,
+  "willRetry": false
+}
+```
+
+如果 `reason` 是 `"overflow"` 且压缩成功，`willRetry` 为 `true`，Agent 会自动重试该 prompt。
+
+如果压缩被中止，`result` 为 `null`，`aborted` 为 `true`。
+
+如果压缩失败（例如 API 配额超限），`result` 为 `null`，`aborted` 为 `false`，`errorMessage` 包含错误说明。
+
+### auto_retry_start / auto_retry_end
+
+暂时性错误（过载、速率限制、5xx）触发自动重试时发出。
+
+```json
+{
+  "type": "auto_retry_start",
+  "attempt": 1,
+  "maxAttempts": 3,
+  "delayMs": 2000,
+  "errorMessage": "529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
+}
+```
+
+```json
+{
+  "type": "auto_retry_end",
+  "success": true,
+  "attempt": 2
+}
+```
+
+最终失败（超过最大重试次数）时：
+```json
+{
+  "type": "auto_retry_end",
+  "success": false,
+  "attempt": 3,
+  "finalError": "529 overloaded_error: Overloaded"
+}
+```
+
+### summarization_retry_scheduled / summarization_retry_attempt_start / summarization_retry_finished
+
+压缩或分支摘要总结因暂时性提供方错误而重试时发出。这些事件使用与 assistant 回合自动重试相同的重试设置。
+
+```json
+{
+  "type": "summarization_retry_scheduled",
+  "attempt": 1,
+  "maxAttempts": 3,
+  "delayMs": 2000,
+  "errorMessage": "terminated"
+}
+```
+
+```json
+{
+  "type": "summarization_retry_attempt_start",
+  "source": "compaction",
+  "reason": "threshold"
+}
+```
+
+对于分支摘要，`source` 是 `"branchSummary"`，且不包含 `reason`。
+
+```json
+{
+  "type": "summarization_retry_finished"
+}
+```
+
+### extension_error
+
+Extension 抛出错误时发出。
+
+```json
+{
+  "type": "extension_error",
+  "extensionPath": "/path/to/extension.ts",
+  "event": "tool_call",
+  "error": "Error message..."
+}
+```
+
+## 扩展 UI 协议
+
+扩展可以通过 `ctx.ui.select()`、`ctx.ui.confirm()` 等方法请求用户交互。在 RPC 模式下，这些调用会在基础命令/事件流程之上转换为请求/响应子协议。
+
+扩展 UI 方法分为两类：
+
+- **对话框方法**（`select`、`confirm`、`input`、`editor`）：向 stdout 发出 `extension_ui_request`，并阻塞等待客户端通过 stdin 发回具有匹配 `id` 的 `extension_ui_response`。
+- **发后即忘方法**（`notify`、`setStatus`、`setWidget`、`setTitle`、`set_editor_text`）：向 stdout 发出 `extension_ui_request`，但不等待响应。客户端可以显示这些信息，也可以忽略它们。
+
+如果对话框方法包含 `timeout` 字段，Agent 侧会在超时后使用默认值自动完成响应。客户端不需要跟踪超时。
+
+部分 `ExtensionUIContext` 方法需要直接访问 TUI，因此在 RPC 模式下不受支持或能力受限：
+- `custom()` 返回 `undefined`
+- `setWorkingMessage()`、`setWorkingIndicator()`、`setFooter()`、`setHeader()`、`setEditorComponent()`、`setToolsExpanded()` 都是空操作
+- `getEditorText()` 返回 `""`
+- `getToolsExpanded()` 返回 `false`
+- `pasteToEditor()` 委托给 `setEditorText()`（不处理粘贴/折叠）
+- `getAllThemes()` 返回 `[]`
+- `getTheme()` 返回 `undefined`
+- `setTheme()` 返回 `{ success: false, error: "..." }`
+
+注意：RPC 模式下 `ctx.mode` 为 `"rpc"`，`ctx.hasUI` 为 `true`，因为对话框方法和发后即忘方法可以通过扩展 UI 子协议正常工作。对于要求真实终端的 TUI 专用功能（例如 `custom()`），请使用 `ctx.mode === "tui"` 进行保护。
+
+### 扩展 UI 请求（stdout）
+
+所有请求的 `type` 都是 `"extension_ui_request"`，并包含唯一的 `id` 和 `method` 字段。
+
+#### select
+
+提示用户从列表中选择一项。包含 `timeout` 字段的对话框方法会将超时时间（毫秒）包含在请求中；如果客户端未及时响应，Agent 会自动使用 `undefined` 完成请求。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-1",
+  "method": "select",
+  "title": "Allow dangerous command?",
+  "options": ["Allow", "Block"],
+  "timeout": 10000
+}
+```
+
+预期响应：带有 `value`（选中的选项字符串）或 `cancelled: true` 的 `extension_ui_response`。
+
+#### confirm
+
+提示用户确认或拒绝某个操作。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-2",
+  "method": "confirm",
+  "title": "Clear session?",
+  "message": "All messages will be lost.",
+  "timeout": 5000
+}
+```
+
+预期响应：带有 `confirmed: true/false` 或 `cancelled: true` 的 `extension_ui_response`。
+
+#### input
+
+提示用户输入自由格式的文本。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-3",
+  "method": "input",
+  "title": "Enter a value",
+  "placeholder": "type something..."
+}
+```
+
+预期响应：带有 `value`（输入的文本）或 `cancelled: true` 的 `extension_ui_response`。
+
+#### editor
+
+打开多行文本编辑器，可选择预填充内容。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-4",
+  "method": "editor",
+  "title": "Edit some text",
+  "prefill": "Line 1\nLine 2\nLine 3"
+}
+```
+
+预期响应：带有 `value`（编辑后的文本）或 `cancelled: true` 的 `extension_ui_response`。
+
+#### notify
+
+显示通知。该方法发后即忘，不需要响应。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-5",
+  "method": "notify",
+  "message": "Command blocked by user",
+  "notifyType": "warning"
+}
+```
+
+`notifyType` 字段可以是 `"info"`、`"warning"` 或 `"error"`。省略时默认为 `"info"`。
+
+#### setStatus
+
+设置或清除页脚/状态栏中的状态项。该方法发后即忘。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-6",
+  "method": "setStatus",
+  "statusKey": "my-ext",
+  "statusText": "Turn 3 running..."
+}
+```
+
+发送 `statusText: undefined`（或省略该字段）可以清除该键对应的状态项。
+
+#### setWidget
+
+设置或清除显示在编辑器上方或下方的小组件（文本行块）。该方法发后即忘。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-7",
+  "method": "setWidget",
+  "widgetKey": "my-ext",
+  "widgetLines": ["--- My Widget ---", "Line 1", "Line 2"],
+  "widgetPlacement": "aboveEditor"
+}
+```
+
+发送 `widgetLines: undefined`（或省略该字段）可以清除小组件。`widgetPlacement` 字段可以是 `"aboveEditor"`（默认值）或 `"belowEditor"`。RPC 模式只支持字符串数组；组件工厂会被忽略。
+
+#### setTitle
+
+设置终端窗口或标签页标题。该方法发后即忘。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-8",
+  "method": "setTitle",
+  "title": "pi - my project"
+}
+```
+
+#### set_editor_text
+
+设置输入编辑器中的文本。该方法发后即忘。
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-9",
+  "method": "set_editor_text",
+  "text": "prefilled text for the user"
+}
+```
+
+### 扩展 UI 响应（stdin）
+
+只有对话框方法（`select`、`confirm`、`input`、`editor`）会发送响应。`id` 必须与请求匹配。
+
+#### 值响应（select、input、editor）
+
+```json
+{"type": "extension_ui_response", "id": "uuid-1", "value": "Allow"}
+```
+
+#### 确认响应（confirm）
+
+```json
+{"type": "extension_ui_response", "id": "uuid-2", "confirmed": true}
+```
+
+#### 取消响应（任意对话框）
+
+关闭任意对话框方法。对于 `select`/`input`/`editor`，扩展会收到 `undefined`；对于 `confirm`，扩展会收到 `false`。
+
+```json
+{"type": "extension_ui_response", "id": "uuid-3", "cancelled": true}
+```
+
+## 错误处理
+
+命令失败时会返回带有 `success: false` 的响应：
+
+```json
+{
+  "type": "response",
+  "command": "set_model",
+  "success": false,
+  "error": "Model not found: invalid/model"
+}
+```
+
+解析错误：
+
+```json
+{
+  "type": "response",
+  "command": "parse",
+  "success": false,
+  "error": "Failed to parse command: Unexpected token..."
+}
+```
+
+## 类型
+
+源文件：
+- [`packages/ai/src/types.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/ai/src/types.ts) — `Model`、`UserMessage`、`AssistantMessage`、`ToolResultMessage`
+- [`packages/agent/src/types.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/agent/src/types.ts) — `AgentMessage`、`AgentEvent`
+- [`src/core/messages.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/core/messages.ts) — `BashExecutionMessage`
+- [`src/modes/json-event.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/json-event.ts) — `JsonAgentSessionEvent`
+- [`src/modes/rpc/rpc-types.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/rpc/rpc-types.ts) — RPC 命令/响应类型、扩展 UI 请求/响应类型
+
+### Model
+
+```json
+{
+  "id": "claude-sonnet-4-20250514",
+  "name": "Claude Sonnet 4",
+  "api": "anthropic-messages",
+  "provider": "anthropic",
+  "baseUrl": "https://api.anthropic.com",
+  "reasoning": true,
+  "input": ["text", "image"],
+  "contextWindow": 200000,
+  "maxTokens": 16384,
+  "cost": {
+    "input": 3.0,
+    "output": 15.0,
+    "cacheRead": 0.3,
+    "cacheWrite": 3.75
+  }
+}
+```
+
+### UserMessage
+
+```json
+{
+  "role": "user",
+  "content": "Hello!",
+  "timestamp": 1733234567890,
+  "attachments": []
+}
+```
+
+`content` 字段可以是字符串，也可以是由 `TextContent`/`ImageContent` 块组成的数组。
+
+### AssistantMessage
+
+```json
+{
+  "role": "assistant",
+  "content": [
+    {"type": "text", "text": "Hello! How can I help?"},
+    {"type": "thinking", "thinking": "User is greeting me..."},
+    {"type": "toolCall", "id": "call_123", "name": "bash", "arguments": {"command": "ls"}}
+  ],
+  "api": "anthropic-messages",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "usage": {
+    "input": 100,
+    "output": 50,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": {"input": 0.0003, "output": 0.00075, "cacheRead": 0, "cacheWrite": 0, "total": 0.00105}
+  },
+  "stopReason": "stop",
+  "timestamp": 1733234567890
+}
+```
+
+停止原因包括：`"stop"`、`"length"`、`"toolUse"`、`"error"`、`"aborted"`。
+
+### ToolResultMessage
+
+```json
+{
+  "role": "toolResult",
+  "toolCallId": "call_123",
+  "toolName": "bash",
+  "content": [{"type": "text", "text": "total 48\ndrwxr-xr-x ..."}],
+  "usage": {
+    "input": 100,
+    "output": 50,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 150,
+    "cost": {"input": 0.0003, "output": 0.00075, "cacheRead": 0, "cacheWrite": 0, "total": 0.00105}
+  },
+  "isError": false,
+  "timestamp": 1733234567890
+}
+```
+
+`usage` 是可选字段，用于报告工具执行的嵌套 LLM 工作。存在时，它会计入会话的 token 和成本总量。
+
+### BashExecutionMessage
+
+由 RPC 的 `bash` 命令创建（不是由 LLM 工具调用创建）：
+
+```json
+{
+  "role": "bashExecution",
+  "command": "ls -la",
+  "output": "total 48\ndrwxr-xr-x ...",
+  "exitCode": 0,
+  "cancelled": false,
+  "truncated": false,
+  "fullOutputPath": null,
+  "timestamp": 1733234567890
+}
+```
+
+### Attachment
+
+```json
+{
+  "id": "img1",
+  "type": "image",
+  "fileName": "photo.jpg",
+  "mimeType": "image/jpeg",
+  "size": 102400,
+  "content": "base64-encoded-data...",
+  "extractedText": null,
+  "preview": null
+}
+```
+
+## 示例：基础客户端（Python）
+
+```python
+import subprocess
+import json
+
+proc = subprocess.Popen(
+    ["pi", "--mode", "rpc", "--no-session"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True
+)
+
+def send(cmd):
+    proc.stdin.write(json.dumps(cmd) + "\n")
+    proc.stdin.flush()
+
+def read_events():
+    for line in proc.stdout:
+        yield json.loads(line)
+
+# Send prompt
+send({"type": "prompt", "message": "Hello!"})
+
+# Process events
+for event in read_events():
+    if event.get("type") == "message_update":
+        delta = event.get("assistantMessageEvent", {})
+        if delta.get("type") == "text_delta":
+            print(delta["delta"], end="", flush=True)
+
+    if event.get("type") == "agent_end":
+        print()
+        break
+```
+
+## 示例：交互式客户端（Node.js）
+
+完整的交互式示例见 [`test/rpc-example.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/test/rpc-example.ts)，类型化客户端实现见 [`src/modes/rpc/rpc-client.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/src/modes/rpc/rpc-client.ts)。
+
+如需完整示例了解如何处理扩展 UI 协议，请参阅 [`examples/rpc-extension-ui.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/examples/rpc-extension-ui.ts)；它与扩展 [`examples/extensions/rpc-demo.ts`](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/examples/extensions/rpc-demo.ts) 配合使用。
+
+```javascript
+const { spawn } = require("child_process");
+const { StringDecoder } = require("string_decoder");
+
+const agent = spawn("pi", ["--mode", "rpc", "--no-session"]);
+
+function attachJsonlReader(stream, onLine) {
+    const decoder = new StringDecoder("utf8");
+    let buffer = "";
+
+    stream.on("data", (chunk) => {
+        buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+
+        while (true) {
+            const newlineIndex = buffer.indexOf("\n");
+            if (newlineIndex === -1) break;
+
+            let line = buffer.slice(0, newlineIndex);
+            buffer = buffer.slice(newlineIndex + 1);
+            if (line.endsWith("\r")) line = line.slice(0, -1);
+            onLine(line);
+        }
+    });
+
+    stream.on("end", () => {
+        buffer += decoder.end();
+        if (buffer.length > 0) {
+            onLine(buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer);
+        }
+    });
+}
+
+attachJsonlReader(agent.stdout, (line) => {
+    const event = JSON.parse(line);
+
+    if (event.type === "message_update") {
+        const { assistantMessageEvent } = event;
+        if (assistantMessageEvent.type === "text_delta") {
+            process.stdout.write(assistantMessageEvent.delta);
+        }
+    }
+});
+
+// Send prompt
+agent.stdin.write(JSON.stringify({ type: "prompt", message: "Hello" }) + "\n");
+
+// Abort on Ctrl+C
+process.on("SIGINT", () => {
+    agent.stdin.write(JSON.stringify({ type: "abort" }) + "\n");
+});
+```
 
 ## 完整原文对照
 

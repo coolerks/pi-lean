@@ -1,86 +1,60 @@
 ---
-title: "Settings"
-description: "模型、UI、网络、压缩、重试、工具和资源设置。"
+title: "设置"
+description: "Pi 的模型、界面、网络、压缩、重试、工具、会话和资源设置。"
 ---
 
-# Settings
+# 设置
 
-> 本页是 `packages/coding-agent/docs/settings.md` 的中文参考译本，研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。本页按源文档的顺序逐节解释设置的作用、默认值、覆盖关系和失败边界；JSON 字段、命令、路径和 API 名称保留原样。
+> 本页根据 `packages/coding-agent/docs/settings.md` 重新翻译，研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。设置字段、命令、路径、枚举值和环境变量保留原样。
 
 ## 中文导读
 
-Pi 的设置不是一份“所有选项都放在一起”的无条件配置。它至少有两层文件：用户目录下的全局设置，以及当前项目 `.pi` 目录下的项目设置。项目设置可以覆盖全局设置，但项目设置是否被读取，还受 Project Trust 控制。理解这两个维度，才能解释为什么“文件明明存在，但 Pi 没有采用它”。
-
-本页的阅读顺序是：先定位文件，再理解信任和合并；随后按模型、界面、网络、压缩、重试、消息投递、Terminal、Shell、Tools、Session、模型轮换、Markdown 和资源加载逐项查表。每个示例之后都说明它影响哪一层、覆盖谁、什么时候生效，以及最容易出现的错误。
+Pi 的设置分为全局设置和项目设置。项目设置可以覆盖全局设置，但项目目录中的配置、资源和 Extension 是否生效，还取决于项目信任。阅读本页时，请把“值的覆盖关系”和“资源是否允许加载”分开理解。
 
 ## 中文译文
 
-## 设置文件的两层结构
+## 设置文件
 
-| 文件 | 作用域 | 典型用途 |
-| --- | --- | --- |
-| `~/.pi/agent/settings.json` | 全局，作用于所有项目 | 默认 Provider、默认模型、UI 偏好、全局 proxy、默认信任策略 |
-| `.pi/settings.json` | 项目，仅作用于当前目录 | 项目工具集、项目 Session 目录、项目资源和项目专用模型设置 |
+Pi 使用 JSON 设置文件；项目设置会覆盖全局设置。
 
-可以直接编辑文件，也可以在交互模式执行 `/settings` 修改常见选项。要保存启动模型，执行 `/model`，选中模型后按 `Ctrl+S`；要保存启动 thinking level，在 `/thinking` 中按 `Ctrl+S`。这两个命令保存的是启动默认值，不是把一次请求中的临时模型选择改成永久事实。
-
-> 译者注：全局设置与项目设置可以类比 Java 的全局配置和 profile-specific 配置，也可以类比 Go 程序读取用户配置后再读取工作目录配置。这里最容易误解的是“项目覆盖”不等于“项目天然可信”：前者是值合并，后者是是否允许加载和执行项目资源。
-
-### 一次启动如何决定最终值
-
-可以把设置解析简化为下面的顺序：
-
-```text
-读取全局 ~/.pi/agent/settings.json
-        ↓
-检查项目是否信任
-        ↓
-读取 .pi/settings.json（若允许）
-        ↓
-合并嵌套对象
-        ↓
-应用环境变量和命令行覆盖
-        ↓
-创建本次运行的 AgentSession / TUI / Provider 配置
-```
-
-这个流程的输入是文件、信任记录、环境变量和命令行参数；输出是本次进程使用的有效设置。命令行通常拥有更高优先级，项目对象通常只覆盖同名字段。失败点包括 JSON 语法错误、值类型错误、项目没有被信任，以及把只允许全局的字段放进项目文件。
-
-## Project Trust：设置是否能被读取
-
-交互启动时，如果目录含有项目设置、资源、项目 `.agents/skills`，或者项目扩展，而当前目录及其父目录在 `~/.pi/agent/trust.json` 中没有保存决定，Pi 会先询问是否信任。信任项目意味着 Pi 可以加载 `.pi/settings.json` 和 `.pi` 资源、安装缺少的项目 package，并执行项目 extensions。
-
-非交互模式不会显示询问框。`-p`、`--mode json` 和 `--mode rpc` 会使用全局设置里的 `defaultProjectTrust`：
-
-| 值 | 非交互模式行为 |
+| 位置 | 作用域 |
 | --- | --- |
-| `ask` | 没有保存决定时不自动加载项目资源；默认值 |
-| `never` | 忽略项目资源和项目设置 |
-| `always` | 自动信任项目资源 |
+| `~/.pi/agent/settings.json` | 全局，作用于所有项目 |
+| `.pi/settings.json` | 项目，仅作用于当前目录 |
 
-单次命令可以用 `--approve`/`-a` 信任，也可以用 `--no-approve`/`-na` 忽略，不会把该次覆盖自动写成永久决定。`defaultProjectTrust` 只能在全局 `~/.pi/agent/settings.json` 配置；`pi config` 和 package 命令遵循相同的项目信任流程，但 `pi update` 不会提示。
+你可以直接编辑这些文件，也可以使用 `/settings` 修改常用选项。要在交互模式中保存启动模型，请使用 `/model`，选中目标模型后按 `Ctrl+S`；要保存启动时的思考级别，请使用 `/thinking`。
 
-在交互模式中使用 `/trust` 可以保存当前项目的信任决定，连同立即生效的父目录信任。它只写入 `~/.pi/agent/trust.json`，不会重新加载已经打开的当前 Session；修改后应重新启动 Pi。也就是说，写入 trust 文件成功不等于当前进程的 ResourceLoader 已经重新扫描资源。
+> 译者注：这两层文件类似后端应用中的全局配置和项目 profile。项目配置“覆盖”全局配置，只表示合并后的值不同；它不表示项目文件天然可信，也不表示其中的 Extension 可以自动执行。
 
-> 译者注：信任检查是安全边界，不是配置便利功能。项目里的 settings、Skill、Extension 可能带来网络请求、文件读取或命令执行；在 CI、脚本和 RPC 场景中，使用 `always` 会减少交互阻塞，但也扩大了项目代码的权限面。更安全的做法是显式 `--approve`，并把工作目录、依赖和凭据分开控制。
+## 项目可信度：Project Trust
 
-## All Settings：逐项配置参考
+交互模式启动时，如果项目目录包含项目级设置、资源或项目 `.agents/skills`，并且当前目录及其父目录都没有保存在 `~/.pi/agent/trust.json` 中的决定，Pi 会询问你是否信任该目录。信任项目后，Pi 才会加载 `.pi/settings.json` 和 `.pi` 资源、安装缺失的项目包，并执行项目 Extension。
 
-### Model & Thinking
+非交互模式（`-p`、`--mode json` 和 `--mode rpc`）不会显示信任提示。如果没有适用的已保存决定，它们会使用全局设置中的 `defaultProjectTrust`：默认值 `ask` 和值 `never` 都不会加载项目资源；值为 `always` 时则信任项目。使用 `--approve`/`-a` 或 `--no-approve`/`-na`，可以只为本次运行覆盖项目可信度。
 
-| 设置 | 类型 | 默认值 | 说明 |
+如果没有 Extension 或已保存的决定，`defaultProjectTrust` 决定回退行为。你可以在 `~/.pi/agent/settings.json` 中将它设置为 `"ask"`、`"always"` 或 `"never"`，也可以通过 `/settings` 修改。
+
+`pi config` 和包管理命令使用同一套项目信任流程，但 `pi update` 永远不会询问。使用 `--approve`，可以让本次命令信任项目级设置；使用 `--no-approve` 则忽略它们。
+
+在交互模式中使用 `/trust`，可以保存项目未来会话使用的信任决定，也会包含对当前项目父目录的信任。它只写入 `~/.pi/agent/trust.json`，不会重新加载当前会话；要让改变生效，需要重启 Pi。
+
+> 译者注：信任是“允许加载和执行项目资源”的安全决定，不是普通配置覆盖。项目中的 `settings.json`、Extension 和 skill 可能改变进程行为，因此自动化运行时应显式选择 `--approve` 或 `--no-approve`，不要依赖交互提示。
+
+## 所有设置：All Settings
+
+### 模型与思考：Model & Thinking
+
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `defaultProvider` | string | 无 | 启动时使用的 Provider，例如 `"anthropic"`、`"openai"`；可以手动编辑，或在 `/model` 中按 `Ctrl+S` 保存 |
-| `defaultModel` | string | 无 | 启动时使用的 model ID；可以手动编辑，或由 `/model` 保存 |
-| `defaultThinkingLevel` | string | 无 | 启动 thinking level：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
-| `modelThinkingLevels` | object | 无 | 按 `"provider/modelId"` 保存每个模型的启动 thinking level；可在 `/settings` 的按模型默认 thinking 设置中配置 |
-| `hideThinkingBlock` | boolean | `false` | 隐藏输出中的 thinking block；不会让模型停止推理，只改变呈现 |
-| `showCacheMissNotices` | boolean | `false` | 在 transcript 中显示明显的 prompt-cache miss、compaction 或 branch-summary 提示 |
-| `thinkingBudgets` | object | 无 | 为不同 thinking level 指定 token budget；只有 Provider/compat 支持时才会下发 |
+| `defaultProvider` | string | - | 启动时使用的 Provider，例如 `"anthropic"`、`"openai"`；可在 `/model` 中按 `Ctrl+S` 保存，也可以手动编辑 |
+| `defaultModel` | string | - | 启动时使用的模型 ID；可在 `/model` 中保存，也可以手动编辑 |
+| `defaultThinkingLevel` | string | - | 启动时的思考级别；可选 `"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` |
+| `modelThinkingLevels` | object | - | 按 `"provider/modelId"` 配置每个模型的启动思考级别；可在 `/settings` 的按模型设置项中配置，或手动编辑 |
+| `hideThinkingBlock` | boolean | `false` | 隐藏输出中的思考块 |
+| `showCacheMissNotices` | boolean | `false` | 对明显的 prompt cache 未命中、上下文压缩或分支摘要使用，在 transcript 中显示提示 |
+| `thinkingBudgets` | object | - | 为各个思考级别设置自定义 token 预算。Anthropic、Google 和 Bedrock 原生使用它；OpenAI 兼容模型只有在设置 `compat.thinkingTokenBudgetField`（或 `supportsThinkingTokenBudget`）时才使用它 |
 
-`defaultProvider` 与 `defaultModel` 是一对启动选择。只设置其中一个可能导致模型解析仍需从命令行、认证状态或模型列表补全。`defaultThinkingLevel` 是全局默认；`modelThinkingLevels` 用更具体的 `provider/modelId` 覆盖它。`hideThinkingBlock` 只是显示设置，不是安全设置，也不是 token budget。
-
-#### thinkingBudgets
+#### `thinkingBudgets`
 
 ```json
 {
@@ -93,34 +67,30 @@ Pi 的设置不是一份“所有选项都放在一起”的无条件配置。�
 }
 ```
 
-这段输入按 thinking level 提供数字 token budget。Anthropic、Google 和 Bedrock 可以原生使用；OpenAI-compatible 模型只有在 `compat.thinkingTokenBudgetField` 或 `supportsThinkingTokenBudget` 开启时才会使用。输出效果受 Provider 能力约束，数字写得很大并不能保证模型真的采用。常见失败是把字符串 `"4096"` 写成数字字段，或者给不支持 budget 的模型期待同样行为。
+### 界面与显示：UI & Display
 
-> 译者注：thinking level 和 thinking budget 不是同一个维度。前者是用户可理解的档位，后者是 adapter 需要转换的 token 数。Java 可以把它们建模为 enum 加可选 `Map<ModelId,Integer>`，Go 则可以用字符串常量和 `map[string]int`；真正的 Provider 能力检查仍应留在 adapter。
-
-### UI & Display
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `theme` | string | `"dark"` | 主题名，可用 `"dark"`、`"light"` 或自定义主题 |
-| `externalEditor` | string | `$VISUAL`，再 `$EDITOR`，Windows 为 Notepad，其他平台为 `nano` | `Ctrl+G` 使用的外部编辑器；显式设置优先于环境变量 |
-| `quietStartup` | boolean | `false` | 隐藏启动 header |
-| `defaultProjectTrust` | string | `"ask"` | 全局默认项目可信策略：`ask`、`always`、`never` |
-| `collapseChangelog` | boolean | `false` | 更新后以折叠形式显示 changelog |
-| `enableInstallTelemetry` | boolean | `true` | 首次安装或发现 changelog 更新后发送匿名安装/更新版本 ping；不控制更新检查 |
-| `enableAnalytics` | boolean | `false` | 选择加入 analytics；目前只在 `PI_EXPERIMENTAL=1` 的实验性首次设置中询问 |
-| `trackingId` | string | 无 | 打开 analytics 后生成的追踪标识 |
-| `doubleEscapeAction` | string | `"tree"` | 双击 Escape 的动作：`tree`、`fork` 或 `none` |
-| `treeFilterMode` | string | `"default"` | `/tree` 的默认过滤：`default`、`no-tools`、`user-only`、`labeled-only`、`all` |
-| `editorPaddingX` | number | `0` | 输入编辑器水平内边距，范围 0–3 |
-| `outputPad` | number | `1` | user、assistant、thinking 的水平内边距，取 0 或 1 |
-| `autocompleteMaxVisible` | number | `5` | 自动补全下拉列表最多显示 3–20 项 |
-| `showHardwareCursor` | boolean | `false` | TUI 为 IME 定位时显示终端光标 |
-| `tuiMode` | string | `"regular"` | 交互 TUI 模式：`regular` 或实验性的 `fullscreen`；`/settings` 立即应用，启动参数 `--tui-mode` 优先 |
-| `fullscreenExitOutput` | string | `"transcript"` | fullscreen 退出显示 transcript 和恢复提示，或只显示恢复提示的 `resume-hint` |
-| `fullscreenScrollbar` | string | `"auto"` | fullscreen 滚动条：`auto`、`always` 或 `hidden`；regular 模式无效 |
-| `fullscreenCopyOnSelect` | boolean | `true` | fullscreen 选择文本时自动复制；关闭后由 `Ctrl+X` 复制当前选区 |
+| `theme` | string | `"dark"` | 主题名称：`"dark"`、`"light"` 或自定义主题 |
+| `externalEditor` | string | `$VISUAL`，然后 `$EDITOR`，Windows 使用 Notepad，其他系统使用 `nano` | `Ctrl+G` 外部编辑器使用的命令；优先级高于环境变量 |
+| `quietStartup` | boolean | `false` | 隐藏启动标题 |
+| `defaultProjectTrust` | string | `"ask"` | 项目信任回退行为：`"ask"`、`"always"` 或 `"never"`；仅全局设置有效 |
+| `collapseChangelog` | boolean | `false` | 更新后以折叠形式显示变更日志 |
+| `enableInstallTelemetry` | boolean | `true` | 首次安装或检测到变更日志更新后，发送匿名安装/更新版本 ping；它不控制更新检查 |
+| `enableAnalytics` | boolean | `false` | 是否选择共享分析数据；目前只会在实验性首次设置（`PI_EXPERIMENTAL=1`）期间询问 |
+| `trackingId` | string | - | 开启 `enableAnalytics` 后生成的分析跟踪标识符 |
+| `doubleEscapeAction` | string | `"tree"` | 连续按两次 Escape 时执行的操作：`"tree"`、`"fork"` 或 `"none"` |
+| `treeFilterMode` | string | `"default"` | `/tree` 的默认过滤模式：`"default"`、`"no-tools"`、`"user-only"`、`"labeled-only"`、`"all"` |
+| `editorPaddingX` | number | `0` | 输入编辑器的水平内边距，范围为 0–3 |
+| `outputPad` | number | `1` | 用户消息、assistant 消息和思考内容的水平内边距，可选 0 或 1 |
+| `autocompleteMaxVisible` | number | `5` | 自动补全下拉框最多显示的项目数，范围为 3–20 |
+| `showHardwareCursor` | boolean | `false` | TUI 为支持输入法定位光标时，是否显示终端光标 |
+| `tuiMode` | string | `"regular"` | 交互 TUI 模式：`"regular"` 或实验性的 `"fullscreen"`；`/settings` 的修改立即生效，启动时的 `--tui-mode` 会覆盖它 |
+| `fullscreenExitOutput` | string | `"transcript"` | 全屏模式退出后的输出：`"transcript"` 打印最终 transcript 和恢复提示，`"resume-hint"` 恢复之前的屏幕并只打印恢复提示；普通 TUI 不受影响 |
+| `fullscreenScrollbar` | string | `"auto"` | 全屏 transcript 滚动条：`"auto"` 只在滚动时临时显示，`"always"` 保留最右侧一列并始终显示，`"hidden"` 隐藏；普通 TUI 不受影响 |
+| `fullscreenCopyOnSelect` | boolean | `true` | 全屏模式中自动复制选中文本；关闭后选区仍会高亮，按 `Ctrl+X` 才复制当前选区 |
 
-`externalEditor` 的优先级是配置字段高于环境变量解析结果；如果使用 VS Code，应设置 `code --wait`，否则 Pi 可能在编辑器进程刚启动时就继续。
+如果使用 VS Code，请加入 `--wait`，这样 Pi 会在编辑器退出后继续：
 
 ```json
 {
@@ -128,23 +98,17 @@ Pi 的设置不是一份“所有选项都放在一起”的无条件配置。�
 }
 ```
 
-输入是一个字符串命令，Pi 会把它用于 `Ctrl+G` 外部编辑器。输出不是模型消息，而是编辑器进程退出后返回编辑器内容。`--wait` 让进程保持到文件关闭；缺少它会让输入过早恢复。命令仍然经过当前平台 shell 约束，不应把未受信任输入拼进配置。
+### 遥测与更新检查：Telemetry and update checks
 
-`enableInstallTelemetry`、`enableAnalytics` 和版本检查是不同开关。设置 `enableInstallTelemetry: false` 只关闭匿名安装/更新 ping，不会停止 Pi 请求最新版本。`PI_SKIP_VERSION_CHECK=1` 关闭版本检查；`--offline` 或 `PI_OFFLINE=1` 关闭这里描述的所有启动网络操作，包括更新、package 更新检查和安装/更新 telemetry。
+`enableInstallTelemetry` 只控制向 `https://pi.dev/api/report-install` 发送匿名安装/更新 ping。退出遥测并不会关闭更新检查；Pi 仍然可以访问 `https://pi.dev/api/latest-version` 查询最新版本。
 
-> 译者注：`quietStartup`、`hideThinkingBlock` 只影响 UI；`--offline` 才是启动网络行为的总开关。不要因为界面没有显示 telemetry 提示，就推断进程没有网络请求。
+设置 `PI_SKIP_VERSION_CHECK=1` 可以关闭 Pi 版本更新检查。使用 `--offline` 或 `PI_OFFLINE=1`，可以关闭本页提到的所有启动网络操作，包括更新检查、包更新检查以及安装/更新遥测。
 
-### Telemetry and update checks
+### 网络：Network
 
-`enableInstallTelemetry` 只控制发送到 `https://pi.dev/api/report-install` 的匿名安装/更新 ping。即使选择退出 telemetry，Pi 仍可能请求 `https://pi.dev/api/latest-version` 检查版本。若要禁止后者，使用 `PI_SKIP_VERSION_CHECK=1`；若要关闭所有启动网络操作，使用 `--offline` 或 `PI_OFFLINE=1`。
-
-排障时应先记录三个事实：命令是否带 `--offline`、环境中是否有 `PI_OFFLINE`、设置里是否关闭了 install telemetry。不要把“无法访问版本服务”误认为模型 Provider 失败；它发生在启动网络检查阶段。
-
-### Network
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `httpProxy` | string | 无 | 作为 `HTTP_PROXY` 和 `HTTPS_PROXY` 应用的 HTTP proxy；仅允许全局设置 |
+| `httpProxy` | string | - | 作为 `HTTP_PROXY` 和 `HTTPS_PROXY` 应用的 HTTP 代理 URL；仅全局设置有效 |
 
 ```json
 {
@@ -152,13 +116,11 @@ Pi 的设置不是一份“所有选项都放在一起”的无条件配置。�
 }
 ```
 
-输入是代理 URL；输出是启动后 Provider 和相关 HTTP 请求使用的环境代理。它是全局字段，放在 `.pi/settings.json` 不应被当作项目级网络授权。失败点包括代理不可达、只代理了 HTTP 而 Provider 使用其他传输、或把凭据直接写入 URL 导致日志泄漏。
+### 警告：Warnings
 
-### Warnings
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `warnings.anthropicExtraUsage` | boolean | `true` | 当 Anthropic subscription auth 可能产生付费 extra usage 时显示警告 |
+| `warnings.anthropicExtraUsage` | boolean | `true` | 当 Anthropic 订阅认证可能使用付费额外用量时显示警告 |
 
 ```json
 {
@@ -168,15 +130,13 @@ Pi 的设置不是一份“所有选项都放在一起”的无条件配置。�
 }
 ```
 
-这个输入只改变警告显示，不改变认证、配额或实际计费。把它设为 `false` 只是静默提醒；如果你需要控制费用，应检查认证方式和 Provider 账户策略，而不是关闭 warning。
+### 上下文压缩：Compaction
 
-### Compaction
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `compaction.enabled` | boolean | `true` | 是否开启自动 compaction |
-| `compaction.reserveTokens` | number | `16384` | 为 LLM 回复保留的 token 数 |
-| `compaction.keepRecentTokens` | number | `20000` | 不进入摘要、直接保留的最近 token 数 |
+| `compaction.enabled` | boolean | `true` | 是否启用自动上下文压缩 |
+| `compaction.reserveTokens` | number | `16384` | 为 LLM 响应预留的 token 数 |
+| `compaction.keepRecentTokens` | number | `20000` | 保留、而不纳入摘要的最近 token 数 |
 
 ```json
 {
@@ -188,29 +148,27 @@ Pi 的设置不是一份“所有选项都放在一起”的无条件配置。�
 }
 ```
 
-`reserveTokens` 是给下一次回复预留的空间，`keepRecentTokens` 决定摘要前保留多少尾部上下文。reserve 太小会增加 overflow 风险；keepRecent 太大可能让 compaction 仍超出 context window。`enabled: false` 不会删除已有历史，只是不再自动触发压缩。
+### 分支摘要：Branch Summary
 
-### Branch Summary
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `branchSummary.reserveTokens` | number | `16384` | 为 branch summarization 预留的 token 数 |
-| `branchSummary.skipPrompt` | boolean | `false` | `/tree` 导航时跳过 `Summarize branch?` 询问；默认不生成摘要 |
+| `branchSummary.reserveTokens` | number | `16384` | 为分支摘要预留的 token 数 |
+| `branchSummary.skipPrompt` | boolean | `false` | 跳过 `/tree` 导航时的“Summarize branch?”提示；默认不生成摘要 |
 
-Branch summary 服务于树导航后的分支理解，不等同于 compaction。`skipPrompt: true` 只是跳过询问，不代表自动生成摘要；如果读者依赖 branch summary 继续工作，应明确选择行为并检查 transcript。
+### 重试：Retry
 
-> 译者注：Compaction 压缩当前上下文以继续运行，branch summary 解释用户从树的一个节点切到另一个节点后的分支历史。两者都会消耗模型请求，但触发点和语义不同，不能只看“都叫 summary”就共用一个配置。
-
-### Retry
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `retry.enabled` | boolean | `true` | 是否开启 Agent-level transient error 自动重试 |
-| `retry.maxRetries` | number | `3` | Agent-level 最大重试次数 |
-| `retry.baseDelayMs` | number | `2000` | 指数退避基数，典型间隔 2s、4s、8s |
-| `retry.provider.timeoutMs` | number | SDK 默认 | Provider/SDK 单次请求超时，毫秒 |
-| `retry.provider.maxRetries` | number | `0` | Provider/SDK 层重试次数 |
-| `retry.provider.maxRetryDelayMs` | number | `60000` | 服务端请求的最大等待时间，毫秒 |
+| `retry.enabled` | boolean | `true` | 是否启用 Agent 层针对临时错误的自动重试 |
+| `retry.maxRetries` | number | `3` | Agent 层最多重试次数 |
+| `retry.baseDelayMs` | number | `2000` | Agent 层指数退避的基础延迟（2 秒、4 秒、8 秒） |
+| `retry.provider.timeoutMs` | number | SDK default | Provider/SDK 请求超时时间，单位为毫秒 |
+| `retry.provider.maxRetries` | number | `0` | Provider/SDK 重试次数 |
+| `retry.provider.maxRetryDelayMs` | number | `60000` | 失败前允许服务端请求的最大延迟（60 秒） |
+
+当 Provider 请求的重试延迟超过 `retry.provider.maxRetryDelayMs` 时，请求会立即失败并返回明确错误，而不是静默等待。设置为 `0` 可以关闭该限制。
+
+除非确实需要 Provider 层重试，否则应保持 `retry.provider.maxRetries` 为 `0`。设为大于 `0` 的值后，SDK/Provider 可能会在 Pi 发现错误之前处理用量限制错误，导致 Agent 等待 Provider 配额恢复。
 
 ```json
 {
@@ -227,46 +185,38 @@ Branch summary 服务于树导航后的分支理解，不等同于 compaction。
 }
 ```
 
-输入同时配置两层 retry，输出是一次请求可能经历的 Agent retry 和 Provider retry 组合。`maxRetryDelayMs` 限制服务端要求的等待；设为 `0` 关闭该限制，意味着可能等待很久。通常保持 `retry.provider.maxRetries` 为 `0`，否则 SDK 可能在 Pi 看到 out-of-usage-limit 之前重试，导致 Agent 长时间卡在配额恢复前。
+### 消息投递：Message Delivery
 
-> 译者注：重试不是“失败就再发一次”这么简单。若 Tool 已经产生外部副作用，重试 Agent step 可能重复副作用；Provider-level retry 还可能发生在 Loop 不可见的地方。生产 Harness 需要区分可重试的 HTTP/Provider 错误、不可重试的参数错误和已经提交的外部动作。
-
-### Message Delivery
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `steeringMode` | string | `"one-at-a-time"` | steering 消息逐条或全部发送：`all`、`one-at-a-time` |
-| `followUpMode` | string | `"one-at-a-time"` | follow-up 消息逐条或全部发送：`all`、`one-at-a-time` |
-| `transport` | string | `"auto"` | 多传输 Provider 的偏好：`sse`、`websocket`、`websocket-cached`、`auto` |
-| `httpIdleTimeoutMs` | number | `300000` | HTTP header/body 空闲超时，也用于有明确流空闲超时的 Provider；`0` 关闭 |
-| `websocketConnectTimeoutMs` | number | `15000` | WebSocket 连接/打开握手超时；`0` 关闭 |
+| `steeringMode` | string | `"one-at-a-time"` | steering 消息的发送方式：`"all"` 或 `"one-at-a-time"` |
+| `followUpMode` | string | `"one-at-a-time"` | follow-up 消息的发送方式：`"all"` 或 `"one-at-a-time"` |
+| `transport` | string | `"auto"` | 对支持多种传输方式的 Provider 使用的首选传输：`"sse"`、`"websocket"`、`"websocket-cached"` 或 `"auto"` |
+| `httpIdleTimeoutMs` | number | `300000` | HTTP header/body 空闲超时时间，单位为毫秒；也用于显式支持流空闲超时的 Provider。设置为 `0` 可关闭 |
+| `websocketConnectTimeoutMs` | number | `15000` | 支持 WebSocket 传输的 Provider 建立连接/打开握手的超时时间，单位为毫秒。设置为 `0` 可关闭 |
 
-steering 是对正在进行的工作作修正，follow-up 是模型本来要停止后排队的新要求。`one-at-a-time` 让每条消息在一个边界消费，`all` 则一次把当前队列送入下一轮。它们都不等于 abort：abort 会取消当前运行，delivery mode 只决定队列如何进入上下文。
+### 终端与图片：Terminal & Images
 
-### Terminal & Images
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `terminal.showImages` | boolean | `true` | Terminal 支持时显示图像 |
-| `terminal.imageWidthCells` | number | `60` | 内联图像偏好的 Terminal 单元宽度 |
-| `terminal.clearOnShrink` | boolean | `false` | 内容变短时清空空行；可能造成闪烁 |
-| `terminal.hyperlinks` | boolean 或 `"auto"` | `"auto"` | 高级 JSON-only 设置，覆盖 OSC 8 hyperlink 支持 |
-| `terminal.images` | string 或 boolean | `"auto"` | 高级 JSON-only 设置，指定 `kitty`、`iterm2`、`false` 或 `auto` |
-| `terminal.trueColor` | boolean 或 `"auto"` | `"auto"` | 高级 JSON-only 设置，覆盖 truecolor 探测 |
-| `images.autoResize` | boolean | `true` | 将图像缩放到最大 2000x2000；影响 `@file`、`read` 和工具返回图像 |
-| `images.blockImages` | boolean | `false` | 阻止所有图像发送给 LLM |
-
-Terminal 能力取决于实际终端。`terminal.images: "auto"` 允许 Pi 探测协议；强制设为 `kitty` 或 `iterm2` 可能在错误终端里产生乱码。`images.blockImages` 影响发送给模型的输入，不等于禁止本地文件读取。
+| `terminal.showImages` | boolean | `true` | 在终端中显示图片（终端支持时） |
+| `terminal.imageWidthCells` | number | `60` | 终端内联图片的首选宽度，单位为终端单元格 |
+| `terminal.clearOnShrink` | boolean | `false` | 内容缩小时清除空行，可能导致闪烁 |
+| `terminal.hyperlinks` | boolean or `"auto"` | `"auto"` | 覆盖 OSC 8 超链接支持（高级，仅 JSON） |
+| `terminal.images` | string or boolean | `"auto"` | 使用 `"kitty"`、`"iterm2"`、`false` 或 `"auto"` 覆盖图片协议支持（高级，仅 JSON） |
+| `terminal.trueColor` | boolean or `"auto"` | `"auto"` | 使用该设置覆盖真彩色支持（高级，仅 JSON） |
+| `images.autoResize` | boolean | `true` | 将图片最大调整为 2000x2000；适用于 `@file` 附件、`read` 以及工具返回的图片 |
+| `images.blockImages` | boolean | `false` | 阻止所有图片发送给 LLM |
 
 ### Shell
 
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `shellPath` | string | 无 | 自定义 shell 路径，例如 Windows Cygwin；支持开头的 `~` |
-| `shellCommandPrefix` | string | 无 | 每条 bash 命令的前缀，例如 `shopt -s expand_aliases` |
-| `npmCommand` | string[] | 无 | npm package lookup/install 使用的 argv，例如 `["mise", "exec", "node@20", "--", "npm"]` |
+| `shellPath` | string | - | 自定义 shell 路径，例如 Windows 上的 Cygwin；支持以 `~` 开头的 home 路径 |
+| `shellCommandPrefix` | string | - | 每条 bash 命令前附加的前缀，例如 `"shopt -s expand_aliases"` |
+| `npmCommand` | string[] | - | 用于 npm 包查找和安装的命令参数，例如 `["mise", "exec", "node@20", "--", "npm"]` |
 
-Windows JSON 路径使用正斜杠或转义反斜杠：
+JSON 中的 Windows 路径必须使用正斜杠，或使用转义的反斜杠：
 
 ```json
 {
@@ -286,15 +236,15 @@ Windows JSON 路径使用正斜杠或转义反斜杠：
 }
 ```
 
-每个输入都是进程启动参数。`shellPath` 决定实际解释器，`shellCommandPrefix` 在每条 bash 命令之前添加设置，`npmCommand` 取代直接调用 npm。Windows JSON 反斜杠若没有转义，文件会是非法 JSON；`npmCommand` 若把整行命令写成一个字符串，也会改变 argv 边界。
+`npmCommand` 用于所有 npm 包管理操作，包括安装、卸载以及 git 包内部的依赖安装。用户作用域的 npm 包安装在 `~/.pi/agent/npm/`；项目作用域的 npm 包安装在 `.pi/npm/`。请按进程实际启动所需的 argv 顺序填写。配置 `npmCommand` 后，git 包的依赖安装使用普通的 `install`，避免在包装器或其他包管理器中传递 npm 专用参数。
 
-`npmCommand` 影响所有 package-manager 操作，包括安装、卸载和 git package 内部依赖安装。用户级 package 安装在 `~/.pi/agent/npm/`，项目级 package 安装在 `.pi/npm/`。配置 wrapper 或替代 package manager 时必须保持 argv 顺序；Pi 会在 git package 依赖安装时使用普通 `install`，避免把 npm 专属 flag 传给其他工具。
+### 工具：Tools
 
-### Tools
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `defaultTools` | string[] | 无 | 启动时启用的内置工具；省略时使用标准默认集合 |
+| `defaultTools` | string[] | - | 启动时启用的内置工具；省略时使用 Pi 的标准默认值 |
+
+`defaultTools` 选择启动时启用的内置工具。Extension 和 SDK 自定义工具仍会启用。可用的内置工具包括 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find` 和 `ls`：
 
 ```json
 {
@@ -302,7 +252,7 @@ Windows JSON 路径使用正斜杠或转义反斜杠：
 }
 ```
 
-这段输入只选择内置工具；扩展工具和 SDK custom tools 仍保持启用。可用内置工具是 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find` 和 `ls`。Windows 可以选择 `powershell`，也可以同时包含 `bash`。
+在 Windows 上，选择 `powershell` 而不是 `bash`，或同时包含二者：
 
 ```json
 {
@@ -310,29 +260,25 @@ Windows JSON 路径使用正斜杠或转义反斜杠：
 }
 ```
 
-空数组意味着“不启用内置工具”，但不会移除扩展和 SDK 工具。命令行覆盖关系如下：`--tools` 替换为严格的全工具 allowlist，`--no-tools` 关闭所有工具，`--no-builtin-tools` 关闭内置默认值，`--exclude-tools` 对最终列表再次过滤。项目 `defaultTools` 数组会替换全局数组，而不是追加。
+空数组表示启动时不启用内置工具，但保留 Extension 和 SDK 自定义工具。`--tools` 会把该行为替换为针对所有工具的严格允许列表；`--no-tools` 禁用所有工具；`--no-builtin-tools` 禁用内置默认工具；`--exclude-tools` 则从最终列表中过滤工具。项目级 `defaultTools` 数组会替换全局数组。
 
-> 译者注：`defaultTools: []` 与 `--no-tools` 不一样。前者保留扩展/SDK 工具，后者连这些工具也关闭。判断“模型能不能调用工具”必须看最终 registry，而不是只看 settings 文件里的一行。
+### 会话：Sessions
 
-### Sessions
-
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `sessionDir` | string | 无 | Session 文件目录；支持绝对路径、相对路径和 `~` |
+| `sessionDir` | string | - | 会话文件的存储目录；接受绝对路径、相对路径和 `~` |
 
 ```json
-{
-  "sessionDir": ".pi/sessions"
-}
+{ "sessionDir": ".pi/sessions" }
 ```
 
-多个来源设置 Session 目录时，优先级是 `--session-dir`，再 `PI_CODING_AGENT_SESSION_DIR`，最后是 `settings.json` 的 `sessionDir`。输入是目录选择，输出是 SessionManager 后续创建/恢复文件时使用的位置；目录不可写或放在不受信项目路径时会失败。
+当多个来源指定会话目录时，优先级依次为 `--session-dir`、`PI_CODING_AGENT_SESSION_DIR`，然后是 settings.json 中的 `sessionDir`。
 
-### Model Cycling
+### 模型循环：Model Cycling
 
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `enabledModels` | string[] | 无 | `Ctrl+P` 模型轮换的 model patterns，格式与 `--models` CLI 参数相同 |
+| `enabledModels` | string[] | - | 使用 `Ctrl+P` 循环切换的模型匹配模式，格式与 `--models` CLI 参数相同 |
 
 ```json
 {
@@ -340,35 +286,33 @@ Windows JSON 路径使用正斜杠或转义反斜杠：
 }
 ```
 
-模式输入由 Provider/model catalog 匹配，输出是可以由 `Ctrl+P` 循环选择的模型集合。没有匹配时不会凭空创建模型；通配符写错、模型已被移除或当前认证不支持时，循环列表可能为空。
-
 ### Markdown
 
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `markdown.codeBlockIndent` | string | `"  "` | 代码块的缩进字符串 |
-| `markdown.mermaid` | string | `"streaming"` | Mermaid 渲染模式：`off`、`final` 或 `streaming` |
+| `markdown.codeBlockIndent` | string | `"  "` | 代码块缩进 |
+| `markdown.mermaid` | string | `"streaming"` | Mermaid 渲染模式：`"off"`、`"final"` 或 `"streaming"` |
 
-Markdown 设置只控制呈现。`markdown.mermaid: "off"` 不会删除 Mermaid 源码，而是关闭渲染；`final` 等待最终输出，`streaming` 在流式生成中呈现。解析失败时需要检查主题、缩进和 Mermaid 语法，不能通过重试 Provider 解决。
+### 资源：Resources
 
-### Resources：Extensions、Skills、Prompts 与 Themes
+这些设置决定从哪里加载 Extension、skills、prompts 和 themes。
 
-这些字段决定从哪里加载 extensions、skills、prompts 和 themes：
+`~/.pi/agent/settings.json` 中的路径相对于 `~/.pi/agent` 解析；`.pi/settings.json` 中的路径相对于 `.pi` 解析。支持绝对路径和 `~`。
 
-| 设置 | 类型 | 默认值 | 说明 |
+| 设置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `packages` | array | `[]` | 从 npm/git package 加载资源 |
-| `extensions` | string[] | `[]` | 本地 extension 文件或目录 |
-| `skills` | string[] | `[]` | 本地 skill 文件或目录 |
-| `prompts` | string[] | `[]` | 本地 prompt template 文件或目录 |
-| `themes` | string[] | `[]` | 本地 theme 文件或目录 |
-| `enableSkillCommands` | boolean | `true` | 是否注册 `/skill:name` 命令 |
+| `packages` | array | `[]` | 要从中加载资源的 npm/git 包 |
+| `extensions` | string[] | `[]` | 本地 Extension 文件路径或目录 |
+| `skills` | string[] | `[]` | 本地 skill 文件路径或目录 |
+| `prompts` | string[] | `[]` | 本地 prompt 模板路径或目录 |
+| `themes` | string[] | `[]` | 本地主题文件路径或目录 |
+| `enableSkillCommands` | boolean | `true` | 是否将 skills 注册为 `/skill:name` 命令 |
 
-全局文件中的相对路径相对于 `~/.pi/agent`，项目文件中的相对路径相对于 `.pi`；绝对路径和 `~` 都支持。数组支持 glob 和排除模式：`!pattern` 排除，`+path` 强制包含精确路径，`-path` 强制排除精确路径。资源加载会受到 Project Trust 影响，路径匹配成功不代表资源一定会执行。
+数组支持 glob 模式和排除项。使用 `!pattern` 排除，使用 `+path` 强制包含精确路径，使用 `-path` 强制排除精确路径。
 
-#### packages
+#### `packages`
 
-字符串形式加载 package 的全部资源：
+字符串形式会从一个包中加载全部资源：
 
 ```json
 {
@@ -376,9 +320,7 @@ Markdown 设置只控制呈现。`markdown.mermaid: "off"` 不会删除 Mermaid 
 }
 ```
 
-输入是 package 名称列表，输出是 package 暴露的全部资源。package 找不到、安装失败或项目未被信任时，加载会失败或被跳过；不要把 package 名称误当成 npm install 命令。
-
-对象形式可以筛选资源：
+对象形式可以筛选要加载的资源：
 
 ```json
 {
@@ -392,9 +334,9 @@ Markdown 设置只控制呈现。`markdown.mermaid: "off"` 不会删除 Mermaid 
 }
 ```
 
-对象输入指定来源和资源类型；空 `extensions` 表示不从该 package 加载 extension。它的输出是 ResourceLoader 使用的筛选结果，不会改变 package 本身内容。字段拼写、数组类型或 glob 错误会导致资源缺失，应在启动日志和 `/reload` 后重新确认。
+包管理细节见 [packages.md](/pi-docs/coding-agent/packages)。
 
-### Example：一份可读的全局设置
+## 示例
 
 ```json
 {
@@ -422,20 +364,18 @@ Markdown 设置只控制呈现。`markdown.mermaid: "off"` 不会删除 Mermaid 
 }
 ```
 
-这份输入适合作为全局基础配置：指定启动 Provider/model/thinking，开启 compaction，配置 Agent retry，限制模型轮换，并加载一组 package 资源。输出是启动时的默认配置；项目文件、环境变量和命令行仍可能覆盖其中部分字段。失败排查应逐项注释字段，而不是一次删除全部配置，否则无法定位哪个选项被拒绝。
+## 项目覆盖：Project Overrides
 
-## Project Overrides：嵌套对象如何合并
-
-全局设置先提供默认值，项目设置覆盖同名字段；嵌套对象按字段合并：
+项目设置（`.pi/settings.json`）会覆盖全局设置。嵌套对象会合并：
 
 ```json
-// ~/.pi/agent/settings.json（global）
+// ~/.pi/agent/settings.json (global)
 {
   "theme": "dark",
   "compaction": { "enabled": true, "reserveTokens": 16384 }
 }
 
-// .pi/settings.json（project）
+// .pi/settings.json (project)
 {
   "compaction": { "reserveTokens": 8192 }
 }
@@ -447,118 +387,42 @@ Markdown 设置只控制呈现。`markdown.mermaid: "off"` 不会删除 Mermaid 
 }
 ```
 
-输入是两个 JSON 对象，输出是字段级合并结果：项目只改变 `reserveTokens`，所以全局的 `enabled` 和 `theme` 保留。数组通常按项目值替换，不应假设 `defaultTools`、`enabledModels` 或资源数组会自动拼接。若发现项目设置“覆盖过多”，先检查它是否提供了完整数组。
-
-> 译者注：嵌套对象合并是配置语义，具体字段仍有自己的限制。例如 `defaultProjectTrust` 只允许全局；`sessionDir` 还有命令行和环境变量优先级；`defaultTools` 的项目数组会替换全局数组。学习配置时要把“通用合并规则”和“字段局部规则”分开。
-
-## Go 与 Java 对照
-
-| 配置问题 | Pi / TypeScript | Go 教学实现 | Java 教学实现 |
-| --- | --- | --- | --- |
-| 取消 | `AbortSignal` | `context.Context` | `CancellationToken` 加线程中断 |
-| 嵌套配置 | interface + merge | struct + 显式 merge | record/DTO + 显式 merge |
-| 工具选择 | `defaultTools` 与 CLI allowlist | `Registry` | `ToolRegistry` |
-| 资源 | ResourceLoader | Skill/Plugin discovery | `SkillDiscovery`/`ServiceLoader` |
-| 重试 | Agent/Provider 分层 | `RetryPolicy` | `LoopOptions` retry |
-| 会话目录 | settings + env + CLI | `SessionPath` | `Path sessionPath` |
-
-Pi 的设置文件只描述配置输入，最终的 Agent 行为还要经过 ResourceLoader、AgentSession、Provider、Tool Registry 和 TUI。Go/Java 示例没有复刻完整 Pi settings parser，而是把可测试的配置边界显式放入构造函数；这比把 JSON 任意字段反射进对象更容易发现错误。
-
-## 实验：用最小项目验证覆盖和信任
-
-### 目标
-
-验证“全局默认、项目覆盖、命令行优先、trust 决定资源是否加载”这四件事，不把配置问题误判成模型问题。
-
-### 准备
-
-1. 创建一个临时项目目录，不要使用含有真实凭据的仓库。
-2. 在 `~/.pi/agent/settings.json` 只加入 `theme` 和 `compaction` 的安全测试值。
-3. 在项目 `.pi/settings.json` 只覆盖 `compaction.reserveTokens`。
-4. 准备一个不执行副作用的 Skill 或 Extension，观察它是否被发现。
-
-### 步骤
-
-1. 用交互模式启动，记录是否出现 trust 询问。
-2. 选择不信任，检查项目设置和资源是否没有进入本次上下文。
-3. 重新启动并使用 `--approve`，比较最终设置和资源发现结果。
-4. 用 `--no-approve` 再启动，确认单次命令覆盖信任而不写永久决定。
-5. 在 `/model` 中选择模型并按 `Ctrl+S`，重启验证 `defaultProvider`/`defaultModel`。
-6. 用 `/thinking` 保存 thinking level，检查 `modelThinkingLevels` 是否按模型记录。
-7. 设置 `defaultTools: []`，再用 `--tools read`，比较最终工具定义。
-8. 临时设置 `PI_SKIP_VERSION_CHECK=1`，确认版本检查变化；用 `--offline` 验证更广泛的启动网络关闭。
-9. 故意把 `reserveTokens` 写成字符串或删掉逗号，记录 Pi 的错误位置。
-
-### 观察点
-
-- 项目对象只覆盖同名字段，嵌套对象的其他字段通常保留。
-- 项目资源是否加载由 trust 决定，不能只看文件是否存在。
-- `--approve`/`--no-approve` 是单次覆盖，`/trust` 才写保存决定。
-- `--tools`、`--no-tools`、`defaultTools: []` 的最终 registry 不同。
-- `--offline` 与 install telemetry opt-out 的范围不同。
-
-### 预期结果
-
-你应该能画出 `settings files → trust → merge → env/CLI → runtime` 的流程，并能指出每个字段最终由哪个层级决定。遇到“配置没有生效”时，先按照路径、JSON 类型、trust、优先级、reload/重启的顺序排查。
-
-## 排障清单
-
-| 症状 | 优先检查 | 可能原因 |
-| --- | --- | --- |
-| 项目设置完全没生效 | `trust.json`、启动模式、`defaultProjectTrust` | 非交互模式默认不信任，或使用了 `--no-approve` |
-| 只改了一个嵌套字段却其他默认消失 | 最终 JSON 和数组字段 | 对象按字段合并，数组往往整体替换 |
-| `/model` 保存后重启仍没变化 | `Ctrl+S`、Provider/model ID、认证 | 只切换了当前模型，未实际保存，或模型 ID 不存在 |
-| 外部编辑器内容为空 | `$VISUAL`/`$EDITOR`、`code --wait` | 编辑器没有等待退出，或命令路径不可执行 |
-| Provider 请求一直等待 | timeout、idle timeout、proxy、offline | Provider 层重试和流空闲超时叠加 |
-| 工具不在 prompt 中 | `defaultTools`、CLI flags、Extension | allowlist 过滤、内置工具关闭或项目资源未加载 |
-| compaction 频繁发生 | `reserveTokens`、`keepRecentTokens`、model context | 预算太小或保留尾部过大 |
-| package/Skill 找不到 | 路径基准、glob、trust、`npmCommand` | 相对路径基于不同 settings 目录，package 安装失败 |
-
-## 小结
-
-Settings 是从文件到运行时的配置边界，不是一个可以绕过安全和生命周期的万能开关。先确定全局/项目文件，再确认 trust，之后按嵌套对象、数组、环境变量和命令行的优先级解释最终值。模型、Tool、Session、Compaction、Extension、Skill 和网络选项各有自己的局部语义；准确排障需要观察最终 runtime，而不是只读一行 JSON。
+> 译者注：对象合并意味着项目文件只需要提供要覆盖的键；未出现的全局键仍然保留。数组的替换规则要按具体设置实现确认，不能把“对象合并”泛化为所有值都递归合并。
 
 ## 章节对照
 
-| 源文档标题 | 中文阅读标题 |
+| 源文档章节 | 中文章节 |
 | --- | --- |
-| Settings | Settings |
 | Project Trust | 项目可信度 |
-| All Settings | All Settings |
-| Model & Thinking | 模型与 Thinking |
-| UI & Display | UI 与显示 |
-| Telemetry and update checks | Telemetry and update checks |
-| Network | Network |
-| Warnings | Warnings |
-| Compaction | Compaction |
-| Branch Summary | Branch Summary |
-| Retry | Retry |
-| Message Delivery | Message Delivery |
-| Terminal & Images | Terminal & Images |
+| All Settings | 所有设置 |
+| Model & Thinking | 模型与思考 |
+| UI & Display | 界面与显示 |
+| Telemetry and update checks | 遥测与更新检查 |
+| Network | 网络 |
+| Warnings | 警告 |
+| Compaction | 上下文压缩 |
+| Branch Summary | 分支摘要 |
+| Retry | 重试 |
+| Message Delivery | 消息投递 |
+| Terminal & Images | 终端与图片 |
 | Shell | Shell |
-| Tools | Tools |
-| Sessions | Sessions |
-| Model Cycling | Model Cycling |
+| Tools | 工具 |
+| Sessions | 会话 |
+| Model Cycling | 模型循环 |
 | Markdown | Markdown |
-| Resources | Resources |
-| Example | Example |
-| Project Overrides | Project Overrides |
+| Resources | 资源 |
+| Example | 示例 |
+| Project Overrides | 项目覆盖 |
 
 ## 使用建议
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+1. 先确认设置文件的作用域和项目是否可信。
+2. 再按配置分组查找字段，并注意默认值、作用域和环境变量优先级。
+3. 修改配置后，用最小项目验证最终值，不要把项目资源是否加载误判为设置没有覆盖成功。
 
 ## 完整原文对照
 
-[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/settings.md)
+[在 GitHub 打开固定 commit 的源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/settings.md)
 
 ````markdown
 # Settings

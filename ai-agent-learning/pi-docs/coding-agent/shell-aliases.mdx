@@ -1,47 +1,17 @@
 ---
-title: "Shell Aliases"
-description: "在 Pi 的非交互 bash 中安全、可验证地加载用户 alias。"
+title: "Shell 别名"
+description: "在 Pi 的非交互 Bash 中启用并安全检查 Shell 别名。"
 ---
 
-# Shell Aliases
+# Shell 别名
 
-> 本页是 `packages/coding-agent/docs/shell-aliases.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、配置字段、路径和 shell 语法保留原样。
-
-## 中文导读
-
-Pi 使用非交互模式运行 bash，具体行为相当于 `bash -c`。Bash 在这种模式下默认不会展开 alias，所以你在交互式终端里能执行的 `ll`、`gs` 或 `croot`，直接由 Pi 的 shell tool 执行时可能会变成 `command not found`。
-
-本页解决的不是“让 Pi 记住几个快捷词”，而是解释一条完整的配置链：
-
-```text
-Pi shell command
-  -> shellCommandPrefix
-  -> bash -c 的启动环境
-  -> expand_aliases
-  -> 读取 shell 配置中的 alias 定义
-  -> 执行本次 command
-```
-
-`settings.json` 中的 `shellCommandPrefix` 会在命令前注入一段 shell 文本。它影响 shell 初始化方式，但不会把交互式 shell 的所有行为自动复制到 Pi；函数、插件、补全、环境变量和 zsh 专属语法仍需分别确认。
+> 本页根据 `packages/coding-agent/docs/shell-aliases.md` 重新翻译，研究基线为 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、配置字段、路径和 shell 语法保持原样。
 
 ## 中文译文
 
-### 1. 为什么默认 alias 不生效
+Pi 以非交互模式运行 bash，相当于执行 `bash -c`。这种模式默认不会展开 Shell 别名，因此交互式终端里可用的快捷命令，在 Pi 的 shell 工具中可能找不到。
 
-Pi 的 bash tool 以非交互方式执行 `bash -c`。Bash 默认只在交互 shell 中展开 alias，因此：
-
-```bash
-alias ll='ls -la'
-ll
-```
-
-在你打开的交互式终端中可能成功，但同样的 `ll` 通过 Pi 的 shell command 运行时可能失败。失败原因不是 Pi 把 alias 删除了，而是该次 `bash -c` 没有读取并启用交互 alias 展开。
-
-> 译者注：这可以类比 Java `ProcessBuilder` 启动一个全新进程：子进程不会自动继承父进程的 Java 对象、线程局部状态或 shell 的交互状态。Go `exec.Command("bash", "-c", command)` 也会遇到同样问题。
-
-### 2. 配置位置和最小示例
-
-要启用 shell aliases，在 `~/.pi/agent/settings.json` 添加：
+要启用 shell alias，可以在 `~/.pi/agent/settings.json` 中加入：
 
 ```json
 {
@@ -49,82 +19,32 @@ ll
 }
 ```
 
-这段 JSON 里有两个层次的转义：JSON 使用 `\n` 表示换行，shell 字符串在运行时才会变成真正的换行；`\"` 用于让传给 shell 的 `eval` 命令包含引号。编辑 JSON 时不要把实际换行直接塞进一个普通 JSON 字符串，也不要漏掉反斜杠。
+这个值会作为前缀注入每次 shell 命令。JSON 中的 `\n` 在传给 shell 时变成换行，`\"` 则只是 JSON 对双引号的转义。路径应按照你的实际 shell 配置调整，例如 `~/.zshrc` 或 `~/.bashrc`。
 
-前缀展开后大致等价于：
+展开后大致相当于：
 
 ```bash
 shopt -s expand_aliases
 eval "$(grep '^alias ' ~/.zshrc)"
 ```
 
-第一行打开 Bash 的 alias expansion。第二行从 `~/.zshrc` 读取以 `alias ` 开头的行，把这些定义交给 `eval` 执行，然后 Pi 才运行实际 command。
+`shopt -s expand_aliases` 打开 Bash 的 alias 展开；随后 `grep '^alias '` 取出配置文件中以 `alias ` 开头的行，`eval` 将这些行作为 shell 代码执行。`grep` 只匹配简单的行首 alias，不会完整加载函数、条件语句或复杂 shell 初始化逻辑。
 
-> 译者注：`eval` 会把文本当成 shell 代码重新解析，因此它不是“免费读取配置”。只有在你信任该配置文件、确认它的内容和权限时才使用；不要把模型可写文件或网络响应直接拼进 `eval`。
+> 译者注：`eval` 会再次解析文本，因此它不是安全的配置读取器。只应对自己信任且已检查权限的配置文件使用；不要把模型输出、网络响应或可写文件的内容直接拼接进 `eval`。
 
-### 3. 路径必须匹配你的 shell
+Bash 别名只在 shell 解析阶段生效，不会改变 Agent Loop 或 Tool Registry 的权限。比如 `alias deploy='git push'` 仍会执行 `git push`，短名称不代表风险更低。带参数的工作流通常应使用 shell 函数或明确的 Pi Tool，而不是强行塞进简单的 alias 提取规则。
 
-示例读取 `~/.zshrc`，因为作者的 alias 可能在那里。若你使用 Bash，通常应改为 `~/.bashrc`；若配置放在其他文件，使用实际路径。不要因为当前终端是 zsh 就假设 Pi 的执行 shell 也是 zsh；文档明确说 Pi 运行 bash。
+## 安全检查
 
-| 你的情况 | 应检查 |
-| --- | --- |
-| 交互终端是 zsh | alias 是否真的位于 `~/.zshrc`，以及语法是否能被 Bash 解析 |
-| 交互终端是 bash | 通常读取 `~/.bashrc`，但确认文件没有依赖交互专属状态 |
-| alias 定义分散 | 选一个专门的、只包含兼容定义的文件 |
-| alias 使用 zsh 专属语法 | 不要直接注入 bash；改写成 bash 可解析形式或不用 alias |
-| 文件由其他用户可写 | 先修复权限，否则执行配置本身可能被篡改 |
+启用前至少确认：
 
-`grep '^alias '` 只匹配行首是 `alias ` 的简单定义。带前导空格、换行拼接、函数、条件语句或复杂生成逻辑的配置，不一定会被复制。这里的限制是有意的：只提取简单 alias 比执行整个 `.zshrc` 更容易审查，但也意味着“我的 alias 明明在配置里”不一定等于 Pi 会加载它。
+- `.zshrc` 或 `.bashrc` 由当前用户拥有，不能被不可信用户修改；
+- `grep` 取出的内容只来自你审查过的 alias 行；
+- alias 不会删除文件、上传数据或修改远端仓库；
+- alias 不依赖只能在交互终端中获得的状态；
+- shell 命令仍受 Pi 的权限、容器网络策略和超时控制。
 
-### 4. 参数、别名和函数不是一回事
-
-普通 alias 适合固定文本替换，例如：
-
-```bash
-alias ll='ls -la'
-alias gs='git status'
-```
-
-但带参数的工作流通常应该用 shell function，或者注册一个明确的 Pi tool；不要把复杂函数硬塞进 `grep '^alias '` 的提取规则。也不要把 alias 当作权限系统：`alias deploy='git push'` 仍然会运行 `git push`，它不会因为名字短就更安全。
-
-> 译者注：alias 展开发生在 shell 解析阶段，不是 Agent Loop 的 Tool Registry。模型看到的 command 仍可能通过 alias 触发隐藏的副作用，因此审批、日志和 allowlist 应针对展开后的真实命令。
-
-### 5. 配置加载和验证顺序
-
-建议按下面顺序配置，而不是一改完 settings 就在真实仓库执行破坏性命令：
-
-1. 备份 `~/.pi/agent/settings.json` 和 alias 文件。
-2. 单独创建只含 `alias pi_test='printf test\n'` 的临时配置文件。
-3. 在 JSON 中设置 `shellCommandPrefix`，检查 JSON 是否能被解析。
-4. 用一个无害 command 验证前缀是否执行，例如 `type pi_test`。
-5. 再执行 `pi_test`，观察输出是否为预期文本。
-6. 最后才逐项加入真实 alias，并记录哪一项依赖 zsh、插件或环境变量。
-
-若命令失败，要先区分三层：
-
-```text
-JSON parse failure
-  -> settings 没有加载
-shell prefix failure
-  -> bash 启动了，但前缀命令失败
-alias lookup failure
-  -> 前缀成功，目标 alias 没有定义或不能在 bash 展开
-command failure
-  -> alias 已展开，但真实命令自身失败
-```
-
-### 6. Shell 安全检查
-
-加载 alias 的前缀本身有执行代码的能力。至少检查：
-
-- `~/.zshrc`/`~/.bashrc` 是否由当前用户拥有且不可被不可信用户写入；
-- `grep` 的结果是否只来自你审查过的 alias 行；
-- alias 中是否包含 `curl | sh`、删除文件、上传数据或修改远端仓库；
-- 是否会把 API key、token 或环境变量展开进日志；
-- alias 是否依赖交互终端才能正常运行；
-- Pi 的 PermissionPolicy、容器网络策略和超时是否仍然覆盖展开后的命令。
-
-不要使用下面这种不受控模式：
+不要使用下面这种把远程内容交给 `eval` 的形式：
 
 ```bash
 # 不要把模型或远端响应拼接到 eval
@@ -132,78 +52,35 @@ value=$(curl -fsS https://example.invalid/config)
 eval "$value"
 ```
 
-正确的教学实验只加载固定、人工审查过的 alias 文件，并在临时 workspace 中执行无害命令。
-
-> 译者注：这也是为什么 shell alias 属于便利层而不是 Harness 能力。Harness 需要知道“将要执行什么”，而 alias 可能在 shell 内部把短名称展开成另一条命令；安全审计若停在 alias 名称，会遗漏真实副作用。
-
-### 7. Go 与 Java 对照
+## Go 与 Java 对照
 
 | Pi/TypeScript | Go | Java |
 | --- | --- | --- |
 | `shellCommandPrefix` | `exec.CommandContext("bash", "-c", prefix+command)` | `ProcessBuilder("bash", "-c", prefix+command)` |
 | `settings.json` | `encoding/json` 解码配置 struct | Jackson 解码配置 record/类 |
 | 进程取消 | `context.Context` | `Future`/`CancellationToken`/中断 |
-| 命令审计 | `io.Writer` 或事件 callback | Listener/Telemetry span |
+| 命令审计 | `io.Writer` 或事件 callback | Listener/Telemetry Span |
 
-两种实现都应把 prefix 和 command 当成不可信输入边界，先做配置验证，再进入进程执行；不要因为使用标准库就跳过路径、网络和凭据策略。
+这些只是实现类比。prefix 和 command 都应视为输入边界，先验证配置，再启动进程。
 
-### 8. 动手实验与排障
+## 实验与排障
 
-#### 目标
+1. 在临时 alias 文件中只写 `alias pi_test='printf "alias works\\n"'`，不要直接加载真实配置。
+2. 不打开 `expand_aliases`，运行 `bash -c 'pi_test'`，记录命令找不到的错误。
+3. 加入 `shopt -s expand_aliases` 并执行 `eval`，再用 `type pi_test` 确认定义已经进入当前 shell。
+4. 执行 `pi_test`，确认输出符合预期；再把路径改成不存在的文件，区分读取配置失败和 alias 不存在。
+5. 将 alias 指向一个会失败的命令，确认“alias 已展开”和“命令执行成功”是两个状态。
 
-在临时目录让一个固定 alias 成功展开，并故意制造三种不同失败，学会定位错误层次。
-
-#### 准备
-
-创建临时 alias 文件，只写：
-
-```bash
-alias pi_test='printf "alias works\n"'
-```
-
-不要把真实 `.zshrc`、SSH 配置或 API key 交给实验。先用 `type pi_test` 检查定义，再用 `pi_test` 检查执行。
-
-#### 步骤
-
-1. 不设置 `expand_aliases`，运行 `bash -c 'pi_test'`，记录 `command not found`。
-2. 加入 `shopt -s expand_aliases`，再运行，确认仍需把 alias 定义加载进当前 shell。
-3. 用固定 alias 文件替代真实配置，执行 `eval "$(grep '^alias ' file)"`。
-4. 运行 `type pi_test`，确认 Bash 看到 alias。
-5. 把路径改成不存在的文件，区分 `grep` 错误与 alias 不存在。
-6. 将 alias 改成会失败的真实命令，确认“已展开”和“命令成功”是两个状态。
-7. 用 Pi 的受限 workspace 运行同样命令，检查 shell prefix 日志是否泄漏敏感内容。
-
-#### 排障表
-
-| 现象 | 原因方向 | 修复动作 |
-| --- | --- | --- |
-| `ll: command not found` | 没开 `expand_aliases` 或没加载定义 | 检查 prefix 和 alias 文件 |
-| `shopt: command not found` | 实际执行的不是 bash | 检查 Pi tool 与命令入口 |
-| JSON parse error | JSON 字符串转义错误 | 校验反斜杠和换行 |
-| alias 在终端有效、Pi 无效 | shell/文件/非交互差异 | 用 `type` 和固定 prefix 验证 |
-| alias 展开后行为危险 | alias 隐藏真实命令 | 展开后审查、限制权限和网络 |
-| `eval` 执行异常内容 | 配置文件不可信或被篡改 | 停止加载，检查 owner/mode |
-
-> 译者注：排障时不要从“模型为什么不会我的 alias”开始。先在同一个 `bash -c` 环境重现，再逐层加入 prefix、定义和真实 command；这和排查 Agent Loop 时先区分 provider、tool registry、executor 是同一种边界思维。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
+| 现象 | 优先检查 |
 | --- | --- |
-| Shell Aliases | Shell Alias（非交互 Bash） |
+| `ll: command not found` | 是否打开 `expand_aliases`，以及是否加载了定义。 |
+| `shopt: command not found` | 实际执行入口是否是 Bash。 |
+| JSON 解析错误 | JSON 字符串的反斜杠和换行转义。 |
+| 终端可用、Pi 不可用 | 非交互 shell、配置文件路径和 Bash 语法差异。 |
+| alias 展开后行为危险 | 展开后的真实命令、权限和网络策略。 |
+| `eval` 执行了异常内容 | 配置文件的来源、拥有者和权限。 |
 
-## 使用建议
-
-1. 先复制最小 JSON 配置，确认换行和引号转义。
-2. 使用临时 alias 文件和无害 command 验证，不要直接执行真实部署 alias。
-3. 发生错误时按 JSON、prefix、alias lookup、真实 command 四层定位。
-4. 将 alias 当作便利层，不要当作权限、审批或 sandbox。
-
-<Note>
-
-以下原文是完整核对附录；中文译文补充了非交互 shell、`eval` 风险、Go/Java 对照和排障步骤，但不改变源文档的配置含义。
-
-</Note>
+> 译者注：排查时应先在同一个 `bash -c` 环境中复现，再逐层加入前缀、alias 定义和真实命令。这样能区分 JSON、shell 启动、alias 查找和命令本身四种故障。
 
 ## 完整原文对照
 

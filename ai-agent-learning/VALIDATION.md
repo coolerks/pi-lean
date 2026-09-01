@@ -27,6 +27,7 @@
 | `packages/coding-agent/docs/*.md` | 30 个源文件 |
 | `ai-agent-learning/pi-docs/coding-agent/*.mdx` | 30 个中文页 |
 | `translation-map.json` 数量/路径 | 34/34 通过 |
+| 中文正文结构（标题/围栏/代码块） | 34 页未发现源标题或代码块缺失；`extensions`、`rpc`、`sdk` 已重新组装并审计 |
 | 源文档完整原文附录 byte-equivalence | 34/34 通过 |
 | 原创/参考 MDX 总数 | 138 |
 | `docs.json` 导航页 | 138；脚本检查缺失 0；页面与导航一一对应 |
@@ -38,8 +39,8 @@
 | --- | --- |
 | `cd ai-agent-learning && npx --yes mint@latest validate` | 通过；修复过 `List<Message>` 的 MDX angle bracket、裸 URL 和 Session 表格中的 angle bracket |
 | `cd ai-agent-learning && npx --yes mint@latest broken-links` | 通过；无 broken links |
-| `cd ai-agent-learning && npx --yes mint@latest a11y` | MDX/图片检查通过；CLI 检查 140 个 MDX（仓库 138 个页面，CLI 还计入 2 个入口）；颜色总体 WARN（primary AA，dark color 已达到暗色背景 3:1；建议 AAA 仍待品牌设计） |
-| `cd ai-agent-learning && npx --yes mint@latest dev` + `curl -fsS http://127.0.0.1:3000/` | 通过；首页和 `/00-guide/reading-path` 返回本地 HTML；随后已停止 dev server |
+| `cd ai-agent-learning && npx --yes mint@latest a11y` | MDX/图片检查通过；CLI 检查 141 个 MDX（仓库 138 个页面，CLI 还计入入口文件）；颜色总体 WARN（primary AA，dark color 已达到暗色背景 3:1；建议 AAA 仍待品牌设计） |
+| `cd ai-agent-learning && npx --yes mint@latest dev --port 3000` + `curl -fsS http://127.0.0.1:3000/` | 通过；首页和 `/00-guide/reading-path` 返回本地 HTML；随后已停止 dev server |
 | `cd examples/go-agent && go test ./...` | 通过 |
 | `cd examples/go-agent && go test -race ./...` | 通过 |
 | `cd examples/go-agent && go vet ./...` | 通过 |
@@ -47,7 +48,7 @@
 | `cd examples/java-agent && mvn test` | 通过 |
 | `cd examples/java-agent && mvn package` | 通过；生成 fat jar |
 | `cd examples/java-agent && java -jar target/agent-harness-1.0.0.jar --demo` | 通过；输出 final `2 + 3 = 5` |
-| `python3` 导航/manifest/frontmatter/appendix 检查 | 通过；导航 138/138，翻译附录 34/34 byte-equivalent |
+| `python3` 导航/manifest/frontmatter/appendix/translation structure 检查 | 通过；导航 138/138，翻译附录 34/34 byte-equivalent；三页重组正文的标题、围栏、代码块与链接检查通过 |
 | `npm run check`（根依赖安装后） | 失败：`tsgo --noEmit` 在现有 Pi `packages/ai/src/providers/*.models.ts` 首先报告 JSON manifest 为 `unknown`，随后 `packages/ai/test`、`packages/coding-agent/test` 出现大量 models catalog 类型为 `never`/未知模型错误；未修改 Pi 核心或 `models.generated.ts`，保留该真实失败 |
 | `curl` 生产页面并检查 HTML | 通过；生产页面返回 HTTP 200，HTML 未包含 `vercel.live` Toolbar 注入标记 |
 

@@ -1,173 +1,243 @@
 ---
-title: "Pi Packages"
-description: "安装、管理、创建和筛选 Pi package。"
+title: "Pi 软件包"
+description: "安装和管理包含 Extension、Skill、提示词模板与主题的 Pi 软件包。"
 ---
 
-# Pi Packages
+> Pi 可以帮助你创建 Pi 软件包。你可以让它把扩展、技能、提示词模板或主题打包起来。
 
-> 本页是 `packages/coding-agent/docs/packages.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+# Pi 软件包
 
-## 中文导读
+Pi 软件包用于捆绑 Extension、Skill、提示词模板和主题，方便通过 npm 或 git 分发。软件包可以在 `package.json` 的 `pi` 字段中声明资源，也可以使用约定目录。
 
-安装、管理、创建和筛选 Pi package。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+## 目录
 
-## 中文译文
+- [安装和管理](#安装和管理)
+- [软件包来源](#软件包来源)
+- [创建 Pi 软件包](#创建-pi-软件包)
+- [软件包结构](#软件包结构)
+- [依赖](#依赖)
+- [软件包过滤](#软件包过滤)
+- [启用和禁用资源](#启用和禁用资源)
+- [作用域和去重](#作用域和去重)
 
-Pi package 是可共享的资源包，能够捆绑 extensions、skills、prompt templates 和 themes，通过 npm 或 git 分发。资源可以写在 `package.json` 的 `pi` manifest 中，也可以使用约定目录。安装第三方 package 前必须审查源码：Extension 在宿主进程中运行任意代码，Skill 也可能指示模型执行危险命令。
+## 安装和管理
 
-### 安装、更新与来源
+> **安全提示：** Pi 软件包以完整的系统权限运行。Extension 可以执行任意代码，Skill 也可能指示模型执行包括启动可执行文件在内的任何操作。安装第三方软件包前，请先检查源代码。
 
-常用命令是 `pi install npm:@foo/bar@1.0.0`、`pi install git:github.com/user/repo@v1`、HTTP URL 和本地绝对/相对路径；`pi remove` 删除声明，`pi list` 查看已安装包，`pi update --all` 同时更新 Pi、package 并校准 pinned git refs，`--extensions` 只更新资源，`--models` 只更新模型目录，`--self` 只更新 Pi。`pi -e`/`--extension` 只在当前运行临时安装，不写持久设置。默认写入 `~/.pi/agent/settings.json`，`-l` 写入项目 `.pi/settings.json`；项目启动前必须通过 trust。
+```bash
+pi install npm:@foo/bar@1.0.0
+pi install git:github.com/user/repo@v1
+pi install https://github.com/user/repo  # raw URLs work too
+pi install /absolute/path/to/package
+pi install ./relative/path/to/package
 
-npm spec 可以是 `npm:@scope/pkg@1.2.3` 或 `npm:pkg`。带版本的 spec 会固定并跳过普通更新；用户 package 在 `~/.pi/agent/npm/`，项目 package 在 `.pi/npm/`。`npmCommand` 可把查找/安装交给 `mise` 或 `asdf` wrapper。
-
-git spec 支持 `git:github.com/user/repo@v1`、`git:git@github.com:user/repo@v1`、`https://` 和 `ssh://`；没有 `git:` 前缀时只能使用完整 protocol URL，有此前缀才允许 host/path shorthand。tag 或 commit ref 会固定，`pi update` 不主动移动 ref，但会把现有 clone 校准到配置的 ref。global clone 位于 `~/.pi/agent/git/<host>/<path>`，project clone 位于 `.pi/git/<host>/<path>`；CI 可设 `GIT_TERMINAL_PROMPT=0`，SSH 可用 `GIT_SSH_COMMAND` fail fast。Local path 不复制文件，按出现它的 settings 文件解析；目录按 package 规则，单文件可作为一个 extension。
-
-### 创建与目录约定
-
-在 `package.json` 加入 `pi` 字段和 `pi-package` keyword：`extensions`、`skills`、`prompts`、`themes` 的路径相对 package root，数组支持 glob、`!exclusions` 和直接列出 dot-prefixed 路径。没有 manifest 时，Pi 从 `extensions/`、`skills/`、`prompts/` 和 `themes/` 约定目录自动发现相应 `.ts`/`.js`、`SKILL.md`、`.md` 和 `.json`。Gallery 可添加 `video` 或 `image`，其中 MP4 会优先于图片。
-
-Runtime 第三方依赖放 `dependencies`；Pi Core 会以 `peerDependencies` 提供 `@earendil-works/pi-ai`、`@earendil-works/pi-agent-core`、`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui` 和 `typebox`，这些不应打包。其他 Pi package 要放入 `dependencies` 与 `bundledDependencies`，并把 `node_modules/` 下的资源列入 manifest；Pi 为 package 使用分离的 module roots，因此不同 package 的安装不会共享模块。
-
-### Filtering、Scope 与去重
-
-settings 中 package 字符串会加载全部资源；对象形式可以分别写 `extensions`、`skills`、`prompts` 和 `themes`，空数组表示该类全部禁用，省略字段表示不限制。`!pattern` 排除 glob，`+path` 强制包含 exact path，`-path` 强制排除 exact path；过滤只会收窄 manifest 已允许的资源，不会越权扩大它。`pi config` 可在 global 与 project-local settings 间切换，`-l` 从项目覆盖开始。
-
-同一 package 同时出现在 global/project settings 时，project entry 胜出；若 project entry 设置 `autoload: false`，则作为 global entry 的 delta。npm 的身份是 package name，git 的身份是去掉 ref 的 repository URL，local 的身份是解析后的绝对路径。去重规则决定实际装载哪一个资源，因此修改 project package 前要检查 global package 是否提供了同名能力。
-
-> 译者注：Package 只解决分发和资源声明，不提供 sandbox。Go 更适合显式 `Plugin.Register`/registry，Java 可用 `ServiceLoader`/SPI；无论哪种 loader，都要在安装前校验来源、权限、版本和依赖，并为加载失败设计 fail-fast 或隔离策略。
-
-**实践实验**：创建一个只含 `extensions/`、`skills/`、`prompts/` 的本地 package，先用 `pi -e` 验证，再用 `pi install -l` 写入项目设置；加入 `!legacy.ts`、`+themes/legacy.json`，对比过滤结果。然后在全局和项目各声明同一 npm name，观察 project precedence，并模拟缺依赖和未信任项目的错误路径。
-
-### 一次安装究竟改变了什么
-
-`pi install` 不只是下载文件。它解析 package source，决定安装范围，把声明写入 global 或 project settings，并在需要时安装依赖。启动时 ResourceLoader 再依据 settings、manifest 和过滤条件发现 extension、skill、prompt template、theme。可以把生命周期画成：
-
-```text
-source spec
-  -> resolve npm/git/local
-  -> materialize package
-  -> install dependencies
-  -> write settings
-  -> trust check
-  -> discover resources
-  -> load selected resources
+pi remove npm:@foo/bar
+pi list                     # show installed packages from settings
+pi update                   # update pi only
+pi update --all             # update pi, update packages, and reconcile pinned git refs
+pi update --extensions      # update packages and reconcile pinned git refs only
+pi update --models          # refresh model catalogs only
+pi update --self            # update pi only
+pi update --self --force    # reinstall pi even if current
+pi update npm:@foo/bar      # update one package
+pi update --extension npm:@foo/bar
 ```
 
-每一步都可能失败。Git ref 解析成功不代表 `npm install` 成功；package 被写进 settings 也不代表未信任项目会加载它；manifest 声明了 extension 也不代表过滤器允许它进入 registry。
+这些命令管理 Pi 包；`pi update` 也可以更新 Pi CLI。对于实验性的由 installer 管理的安装方式，`pi update` 会把确定版本安装到由 lockfile 管理的暂存目录中，只有验证完成后才启用它；如果更新失败，当前版本仍保持不变。由 installer 管理的安装不支持 `--force`，需要重新运行 installer 进行修复。要卸载 Pi 本身，请参阅 [Quickstart](/pi-docs/coding-agent/quickstart#uninstall)。
 
-> 译者注：Package 是分发边界，ResourceLoader 是发现边界，Extension runner 是执行边界。把三者写成一个“安装后立刻运行”的动作，会遗漏权限、依赖和恢复问题。Java 生态中可以类比 Maven artifact、ServiceLoader discovery 和实际 bean lifecycle，但 Pi package 的 resource 类型更多。
+默认情况下，`install` 和 `remove` 会写入用户设置（`~/.pi/agent/settings.json`）。使用 `-l` 可以写入项目设置（`.pi/settings.json`）。项目设置可以提交给团队共享；项目获得信任后，Pi 会在启动时自动安装其中配置但本地缺失的包。
 
-### npm、git 和 local 的选择
+如果只想在当前运行中试用一个包而不永久安装，可以使用 `--extension` 或 `-e`。它会把包安装到仅对本次运行有效的临时目录：
 
-npm 适合有版本发布和依赖树的 package。带版本号的 npm spec 会固定版本，更新命令不会擅自移动它；不带版本的 spec 则允许 update 根据包管理策略取得新版本。git source 适合直接跟踪仓库中的资源，但 ref 应尽量使用 tag 或 commit，而不是漂移的 branch。local path 适合开发和调试，它不复制目录，因此修改原目录会立即影响下一次加载。
+```bash
+pi -e npm:@foo/bar
+pi -e git:github.com/user/repo
+```
 
-一个实际决策表：
+## 软件包来源
 
-| 场景 | 推荐 source | 需要额外检查 |
-| --- | --- | --- |
-| 团队发布稳定扩展 | `npm:@scope/pkg@version` | 版本、依赖、包内容 |
-| 内部仓库固定实现 | `git:host/org/repo@commit` | ref、SSH 凭据、构建脚本 |
-| 本地开发 | `./path/to/package` | 路径解析、是否误提交密钥 |
-| 临时试用 | `pi -e <source>` | 临时目录和任意代码权限 |
+Pi 在设置和 `pi install` 中接受三种来源。
 
-裸 URL、SSH shorthand 和 `git:` 前缀的解析规则不同，不能把所有字符串都当作同一种 git URL。CI 中设置 `GIT_TERMINAL_PROMPT=0` 可以避免等待交互式凭据；这不是给 CI 自动提供凭据。
+### npm
 
-### Manifest、约定目录与 glob
+```text
+npm:@scope/pkg@1.2.3
+npm:pkg
+```
 
-manifest 中的路径相对 package root，而不是相对执行 `pi install` 的 cwd。正模式先发现资源，`!pattern` 做排除；dot-prefixed 路径应直接列出。没有 `pi` manifest 时，Pi 才使用 `extensions/`、`skills/`、`prompts/`、`themes/` 的约定发现。
+- 带版本号的 spec 会固定版本；`pi update --extensions` 和 `pi update --all` 不会更新它们。
+- 用户级安装位于 `~/.pi/agent/npm/`。
+- 项目级安装位于 `.pi/npm/`。
+- 在 `settings.json` 中设置 `npmCommand`，可以让包的查找和安装通过 `mise` 或 `asdf` 等指定封装命令执行。
 
-下面这个例子只允许 review extension 和一个 prompt：
+示例：
 
 ```json
 {
+  "npmCommand": ["mise", "exec", "node@20", "--", "npm"]
+}
+```
+
+### git
+
+```text
+git:github.com/user/repo@v1
+git:git@github.com:user/repo@v1
+https://github.com/user/repo@v1
+ssh://git@github.com/user/repo@v1
+```
+
+- 没有 `git:` 前缀时，只接受带协议的 URL（`https://`、`http://`、`ssh://`、`git://`）。
+- 带 `git:` 前缀时，也接受 `github.com/user/repo`、`git@github.com:user/repo` 等简写。
+- 同时支持 HTTPS 和 SSH URL。
+- SSH URL 会自动使用已配置的 SSH key，并遵守 `~/.ssh/config`。
+- 在非交互环境（例如 CI）中，可以设置 `GIT_TERMINAL_PROMPT=0` 禁止凭据提示，也可以设置 `GIT_SSH_COMMAND`（例如 `ssh -o BatchMode=yes -o ConnectTimeout=5`）让连接快速失败。
+- ref 会固定为 tag 或 commit。`pi update --extensions` 和 `pi update --all` 不会把 ref 移到更新版本，但会把已有 clone 调整到配置的 ref。
+- 使用 `pi install git:host/user/repo@new-ref` 可以更新设置，并把已有包切换到新的固定 ref。
+- 全局包克隆到 `~/.pi/agent/git/<host>/<path>`，项目包克隆到 `.pi/git/<host>/<path>`。
+- 如果对齐过程改变了工作副本内容，Pi 会 reset 并清理 clone；如果存在 `package.json`，随后运行 `npm install`。
+
+**SSH 示例：**
+
+```bash
+# git@host:path shorthand (requires git: prefix)
+pi install git:git@github.com:user/repo
+
+# ssh:// protocol format
+pi install ssh://git@github.com/user/repo
+
+# With version ref
+pi install git:git@github.com:user/repo@v1.0.0
+```
+
+### 本地路径
+
+```text
+/absolute/path/to/package
+./relative/path/to/package
+```
+
+本地路径指向磁盘上的文件或目录，Pi 会在设置中记录路径而不复制内容。相对路径按照它出现的设置文件所在位置解析。如果路径是文件，Pi 会把它作为单个 Extension 加载；如果路径是目录，则按包规则加载其中资源。
+
+## 创建 Pi 软件包
+
+可以在 `package.json` 中增加 `pi` 清单，也可以使用约定目录。建议加入 `pi-package` 关键字，便于别人发现。
+
+```json
+{
+  "name": "my-package",
+  "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["extensions/*.ts", "!extensions/legacy.ts"],
-    "skills": [],
-    "prompts": ["prompts/review.md"],
-    "themes": []
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"]
   }
 }
 ```
 
-注意 `skills: []` 是全部不加载，而省略 `skills` 是不限制该类型。过滤器只能收窄 manifest 的允许范围，`+path` 不是越过 manifest 的万能授权。路径中出现 symlink 时，还要按源文档规则直接列出 resource root，避免 glob 穿过链接造成意外发现。
+路径相对于包根目录。数组支持 glob 模式和 `!exclusions` 排除项。清单中的正向 glob 模式会按字典序发现资源。以点开头的路径要直接列出；如果 glob 需要穿过符号链接才能继续查找，请直接列出链接指向的资源根目录。
 
-> 译者注：glob 过滤是集合运算，不是逐文件的权限审批。若 package manifest 已经允许一个目录，settings filter 可以减少它；如果 manifest 根本没有声明某资源，`+path` 也不应被理解为扩大权限。实现自己的 loader 时，应先得到 allowed set，再应用 filter。
+### Gallery 展示元数据
 
-### 依赖与 module root
+[软件包画廊](https://pi.dev/packages) 会展示带有 `pi-package` 标签的软件包。可以增加 `video` 或 `image` 字段显示预览：
 
-扩展运行时依赖放在 `dependencies`，Pi core 提供的包放在 `peerDependencies` 并使用 `*`，不要把宿主核心重复打进 tarball。其他 Pi package 如果被 package 代码导入，要放进 `dependencies` 和 `bundledDependencies`，并用 `node_modules/` 下的资源路径引用它们。
-
-这条规则解决的是模块隔离：不同 package 有分离的 module roots，不应依赖“另一个 package 已经安装了某个 npm 模块”。如果本地开发时恰好能解析，发布后的独立安装仍可能失败。因此要用干净临时目录执行 package 安装测试，而不是只在 monorepo 根目录运行。
-
-### Scope、autoload 与 precedence
-
-global settings 为用户所有项目提供资源，project settings 为当前仓库提供资源。相同 package identity 同时出现时，project entry 优先；`autoload: false` 则表示 project entry 作为对 global entry 的增量修改。npm identity 是 package name，git identity 是去掉 ref 的 repository URL，local identity 是解析后的绝对路径。
-
-这会产生一个常见 trace：
-
-```text
-global: npm:review-tools, extensions=[review.ts]
-project: npm:review-tools, autoload=false, skills=[review]
-=> 项目设置不会简单“替换整个 global package”，而是按 scope 规则合并/收窄
+```json
+{
+  "name": "my-package",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"],
+    "video": "https://example.com/demo.mp4",
+    "image": "https://example.com/screenshot.png"
+  }
+}
 ```
 
-不要用“项目里没写 extension”推断 extension 一定不存在；先看 entry 的 scope、autoload 和资源过滤字段。
+- **video：** 只支持 MP4。桌面端会在鼠标悬停时自动播放，点击后打开全屏播放器。
+- **image：** 支持 PNG、JPEG、GIF 或 WebP，以静态预览显示。
 
-### 更新、失败和回滚
+如果两个字段都存在，优先显示 video。
 
-`pi update --all` 可能同时更新 Pi、packages 和 pinned git refs 的 checkout；`--extensions` 只处理 package 资源，`--models` 刷新模型目录，`--self` 只处理 Pi。实验性 installer-managed 安装会先写 staged、lockfile-backed release，验证成功才激活，因此失败时应保留当前版本。普通 package update 若需要运行 `npm install`，应把它视为任意代码执行步骤，审查脚本和网络访问。
+## 软件包结构
 
-> 译者注：安装的“成功”至少包含 source resolved、package materialized、依赖安装、settings 写入和资源加载五个层次。建议把每层写事件并可重试；不要只依据进程 exit code 判断 extension 已生效。
+### 约定目录
 
-### 可执行实验：构造一个最小 package
+如果没有 `pi` 清单，Pi 会从这些目录自动发现资源：
 
-1. 在临时目录创建 `package.json`、`extensions/hello.ts`、`prompts/review.md` 和 `skills/review/SKILL.md`。
-2. 写入 `pi` manifest，并故意加入 `!extensions/legacy.ts` 与 `skills: []`。
-3. 用 `pi -e ./package` 试用，确认不会把设置持久化。
-4. 用 `pi install -l ./package` 安装到项目设置，确认 `.pi/settings.json` 的变化。
-5. 在 global 和 project 分别声明相同 npm identity，观察 precedence 与 `autoload`。
-6. 删除一个依赖或制造坏 manifest，记录失败发生在哪个生命周期阶段。
-7. 用干净临时 npm cache 重复安装，排除 monorepo 中已有依赖造成的假成功。
+- `extensions/`：加载 `.ts` 和 `.js` 文件。
+- `skills/`：递归查找包含 `SKILL.md` 的目录，并将顶层 `.md` 文件作为 Skill 加载。
+- `prompts/`：加载 `.md` 文件。
+- `themes/`：加载 `.json` 文件。
 
-实验结果应包含 source、settings、discovery、filter、dependency 和 load 的实际证据。不要安装未审查的第三方 package，也不要在实验 package 中执行 shell、读取 home 凭据或发送网络请求。
+## 依赖
 
-> 译者注：如果只想学习资源解析，可以先用 local path；如果要学习发布与可复现性，再使用固定 npm/git ref。两者的测试重点不同，不能用 local path 的成功替代发布包测试。
+第三方运行时依赖放在 `package.json` 的 `dependencies` 中。即使某个依赖不注册 Extension、Skill、提示词模板或主题，也应放入 `dependencies`。Pi 从 npm 或 git 安装软件包时会运行 `npm install`，这些依赖会自动安装。
 
-## 章节对照
+Pi 会为 Extension 和 Skill 提供核心包。如果要导入以下任意核心 package，请在 `peerDependencies` 中使用 `"*"` 范围，并且不要将它们打入自己的包：`@earendil-works/pi-ai`、`@earendil-works/pi-agent-core`、`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox`。
 
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Pi Packages | Pi Packages |
-| Table of Contents | 目录 |
-| Install and Manage | Install and Manage |
-| Package Sources | Package Sources |
-| npm | npm |
-| git | git |
-| git@host:path shorthand (requires git: prefix) | git@host:path shorthand (requires git: prefix) |
-| ssh:// protocol format | ssh:// protocol format |
-| With version ref | With version ref |
-| Local Paths | Local Paths |
-| Creating a Pi Package | Creating a Pi Package |
-| Gallery Metadata | Gallery Metadata |
-| Package Structure | Package Structure |
-| Convention Directories | Convention Directories |
-| Dependencies | Dependencies |
-| Package Filtering | Package Filtering |
-| Enable and Disable Resources | Enable and Disable Resources |
-| Scope and Deduplication | Scope and Deduplication |
+其他 Pi 软件包必须打包进发布压缩包（tarball）。将它们加入 `dependencies` 和 `bundledDependencies`，然后通过 `node_modules/` 路径引用其中资源。Pi 会为各个 package 使用独立的模块根目录，因此独立安装不会相互冲突或共享 module。
 
-## 使用建议
+示例：
 
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
+```json
+{
+  "dependencies": {
+    "shitty-extensions": "^1.0.1"
+  },
+  "bundledDependencies": ["shitty-extensions"],
+  "pi": {
+    "extensions": ["extensions", "node_modules/shitty-extensions/extensions"],
+    "skills": ["skills", "node_modules/shitty-extensions/skills"]
+  }
+}
+```
 
-<Note>
+## 软件包过滤
 
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
+可以在设置中使用对象形式，限制一个包加载哪些资源：
 
-</Note>
+```json
+{
+  "packages": [
+    "npm:simple-pkg",
+    {
+      "source": "npm:my-package",
+      "extensions": ["extensions/*.ts", "!extensions/legacy.ts"],
+      "skills": [],
+      "prompts": ["prompts/review.md"],
+      "themes": ["+themes/legacy.json"]
+    }
+  ]
+}
+```
+
+`+path` 和 `-path` 都是相对于包根目录的精确路径。
+
+- 省略配置键：加载该类型的全部资源。
+- 使用 `[]`：不加载该类型的任何资源。
+- 使用 `!pattern`：排除匹配项。
+- 使用 `+path`：强制包含精确路径。
+- 使用 `-path`：强制排除精确路径。
+
+过滤器叠加在清单之上，只能进一步缩小已经允许加载的资源集合。
+
+## 启用和禁用资源
+
+使用 `pi config`，可以从已安装软件包和本地目录中启用或禁用 Extension、Skill、提示词模板和主题。`pi config` 默认从全局设置（`~/.pi/agent/settings.json`）开始；按 Tab 可以切换全局和项目本地模式。使用 `pi config -l` 从项目覆盖设置开始，此时继承自全局的资源会以灰色显示。
+
+## 作用域和去重
+
+同一个包可以同时出现在全局设置和项目设置中。如果两处都出现，项目条目优先；但如果项目条目的 `autoload: false`，它会作为对全局条目的增量配置应用。身份判定规则如下：
+
+- npm：包名。
+- git：不含 ref 的仓库 URL。
+- local：解析后的绝对路径。
+
+> 译者注：软件包的安装来源、资源发现和启用状态是三件事。安装成功不代表每种资源都会自动加载；清单、设置过滤器、`autoload` 和项目可信度共同决定最终可见能力。Extension 以宿主进程权限运行，安装和更新前应把软件包当作代码审查。
 
 ## 完整原文对照
 

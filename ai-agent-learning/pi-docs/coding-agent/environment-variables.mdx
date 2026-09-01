@@ -1,72 +1,59 @@
 ---
 title: "环境变量"
-description: "Pi 进程标记、Shell 工具环境和运行时配置。"
+description: "Pi 的进程标记、Shell 工具会话信息和进程配置。"
 ---
 
 # 环境变量
 
-> 本页是 `packages/coding-agent/docs/environment-variables.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
-
-## 中文导读
-
-Pi 进程标记、Shell 工具环境和运行时配置。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+> 本页根据 `packages/coding-agent/docs/environment-variables.md` 重新翻译，研究基线为 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。环境变量名、命令、配置字段和路径保持原样。
 
 ## 中文译文
 
-### 三种环境变量
+Pi 使用环境变量完成三类工作：配置 Pi 进程本身；让子进程识别 Pi 是启动者；向模型可以调用的 Shell 工具提供当前会话信息。提供方的 API key 变量另见[提供方配置](/pi-docs/coding-agent/providers#environment-variables-or-auth-file)。
 
-Pi 使用环境变量完成三个不同任务，不能混为一个“配置表”：
+## 进程标记
 
-1. `PI_OFFLINE` 等变量配置 Pi 进程本身；
-2. `AI_AGENT`、`PI_CODING_AGENT` 标记子进程是由 Pi 启动；
-3. `bash` 和 `powershell` Tool 收到 `PI_*` session metadata。
+CLI 和 RPC 入口会设置两个进程标记：
 
-Provider credentials（例如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）另见 Providers。环境变量是输入边界，不代表它们都应被暴露给模型。尤其要区分：Pi 进程可以读取一个 key，不等于 shell tool、Skill、Extension 或 telemetry 都应该看到它。
+- `AI_AGENT=pi` 是通用标记，用于让工具识别启动子进程的 Agent；
+- `PI_CODING_AGENT=true` 是 Pi 专用标记，用于让子进程知道自己运行在 Pi 内部。
 
-### Process Marker
+子进程会继承这两个标记。它们与具体会话无关，Pi 通过 SDK 嵌入其他程序时也不会自动设置它们。因此，标记只能说明启动来源，不能作为项目可信、当前用户或权限的证明。
 
-CLI 和 RPC entry point 设置：
+## Shell 工具的会话环境
 
-| 变量 | 作用 | 限制 |
-| --- | --- | --- |
-| `AI_AGENT=pi` | 通用标记，表示启动者是 Pi | 不是 session id |
-| `PI_CODING_AGENT=true` | Pi 专用标记 | 不是权限证明 |
+`bash` 和 `powershell` 工具启动命令时会收到当前 Pi 会话状态：
 
-子进程继承这两个 marker。它们不是 session-specific，所以脚本不能靠它们判断当前 lane、model 或用户。SDK embed 场景不会自动设置它们；嵌入方若设置，应明确说明是宿主自己的约定。
+| 变量 | 含义 |
+| --- | --- |
+| `PI_SESSION_ID` | 当前会话 ID。 |
+| `PI_SESSION_FILE` | 当前会话 JSONL 文件的绝对路径；临时会话中未设置。 |
+| `PI_PROVIDER` | 当前选择的模型提供方。 |
+| `PI_MODEL` | 当前选择的模型 ID。 |
+| `PI_REASONING_LEVEL` | 当前生效的推理级别：`off`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`。 |
 
-失败例子：脚本看到 `PI_CODING_AGENT=true`，于是把当前目录当成可信项目并执行任意 migration。这是不正确的；marker 只能说明启动来源，project trust 和 command permission 需要单独检查。
+这些值在每条命令启动时解析。因此切换模型或推理级别后，下一条 Shell 命令就可能得到新值，无需重启 Pi。`PI_PROVIDER` 和 `PI_MODEL` 表示 Pi 选择的模型，不一定等于路由器最终选择的上游模型。
 
-### Shell Tool Session Environment
-
-`bash`/`powershell` Tool 启动每条命令时读取当前 session 状态：
-
-| 变量 | 含义 | 生命周期 |
-| --- | --- | --- |
-| `PI_SESSION_ID` | 当前 session id | 当前 session |
-| `PI_SESSION_FILE` | 当前 session JSONL 绝对路径 | ephemeral session 未设置 |
-| `PI_PROVIDER` | 当前选择的 Provider | 下一条 command 开始时解析 |
-| `PI_MODEL` | 当前选择的 model id | 不是 router 最终上游 model |
-| `PI_REASONING_LEVEL` | effective reasoning level | `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max` |
-
-切换 model 或 reasoning level 后，不需要重启 Pi；下一条 shell command 会获得新值。Router 内部选择的 concrete model 可能不同，不能从 `PI_MODEL` 推断最终计费对象。
-
-查看示例：
+需要查看当前模型或提供方时，可以读取这些变量，而不是从系统提示词猜测：
 
 ```bash
 printf '%s/%s\n' "$PI_PROVIDER" "$PI_MODEL"
 printf 'reasoning=%s session=%s\n' "$PI_REASONING_LEVEL" "$PI_SESSION_ID"
+```
+
+持久会话的文件也可以直接查看：
+
+```bash
 if [ -n "$PI_SESSION_FILE" ]; then
   tail -n 1 "$PI_SESSION_FILE"
 fi
 ```
 
-这些变量只注入 LLM-callable `bash`/`powershell`，不会注入用户输入的 `!` 或 `!!` command。原因是后两者是用户直接执行的 shell 表面，不应被误认为模型工具上下文。`PI_SESSION_FILE` 的最后一行也可能是敏感内容，调试时只在临时 workspace 使用。
+这些变量只注入 LLM 可以调用的 `bash` 和 `powershell` 工具，不会注入用户输入的 `!` 或 `!!` 命令。
 
-### Custom Shell Tools 与 spawnHook
+### 自定义 Shell 工具
 
-> 译者注：`spawnHook` 类似 Java 的 `ProcessBuilder` 包装器或 Go 对 `exec.Cmd.Env` 的最后一次改写。它能改变子进程环境，但不能把已经泄漏的 secret 重新变安全；调试时只打印变量名。
-
-`createBashTool()` 和 `createPowerShellTool()` 默认暴露 session environment。注入发生在 `spawnHook` 之前，因此 hook 可以在继承基础上追加 `CI=1`：
+通过 `createBashTool()` 或 `createPowerShellTool()` 创建并注册的工具，默认会暴露会话环境。注入发生在 `spawnHook` 之前，因此 hook 可以追加环境变量：
 
 ```typescript
 const bashTool = createBashTool(cwd, {
@@ -77,7 +64,7 @@ const bashTool = createBashTool(cwd, {
 });
 ```
 
-要独立关闭 session metadata：
+也可以单独关闭会话元数据：
 
 ```typescript
 const powershellTool = createPowerShellTool(cwd, {
@@ -86,84 +73,37 @@ const powershellTool = createPowerShellTool(cwd, {
 });
 ```
 
-关闭后 Pi 会移除这些变量的 inherited values，避免嵌套 Pi 把父 session 的旧 id、旧 model 或旧文件路径暴露给子进程。`spawnHook` 的输入是准备 spawn 的上下文；不要在 hook 中打印整个 `ctx.env`，因为其中可能已有凭据。
+关闭后，Pi 会移除这些变量的继承值，避免嵌套 Pi 暴露父会话的过期信息。
 
-### Pi Process Configuration
+> 译者注：`spawnHook` 可以类比 Java `ProcessBuilder` 启动前对环境的最后一次修改，也类似 Go 对 `exec.Cmd.Env` 的设置。它能减少暴露面，但不能把已经写入日志的密钥重新变安全。
 
-下面这些变量由 Pi 自己读取：
+## Pi 进程配置
 
-| 变量 | 含义与注意 |
+以下变量由 Pi 自己读取：
+
+| 变量 | 含义 |
 | --- | --- |
-| `PI_CODING_AGENT_DIR` | 覆盖 `~/.pi/agent` config directory |
-| `PI_CODING_AGENT_SESSION_DIR` | 覆盖 session storage；`--session-dir` 优先 |
-| `PI_PACKAGE_DIR` | 覆盖 package directory，适合 Nix/Guix path |
-| `PI_OFFLINE` | 关闭 update check、package update、install/update telemetry 等启动网络操作 |
-| `PI_SKIP_VERSION_CHECK` | 关闭 `pi.dev` latest-version request |
-| `PI_TELEMETRY` | `1/true/yes` 或 `0/false/no`，覆盖 install/update telemetry 与 attribution header |
-| `PI_CACHE_RETENTION` | `long` 时在支持的 Provider 延长 prompt cache |
-| `PI_SHARE_VIEWER_URL` | 覆盖 `/share` 使用的 viewer base URL |
-| `PI_HARDWARE_CURSOR` | `1` 时显示硬件 cursor，关联 Terminal setup |
-| `PI_HYPERLINKS` | `1`、`0` 或 `auto` 覆盖 OSC 8 detection |
-| `PI_IMAGE_PROTOCOL` | `kitty`、`iterm2`、`none` 或 `auto` |
-| `PI_TRUE_COLOR` | `1`、`0` 或 `auto` |
-| `PI_TUI_ESC_TIMEOUT` | lone ESC 等待毫秒数；SSH 默认 100，其他默认 10 |
-| `VISUAL`/`EDITOR` | `externalEditor` 未设置时的 editor fallback |
-| `HTTP_PROXY`/`HTTPS_PROXY` | outbound HTTP proxy |
+| `PI_CODING_AGENT_DIR` | 覆盖配置目录，默认是 `~/.pi/agent`。 |
+| `PI_CODING_AGENT_SESSION_DIR` | 覆盖会话存储目录；`--session-dir` 会覆盖它。 |
+| `PI_PACKAGE_DIR` | 覆盖软件包目录，适合 Nix/Guix store 路径。 |
+| `PI_OFFLINE` | 关闭启动时的网络操作，包括更新检查、软件包更新和安装/更新遥测。 |
+| `PI_SKIP_VERSION_CHECK` | 关闭对 `pi.dev` 最新版本的请求。 |
+| `PI_TELEMETRY` | 覆盖安装/更新遥测与提供方归因请求头；可使用 `1`/`true`/`yes` 或 `0`/`false`/`no`。 |
+| `PI_CACHE_RETENTION` | 设置为 `long` 时，在支持的提供方上延长提示缓存。 |
+| `PI_SHARE_VIEWER_URL` | 覆盖 `/share` 使用的基础 URL。 |
+| `PI_HARDWARE_CURSOR` | 设置为 `1` 时显示硬件光标；参见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。 |
+| `PI_HYPERLINKS` | 用 `1`、`0` 或 `auto` 覆盖 OSC 8 超链接检测。 |
+| `PI_IMAGE_PROTOCOL` | 用 `kitty`、`iterm2`、`none` 或 `auto` 覆盖行内图片检测。 |
+| `PI_TRUE_COLOR` | 用 `1`、`0` 或 `auto` 覆盖真彩色检测。 |
+| `PI_TUI_ESC_TIMEOUT` | 等待单独 ESC 的时间（毫秒）；SSH 默认 `100`，其他情况默认 `10`。如果 Alt 键被误识别为 Escape，可以增大它。 |
+| `VISUAL`、`EDITOR` | `externalEditor` 未设置时使用的外部编辑器回退值。 |
+| `HTTP_PROXY`、`HTTPS_PROXY` | 出站 HTTP 请求使用的代理。 |
 
-`PI_CODING_AGENT_SESSION_DIR` 与 CLI `--session-dir` 存在优先级时，以命令行参数为准。`PI_OFFLINE` 不是“禁止所有网络”：它控制 Pi 启动阶段列出的网络操作，Provider request 是否可用仍取决于运行模式和调用方式。代理变量还可能改变 Provider 和 package 的出站路径。
+提供方凭据（例如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY` 和云提供方配置）见[提供方配置](/pi-docs/coding-agent/providers#environment-variables-or-auth-file)。
 
-> 译者注：环境变量的“优先级”必须按具体字段验证。命令行优先于 session directory 的事实来自源文档；不能把它推广成所有 settings、Provider auth 和 Extension config 都遵循同一层级。遇到冲突应打印最终 effective config，而不是只打印输入来源。
+## 安全边界
 
-### 优先级、嵌套进程与安全
-
-建议按这个顺序排查配置：命令行显式选项 -> Pi config/settings -> 进程环境变量 -> 默认值；具体字段以当前实现为准，不要把这个通用顺序当成每个变量的 API 保证。Session metadata 在每条 Tool spawn 时解析，Provider auth 则按 Providers 的 credential resolution 规则解析。
-
-不要把 `printenv` 的完整结果交给模型或写进 issue。API key、OAuth refresh token、proxy credentials、session JSONL 和 `/debug` log 都应当脱敏。使用最小环境 allowlist 给子进程，而不是把宿主全部环境传给 shell。嵌套 Pi 要么关闭 `exposeSessionEnvironment`，要么明确生成新的 session identity。
-
-### Go 与 Java 对照
-
-| Pi | Go | Java |
-| --- | --- | --- |
-| `process.env` | `os.Getenv` | `System.getenv` |
-| child env | `exec.Cmd.Env` | `ProcessBuilder.environment()` |
-| command cancellation | `context.Context` | `Future`/interrupt |
-| config dir | `os.UserHomeDir` + Path | `System.getProperty("user.home")` + Path |
-
-这只是 API 对照，不表示 Go/Java 会自动得到 Pi 的 session metadata。自己的 Harness 应显式决定哪些字段进入 Tool context，并把 key 与 metadata 分开。
-
-> 译者注：最危险的错误是把 `System.getenv()` 或 `os.Environ()` 全量交给模型可调用的 shell。正确做法是先建立 allowlist，再把不敏感的 session metadata 单独注入；认证凭据应由 Provider adapter 或受控代理消费。
-
-### 实验与小结
-
-1. 用一个 fake shell tool 打印变量名而不是值，确认 session metadata 注入位置。
-2. 切换 model/reasoning level，再运行下一条 command，观察值变化。
-3. 设置 `PI_CODING_AGENT_SESSION_DIR`，再用 `--session-dir`，确认实际优先级。
-4. 设置 `exposeSessionEnvironment:false`，启动嵌套 Pi，确认旧值不会泄漏。
-5. 让日志故意包含一个 dummy key，练习 redaction；不要使用真实凭据。
-
-环境变量既是配置，也是进程边界。marker 只说明来源，session `PI_*` 只说明当前上下文，Provider key 只用于认证；三者的生命周期、可见范围和安全等级都不同。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Environment Variables | Environment Variables |
-| Process Marker | Process Marker |
-| Shell Tool Session Environment | Shell Tool Session Environment |
-| Custom Shell Tools | Custom Shell Tools |
-| Pi Process Configuration | Pi Process 配置 |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+不要把完整的 `printenv`、API key、OAuth 刷新令牌、代理凭据、会话 JSONL 或 `/debug` 日志直接交给模型或写入 issue。给子进程提供环境变量时应使用最小允许列表；嵌套 Pi 则应关闭 `exposeSessionEnvironment`，或明确创建新的会话身份。环境变量描述的是配置或上下文，不是权限授予。
 
 ## 完整原文对照
 

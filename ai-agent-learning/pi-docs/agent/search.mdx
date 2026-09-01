@@ -1,37 +1,17 @@
 ---
-title: "Session Search"
-description: "Session 搜索 API、异步迭代和索引后端。"
+title: "会话搜索"
+description: "会话搜索契约、异步结果流以及扫描和索引后端。"
 ---
 
-# Session Search
+# 会话搜索
 
-> 本页是 `packages/agent/docs/search.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
-
-## 中文导读
-
-Session 搜索 API、异步迭代和索引后端。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+> 本页根据 `packages/agent/docs/search.md` 重新翻译，研究基线为 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。函数名、类型名、字段名和协议标识符保留原样。
 
 ## 中文译文
 
-### 这份 API 解决什么问题
+Pi 的会话搜索建立在一个很小的查询契约上：它从已经提交的会话条目中查找内容，并返回能够稳定定位命中的两个标识符。具体后端可以附加展示信息，但不能改变这两个基础身份。
 
-Session Search 不是“把所有消息读出来再做字符串查找”的命令，而是一层稳定的查询契约。它只针对已经提交的 session entries 建立搜索视图，并把命中结果定位回 `(sessionId, entryId)`。这两个 id 是跨 JSONL、内存、SQLite FTS 和远程索引都能理解的最小身份；snippet、时间、分数、metadata 和字符 offset 则属于具体后端，不能擅自放进共享接口。
-
-一次搜索的边界可以画成：
-
-```text
-用户输入 query
-  -> UI 取消上一轮查询
-  -> SessionSearch.search(text, options)
-  -> 扫描器或索引后端
-  -> 返回稳定的 sessionId + entryId
-  -> 调用方按需读取完整 entry
-  -> UI 渲染 snippet 或详情
-```
-
-这里有一个常见误解：命中结果不是一条新的 session message。搜索只读 canonical entry；它不改变 tree、leaf、branch、operation log，也不取得一个 Harness writer lease。要修改 session，仍必须走正常的 session mutation 边界。
-
-### Core API 逐项说明
+## 核心 API
 
 ```ts
 export interface SessionSearchHit {
@@ -58,17 +38,15 @@ export interface SessionSearch<T extends SessionSearchHit = SessionSearchHit> {
 }
 ```
 
-`SessionSearchHit` 的两个属性都是 `readonly`，表示消费者不能通过修改结果来改变索引。`entryId` 只能在拿到 `sessionId` 后解释；不同 session 可能有同名 entry id，不能只用后者做全局主键。
+`SessionSearchHit` 只包含 `sessionId` 和 `entryId`。这是刻意保留的最小公共身份：JSONL、内存存储、SQLite FTS 和远程索引都能使用它。摘要片段、时间戳、分数、元数据、偏移量和排序规则属于具体实现，不应强行塞进共享接口。
 
-`entryTypes` 过滤 canonical type。例如只搜索 `message` 和 `compaction`，可以排除 model-change、fact 或 operation record。过滤发生在哪里由后端决定，但返回结果必须符合过滤条件。`limit` 是上限，不是承诺一定返回这么多；索引刚重建、权限过滤或数据不足时可以少于该值。`signal` 只提供取消通道，不负责 debounce、节流、缓存或排序。
+`entryTypes` 限制参与匹配的规范条目类型，`limit` 是返回数量的上限而不是保证值，`signal` 提供取消通道。接口不负责防抖、缓存或排序策略。
 
-泛型 `T extends SessionSearchHit` 让 SQLite 返回 `score`、扫描器返回 `snippet`、业务索引返回 metadata，同时保持基础调用方只依赖两个稳定 id。这是 TypeScript 的结构类型设计；Java 可以用 `SessionSearchHit` interface 加具体 record，Go 可以用基础 struct 加后端私有字段。
+> 译者注：`AsyncIterable` 不是一个异步数组。调用方可以边收到边展示结果，也可以在达到所需数量后停止迭代。它可以类比 Java 的迭代器/发布者组合，或 Go 中逐项读取结果的通道（channel）；实际后端是否立即停止，取决于它是否检查 `AbortSignal`。
 
-> 译者注：不要把 `AsyncIterable` 翻译成“异步数组”。它是一种可以逐项产生结果的协议，类似 Java 的 Iterator/Publisher 组合，也可以类比 Go 中从 channel 读取结果。调用者结束消费后，后端是否真的停止工作仍取决于它是否检查 `AbortSignal`。
+## 为什么返回异步迭代器
 
-### 为什么使用 AsyncIterable
-
-搜索框通常会连续产生 `a`、`au`、`aut`、`auth` 四个查询。如果每次都等待一个完整数组，旧查询可能在新查询之后返回，UI 就会闪回过期结果。正确的调用顺序是：先 abort 旧 controller，再创建新 controller，再把新的 signal 传进搜索。
+搜索框输入 `a`、`au`、`aut`、`auth` 时，旧查询可能晚于新查询返回。如果调用方不取消旧查询，界面会被过期结果覆盖。下面的代码先中止旧控制器，再启动新的查询：
 
 ```ts
 let currentAbortController: AbortController | undefined;
@@ -88,13 +66,13 @@ async function updateResults(query: string) {
 }
 ```
 
-这段代码有四个状态变化：旧请求收到取消信号；当前 controller 被替换；新结果逐个渲染；只有 AbortError 被视为正常切换，坏 JSON、数据库断开和权限错误仍然向上传播。`for await` 结束后，调用方应避免让旧请求继续更新 UI，实际应用通常还要比较 query generation。
+`AbortController` 负责通知旧查询停止，`for await` 负责逐项消费异步结果。只有 `AbortError` 被视为查询切换产生的正常结果；数据库断开、坏数据等真正错误仍应向上传播。防抖仍是 UI 或调用方的责任，接口只提供取消能力。
 
-Debounce 是 UI 责任，不在接口里强行实现。可以在输入 150ms 后再调用 `updateResults`，也可以立即调用并依赖取消。后端只需要保证：观察到 signal 后尽快停止读取，并且不要把取消当成“没有命中”。
+## 默认实现
 
-### Default implementations：扫描路径
+### 扫描式搜索
 
-扫描实现接收 session-like readable，并将它投影成 `SessionSearchCandidate`：
+可复用的扫描器把具有 `getMetadata`、`findEntries` 和 `getLabel` 等能力的类会话可读对象转换成可搜索的投影：
 
 ```ts
 export interface SessionSearchCandidate {
@@ -112,7 +90,9 @@ export interface ScanningSessionSearchHit extends SessionSearchHit {
 }
 ```
 
-candidate 是内部匹配输入，不是最终 API。`seq` 用来保持 canonical 顺序，`type` 用来执行 `entryTypes`，`text` 是可搜索投影，`fields` 允许后端暴露标题、label 等额外字段。扫描器完成匹配后才生成 hit，并可以截断 text 成 snippet。
+`SessionSearchCandidate` 是匹配前的内部输入：它携带条目身份、顺序、类型、时间、可搜索文本和可选字段。扫描器匹配后才生成公开的 hit，并可将文本截成 `snippet`。
+
+已经打开的 session 或 storage 可以直接扫描：
 
 ```ts
 const search = createScanningSessionSearch(sessions);
@@ -124,9 +104,7 @@ for await (const hit of search.search("authentication", { limit: 10 })) {
 }
 ```
 
-上例把“搜索定位”和“读取详情”分开。`!` 只是告诉 TypeScript 作者确信 map 中存在 session，并不是运行时校验；生产代码应处理 session 被删除或权限变化的情况。搜索结果只含定位信息，读取完整 entry 可能失败，这两个错误要分别记录。
-
-JSONL 不需要另造一套公开 search interface。它可以使用只读 metadata/list/load helper，加载 storage 后复用扫描器：
+搜索结果只负责定位；读取完整条目是另一个可能失败的操作。JSONL 不需要另建一套公开搜索适配器，可以先发现并加载 storage，再交给同一个扫描器：
 
 ```ts
 async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, query: JsonlSessionListOptions = {}) {
@@ -138,11 +116,11 @@ async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, query: JsonlSessi
 const search = createScanningSessionSearch((query) => jsonlReadables(jsonl, query));
 ```
 
-重要的并发边界是：不要对 Harness 已经拥有的 session 调用可能获取 writer lease 的 `SessionRepo.open()`。搜索是读操作，却可能因为错误的 open helper 与运行中的写操作竞争租约。已经打开的 session/storage 可以直接扫描；JSONL 应走只读加载。
+扫描会话时不能对 Harness 已拥有的会话调用可能取得写租约（writer lease）的 `SessionRepo.open()`。搜索是读操作，应使用只读加载辅助函数；已经打开的 session/storage 则可以直接扫描。
 
-### SQLite FTS：索引与 canonical 数据
+### SQLite FTS
 
-SQLite 搜索扩展基础 hit：
+SQLite 后端在基础命中身份之外提供元数据、时间戳和分数：
 
 ```ts
 export interface SqliteSessionSearchHit extends SessionSearchHit {
@@ -163,19 +141,41 @@ for await (const hit of search.search("auth", {
 }
 ```
 
-非空查询第一次运行时，FTS table 和 triggers 可以惰性创建。创建时先从 canonical `entries` 一次性 rebuild；以后 canonical entry 的 insert、delete 和 payload update 由 trigger 同步。于是 commit 后的 entry 可以立即被搜索，但 trigger 失败可能让同一个 SQLite transaction 回滚 canonical 写入。不要把 FTS 当成“只读旁路所以永远不会影响写入”的保证。
+FTS 表和触发器会在第一次非空搜索时惰性创建。首次创建会从规范 `entries` 做一次重建；之后由 SQLite 触发器跟踪条目的插入、删除和 payload 更新。因此提交后的数据可以及时搜索，但触发器失败也可能使启用该搜索数据库的规范写入回滚。这是搜索索引与规范数据共用事务时必须接受的边界。
 
-空白 query 不应触发建表或全库扫描。`score` 的排序含义由 SQLite FTS 实现决定，不应在共享接口里声称它与 Elasticsearch score、余弦相似度或另一个数据库可比较。
+## 索引后端
 
-### Indexed backends：Elasticsearch 示例
+搜索索引是后端负责维护的派生状态。共享包只提供查询契约；如果应用需要显式维护索引，可以在具体后端定义自己的 writer/feed（写入与数据供给）契约。
 
-索引是 derived state，不是 session 的事实来源。应用可以从 JSONL 投影 entry，使用 upsert/delete feed 写 Elasticsearch，再 refresh 后查询；如果索引损坏，可以重试、rebuild 或标记 stale，而不能反过来用索引覆盖 canonical session。
+### 使用 Elasticsearch 索引 JSONL 会话
+
+下面的代码是应用层适配，不是核心包自动提供的 Elasticsearch 实现：
 
 ```ts
+import { Client } from "@elastic/elasticsearch";
+import {
+  scanningEntries,
+  type JsonlSessionMetadata,
+  type JsonlSessionRepoOptions,
+  type SessionSearch,
+  type SessionSearchHit,
+  type SessionSearchOptions,
+} from "@earendil-works/pi-agent-core";
+
+// JSONL-backed code can provide this locally from existing JSONL list/load helpers.
+async function* jsonlReadables(jsonl: JsonlSessionRepoOptions, options: { cwd?: string } = {}) {
+  for (const metadata of await listJsonlSessionMetadata(jsonl, options)) {
+    yield loadJsonlSessionStorage(jsonl, metadata);
+  }
+}
+
 interface SearchIndexWriter<TItem> {
   apply(items: TItem[]): Promise<void>;
   flush?(): Promise<void>;
 }
+
+interface IndexedSessionSearch<T extends SessionSearchHit, TItem>
+  extends SessionSearch<T>, SearchIndexWriter<TItem> {}
 
 type ElasticSessionFeedItem =
   | { type: "upsert"; id: string; body: ElasticSessionDoc }
@@ -191,84 +191,129 @@ interface ElasticSessionDoc {
   metadata: JsonlSessionMetadata;
   fields?: Record<string, unknown>;
 }
+
+interface ElasticSessionSearchHit extends SessionSearchHit {
+  readonly timestamp: number;
+  readonly snippet: string;
+  readonly score?: number;
+}
+
+class ElasticSessionSearch
+  implements IndexedSessionSearch<ElasticSessionSearchHit, ElasticSessionFeedItem>
+{
+  constructor(
+    private readonly client: Client,
+    private readonly index: string,
+  ) {}
+
+  async apply(items: ElasticSessionFeedItem[]): Promise<void> {
+    const operations = items.flatMap((item) => {
+      if (item.type === "delete") {
+        return [{ delete: { _index: this.index, _id: item.id } }];
+      }
+      return [{ index: { _index: this.index, _id: item.id } }, item.body];
+    });
+
+    if (operations.length > 0) await this.client.bulk({ operations });
+  }
+
+  async flush(): Promise<void> {
+    await this.client.indices.refresh({ index: this.index });
+  }
+
+  async *search(
+    text: string,
+    options: SessionSearchOptions = {},
+  ): AsyncIterable<ElasticSessionSearchHit> {
+    const result = await this.client.search<ElasticSessionDoc>({
+      index: this.index,
+      size: options.limit ?? 20,
+      query: {
+        bool: {
+          must: [{ match: { text } }],
+        },
+      },
+    });
+
+    for (const hit of result.hits.hits) {
+      if (!hit._source) continue;
+      if (options.signal?.aborted) throw options.signal.reason;
+      yield {
+        sessionId: hit._source.sessionId,
+        entryId: hit._source.entryId,
+        timestamp: hit._source.timestamp,
+        snippet: hit._source.text,
+        score: hit._score ?? undefined,
+      };
+    }
+  }
+}
 ```
 
-`apply` 必须对同一 entry 使用稳定 document id；重复 upsert 应覆盖同一文档，delete 应可重复执行。bulk 返回错误时不能假装 feed 成功。`flush` 解决“写入成功但搜索副本尚未可见”的 refresh gap；它不是 transaction commit。
+`apply` 使用稳定文档 id 写入或删除索引，`flush` 处理“写入成功但搜索副本暂时不可见”的刷新间隔。索引损坏时可以重试、重建或标记为过期，但不能反过来覆盖规范会话。
 
-查询时应检查 `_source` 是否存在，尊重 limit，在每个 yield 前检查 cancellation，并保留 session/entry identity。远程索引返回的 snippet 是展示数据，详情仍应从 session 读取并验证 entry 是否存在。
+追赶或重建任务可以把 JSONL 投影送入 Elasticsearch，且不需要取得写租约：
 
-### 正确性、排序与失败边界
+```ts
+async function indexJsonlSessionsIntoElastic(
+  jsonl: JsonlSessionRepoOptions,
+  elastic: ElasticSessionSearch,
+  options: { cwd?: string } = {},
+): Promise<void> {
+  for await (const session of jsonlReadables(jsonl, { cwd: options.cwd })) {
+    const metadata = await session.getMetadata();
+    for await (const candidate of scanningEntries(session)) {
+      await elastic.apply([{
+        type: "upsert",
+        id: `${metadata.id}:${candidate.entryId}`,
+        body: {
+          sessionId: metadata.id,
+          entryId: candidate.entryId,
+          seq: candidate.seq,
+          timestamp: candidate.timestamp,
+          cwd: metadata.cwd,
+          text: candidate.text,
+          metadata,
+          fields: candidate.fields,
+        },
+      }]);
+    }
+  }
 
-扫描 source 不应产生重复 `sessionId`；基础身份是 `(sessionId, entryId)`，重复 session id 会让调用者无法判断命中属于哪个 storage。索引后端通常在自己的唯一约束中保证这个身份。跨 session 排序应明确规则：canonical `seq` 只能在单个 session 内比较，不能拿来替代全局时间排序。
+  await elastic.flush();
+}
+```
 
-搜索失败矩阵：
+## 正确性与失败边界
 
-| 场景 | 正确处理 |
-| --- | --- |
-| query 为空 | 返回空迭代或按后端约定拒绝，不触发全量 rebuild |
-| signal 已取消 | 尽早停止，向 UI 报 AbortError/取消，不写 session |
-| JSONL 损坏 | 报告文件和行号，不能跳过后声称结果完整 |
-| session 被删除 | 命中后读取详情失败，显示 stale hit 并可重建索引 |
-| SQLite trigger 失败 | 让写 transaction 失败，检查 canonical 数据是否回滚 |
-| Elastic bulk 失败 | 保留未成功 feed，重试或标记 stale |
-| 重复 sessionId | fail fast，避免生成不稳定身份 |
+扫描源如果产生重复的 `sessionId`，应立即失败，因为基础身份由 `(sessionId, entryId)` 构成。索引后端通常在自己的存储层强制唯一性。SQLite FTS 与规范 SQLite 写入共用触发器时，触发器错误可能回滚规范写入，这一点与普通旁路索引不同。
 
-Search opt-in 仍需要同步层。一个 no-op-by-default 的 `NOOP_SEARCH_INDEX_SINK` 可以让 canonical write sites 无条件发 indexing event；搜索未启用时 sink 丢弃，启用时再消费。这样主写入路径不需要到处写 `if searchEnabled`。
+搜索仍需要同步层。可以提供默认不执行操作的 `NOOP_SEARCH_INDEX_SINK`，让规范写入点无条件发出索引事件；未启用搜索时由它丢弃，启用后再由后端消费。
 
-> 译者注：搜索“结果正确”不等于“索引永远新鲜”。Session 是 canonical，索引是可重建投影；这和 Telemetry 的旁路属性类似，但 SQLite trigger 与 canonical write 共用 transaction 时例外，需要把回滚影响写进故障模型。
+> 译者注：搜索结果的“新鲜”不等于数据事实。会话是规范数据，索引是可重建投影；命中后仍应通过 `entryId` 读取并验证完整条目。
 
-### Go 与 Java 对照
+## Go 与 Java 对照
 
 | 语义 | TypeScript/Pi | Go | Java |
 | --- | --- | --- | --- |
 | 结果流 | `AsyncIterable<T>` | channel 或 callback iterator | `Iterator`/`Flow.Publisher` |
 | 取消 | `AbortSignal` | `context.Context` | cancellation token/interrupt |
 | 稳定身份 | `sessionId + entryId` | struct 字段 | record 字段 |
-| 读写边界 | read-only storage vs writer lease | interface 分离 | read service vs writer service |
-| 索引刷新 | `flush()` | `Flush(ctx)` | `CompletableFuture` 或同步 flush |
+| 读写边界 | read-only storage / writer lease | 分离 interface | read service / writer service |
+| 索引刷新 | `flush()` | `Flush(ctx)` | 同步 flush 或 `CompletableFuture` |
 
-Java/Go 实现都不应把全文搜索直接放进 Agent Loop。Loop 如果需要知识检索，可以调用一个只读搜索 Tool；Session Search 本身仍是基础设施，负责查询和定位，不决定模型下一步行为。
+## 实验
 
-### 动手实验
+1. 准备两个包含 `authentication` 的内存 session，记录每个命中的 `sessionId` 和 `entryId`。
+2. 使用 `limit: 1`，验证后端最多返回一条，而不是承诺一定返回一条。
+3. 连续输入两个查询，取消旧的 `AbortController`，确认旧结果不再更新界面。
+4. 构造重复 `sessionId` 的扫描源，确认它快速失败。
+5. 首次查询 SQLite 以触发 FTS 初始化，再插入条目，检查触发器是否使新内容可见。
+6. 模拟 Elasticsearch 批量写入失败，保留未完成的 feed 并执行重建，而不是修改规范 JSONL。
 
-1. 准备两个内存 session：在不同 entry 中写入 `authentication`，记录每个 hit 的两个 id。
-2. 用 `limit: 1` 验证后端最多返回一条，而不是恰好一条。
-3. 连续输入两个 query，调用旧 controller 的 `abort()`，确认旧结果不再更新 UI。
-4. 构造重复 `sessionId` source，确认 scanner fail fast。
-5. 在 SQLite 中先搜索一次触发 FTS 初始化，再插入 entry，验证 trigger 是否使新内容可见。
-6. 模拟 Elastic bulk 失败，保留 feed 并执行 rebuild，而不是修改 canonical JSONL。
+## 小结
 
-观察点：query、index projection、canonical entry 和 UI state 是四种不同数据。思考：如果搜索结果只保存 snippet、不保存 entryId，用户点击结果后如何安全读取原文？
-
-### 小结
-
-Session Search 提供稳定身份和可取消的异步结果流；扫描器适合小型或已有 storage，SQLite FTS 和 Elasticsearch 适合索引查询。无论后端是什么，session canonical data、索引 derived data 和 UI 展示都必须分开。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Session Search | Session Search |
-| Core API | 核心 API |
-| Why async iterable | Why async iterable |
-| Default implementations | 默认实现 |
-| Scanning search | Scanning search |
-| SQLite FTS | SQLite FTS |
-| Indexed backends | 索引后端 |
-| JSONL sessions with Elasticsearch | JSONL sessions with Elasticsearch |
-| Correctness and failure boundaries | 正确性与失败边界 |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+会话搜索只提供稳定身份和可取消的异步结果流。扫描器适合小规模数据或已经打开的 storage，SQLite FTS 和 Elasticsearch 适合索引查询。无论使用哪个后端，都要把规范会话、派生索引和界面展示分开。
 
 ## 完整原文对照
 

@@ -1,196 +1,69 @@
 ---
-title: "安全"
-description: "Project Trust、内建沙箱边界和运行不受信任代码的风险。"
+title: "安全边界"
+description: "理解项目可信度、进程权限、内置沙箱缺失和运行不受监控任务的风险。"
 ---
 
-# 安全
+# 安全边界
 
-> 本页是 `packages/coding-agent/docs/security.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+Pi 是本地 Coding Agent。它以启动 Pi 的用户身份运行；只要某个文件对该用户可写，Pi 就把它视为同一个本地信任边界中的资源。
 
-## 中文导读
+## Project Trust
 
-这篇文档先建立一个容易被忽略的前提：Pi 是运行在本机上的 Coding Agent，不是远程 SaaS，也不是自动带沙箱的容器。它继承启动进程的操作系统用户权限，因此模型生成的 `read`、`write`、`edit` 或 shell 请求，最终都要经过本机 Runtime 和操作系统权限。
+Project Trust 用来决定 Pi 是否加载项目本地的设置、资源、package 和 Extension。它不是 sandbox，也不会限制你进入项目后模型可以要求工具执行的操作。
 
-读完本页，你应该能区分三件事：
-
-1. **Project Trust**：决定项目里的 settings、resources、packages 和 extensions 是否可以被 Pi 加载。
-2. **Permission/approval**：决定某次工具动作是否符合应用策略，必要时是否要求人工确认。
-3. **Sandbox/container**：把进程放进操作系统或虚拟化隔离边界，限制文件、网络、凭据和资源。
-
-这三层不能互相替代。Project Trust 通过了，不代表 `bash` 可以安全执行任意命令；工具策略拒绝了一个路径，也不等于进程已经被操作系统隔离。
-
-## 中文译文
-
-### 1. 基本信任边界
-
-Pi 是本地 Coding Agent。它使用启动 Pi 的用户账号权限运行；对这个用户可写的文件，Pi 将其视作同一个本地信任边界。换句话说，Pi 不会凭空制造一个“只能访问当前仓库”的身份。
-
-例如，你以自己的账号启动 Pi，而该账号可以读取 `~/.ssh`、写入工作区并执行 `npm`，那么 Pi 启动的工具和 Extension 也可能使用这些权限。模型只是提出动作，真正的权限来自 Pi 进程、子进程和操作系统。
-
-> 译者注：可以把这条边界类比成 Java 程序调用 `Files.readString` 或 `ProcessBuilder` 时的进程权限，而不是把模型想象成一个自动受限的 Java 方法。Go 的 `os.ReadFile` 和 `exec.Command` 也没有天然沙箱。
-
-### 2. Project Trust 负责什么
-
-Project Trust 控制 Pi 是否加载项目本地的 settings、resources、packages 和 extensions。它不是 sandbox，也不会限制你进入目录并开始工作之后，模型通过工具提出什么请求。
-
-Pi 从当前工作目录向上检查项目资源。出现以下任一项时，项目会被视为包含需要信任的资源：
+Pi 从当前工作目录向上查找以下项目资源；发现其中任一项，就认为该项目包含需要信任的资源：
 
 - `.pi/settings.json`
 - `.pi/extensions`、`.pi/skills`、`.pi/prompts` 或 `.pi/themes`
 - `.pi/SYSTEM.md` 或 `.pi/APPEND_SYSTEM.md`
-- 当前目录或祖先目录中的项目 `.agents/skills`
+- 当前目录或任一祖先目录中的项目 `.agents/skills`
 
-只有一个空的 `.pi` 目录不算需要信任的项目资源。这一点避免了普通目录标记本身触发不必要的询问。
+单独存在的空 `.pi` 目录不算需要信任的项目资源。
 
-> 译者注：这里的“发现资源”是输入加载规则，不是完整的威胁扫描。一个恶意的 `SKILL.md` 或 `SYSTEM.md` 仍然可能包含 prompt injection；信任提示只能让用户先决定“要不要加载”，不能判断文本内容是否诚实。
+当交互会话在包含上述资源的项目中启动，且当前目录或父目录还没有保存过决定时，Pi 会遵循全局设置中的 `defaultProjectTrust`。默认值为 `"ask"`；如果有 UI，Pi 会询问是否信任项目。决定会按照规范化后的目录路径保存到 `~/.pi/agent/trust.json`，当前目录或父目录中距离最近的已保存决定优先于全局默认值。
 
-#### 2.1 交互模式的决定顺序
+信任项目后，Pi 可以加载需要信任的项目资源，包括：
 
-如果交互 session 启动时发现了需要信任的资源，而当前目录及其父目录都没有保存过决定，Pi 使用 global settings 中的 `defaultProjectTrust`。默认值是 `"ask"`；有 UI 时会询问用户是否信任项目。
+- `.pi/settings.json`
+- `.pi` 资源，例如 Extension、Skill、prompt template、theme 和 system prompt 文件
+- 项目设置中配置但本地还缺失的 package
+- 项目本地 Extension 和项目 package 管理的 Extension
 
-保存的决定按 canonical directory 存在 `~/.pi/agent/trust.json`。当前目录或父目录中距离最近的保存决定优先于更远路径和 global default。canonical path 很重要：符号链接造成的两个字符串路径不应该被误当成两个完全无关的项目。
+拒绝信任会跳过受保护资源。`AGENTS.override.md`、`AGENTS.md` 和 `CLAUDE.md` 等上下文文件无论项目是否受信任都会加载，除非关闭上下文加载。在信任决定完成前，Pi 只加载上下文文件、用户/全局 Extension 以及 CLI `-e` Extension。用户/全局 Extension 和 CLI Extension 可以处理 `project_trust` 事件；第一个返回 yes/no 决定的 Extension 拥有这次决定权。
 
-选择信任后，Pi 可以加载：
+非交互模式（`-p`、`--mode json` 和 `--mode rpc`）不会显示信任提示。如果没有适用的已保存决定，`defaultProjectTrust: "ask"` 和 `"never"` 会忽略这些资源，而 `"always"` 会信任它们。使用 `--approve`/`-a` 或 `--no-approve`/`-na`，可以只对本次运行覆盖项目可信度。
 
-- `.pi/settings.json`；
-- `.pi` 下的 extensions、skills、prompt templates、themes 和 system prompt 文件；
-- project settings 指定但本地尚不存在的 packages；
-- 项目本地 extensions 和由项目 package 管理的 extensions。
+> 译者注：Project Trust 保护的是“启动时是否加载项目提供的配置和代码”，不是执行阶段的权限隔离。信任一个项目后，项目 Extension 仍以 Pi 进程权限运行；如果需要真正限制文件、网络和凭据访问，应使用容器、虚拟机或其他 sandbox。
 
-选择拒绝后，受保护资源会被跳过。但 `AGENTS.override.md`、`AGENTS.md` 和 `CLAUDE.md` 等 context files 默认仍会加载，除非关闭 context loading。信任决定解决的是“是否加载受保护资源”，不是“是否相信所有进入 context 的文字”。
+## 没有内置 Sandbox
 
-在 trust 决定完成之前，Pi 只加载 context files、user/global extensions 和 CLI `-e` extensions。user/global extension 与 CLI extension 可以处理 `project_trust` event；第一个返回 yes/no 决定的 extension 拥有这次决定。
+Pi 没有内置 sandbox。内置工具可以以 Pi 进程的权限读取、写入、编辑文件和运行 shell 命令。Extension 是在同一进程中运行的 TypeScript 模块，也拥有相同权限。package 安装、shell 命令、语言服务器、测试命令和其他开发工具都只是普通本地进程。
 
-> 译者注：这类似一个启动阶段的 bootstrap 顺序。决定发生得太晚，项目 Extension 就已经影响 system prompt 或工具注册；发生得太早，又无法允许全局策略 extension 参与。阅读源码时要把“资源发现”和“资源执行”分开看。
+这是有意的设计：Pi 面向本地源码树，需要调用项目工具链并接入用户现有的开发环境。一个不完整的进程内 sandbox 很容易被误认为安全边界，但它仍会依赖宿主 shell、文件系统、package manager、凭据和 Extension 代码。真正的隔离应由操作系统或虚拟化/容器边界提供。
 
-#### 2.2 非交互模式
+Project Trust 只是输入加载保护。它防止仓库在你批准前悄悄修改 Pi 设置或 Extension；它不会让不受信任的代码、不受信任的 prompt 或不受信任的模型输出自动变安全。仓库文件、注释、文档、上下文文件或构建输出中的 prompt injection，是本地 Agent 预期会遇到的风险，Pi 无法可靠地阻止它。
 
-`-p`、`--mode json` 和 `--mode rpc` 不显示 trust prompt。没有适用的保存决定时：
+## 运行不受信任或无人监控的任务
 
-| `defaultProjectTrust` | 非交互行为 |
-| --- | --- |
-| `"ask"` | 不弹 UI，因此忽略需要信任的项目资源 |
-| `"never"` | 忽略需要信任的项目资源 |
-| `"always"` | 直接信任并加载这些资源 |
+处理不受信任的仓库、你不会密切监控的生成代码或无人值守自动化时，应在受限环境中运行 Pi。可以使用 container、VM、micro-VM、远程 sandbox 或策略控制的 sandbox，并且只提供任务所需的文件和凭据。
 
-单次运行可以用 `--approve`/`-a` 或 `--no-approve`/`-na` 覆盖项目 trust。自动化脚本不要依赖交互式默认值；应在命令、CI 配置或受控运行器中明确选择策略，并审查实际加载了哪些 settings、skills 和 extensions。
+[Containerization](/pi-docs/coding-agent/containerization) 中记录了常见模式：
 
-一个常见失败 trace 是：本地交互测试中看到 trust prompt，于是以为 RPC 服务也会等待用户；实际上 RPC 没有 UI，若没有保存决定，项目 resources 可能被跳过，导致工具或 prompt 与交互模式不同。
+- 在 container/sandbox 内运行整个 `pi` 进程。
+- 让宿主 Pi 运行，而把内置工具执行转发到 Gondolin micro-VM。
+- 只挂载 Agent 应该访问的 workspace 路径。
+- 除非需要访问宿主会话、设置和凭据，否则不要挂载宿主的 `~/.pi/agent`。
+- 只传入最低限度的 API key，或使用短期凭据。
+- 如果任务不需要网络，限制网络访问。
+- 将结果复制回受信任系统前先审查 diff 和输出。
 
-### 3. 没有内建 Sandbox
+如果把宿主 workspace 以可写方式 bind-mount 到受限环境中，container 或 VM 内的写入仍然可以修改宿主文件。需要更强保护时，使用只读挂载，或把文件复制进 sandbox，再把结果显式复制出来。
 
-Pi 没有 built-in sandbox。内置 tools 可以使用 Pi 进程权限读文件、写文件、编辑文件和运行 shell；Extensions 是以相同权限执行的 TypeScript modules。package installs、shell commands、language servers、test commands 和其他开发工具也都是普通本地进程。
+## 报告安全问题
 
-这不是遗漏，而是产品边界。Pi 需要操作本地 source tree、调用项目 toolchain 并使用用户现有开发环境。如果只做一个不完整的 in-process sandbox，用户很容易把它误解为安全边界，但 host shell、filesystem、package manager、credentials 或 Extension code 仍可能绕过它。真正的隔离应由操作系统权限、container、VM、micro-VM 或 policy-controlled sandbox 提供。
+报告安全问题时，请遵循仓库的 [Security Policy](https://github.com/earendil-works/pi-mono/blob/main/SECURITY.md)。不要为安全敏感报告创建公开 issue。
 
-> 译者注：不要把“有工具 allowlist”说成“有 sandbox”。allowlist 只控制宿主应用是否接受某类请求；sandbox 还必须控制进程能否触达文件系统、网络、设备、凭据和资源配额。
-
-Project Trust 只是 input-loading guard：它阻止一个仓库在用户批准前悄悄改变 Pi 的 settings 或 extensions。它不会自动使不受信任的代码、不受信任的 prompt 或模型输出安全。仓库文件、注释、文档、context files 和 build output 中的 prompt injection，都是本地 agent 的预期风险。
-
-### 4. 文件、Shell、网络与凭据的风险
-
-下面的例子都不是“模型已经成功执行”的证据，而是需要 Runtime 继续校验和授权的请求：
-
-| 请求 | 主要风险 | 需要的边界 |
-| --- | --- | --- |
-| `read("~/.ssh/id_rsa")` | 暴露私钥或连接凭据 | 路径策略、secret redaction、最小挂载 |
-| `write("../../config")` | 越出工作区覆盖文件 | canonical path、workspace allowlist |
-| `bash("rm -rf ...")` | 破坏文件或触发任意进程 | 命令审批、sandbox、超时、资源限制 |
-| `curl(...)` | 数据外传或下载恶意内容 | 网络策略、域名 allowlist、审计 |
-| `git push` | 把未经审查的改动发布到远程 | 明确人工批准、凭据隔离、diff review |
-| `npm install` | 执行 package lifecycle script | 隔离环境、锁定依赖、网络控制 |
-
-Project Trust 不能代替这些控制。即使模型返回的 JSON Schema 合法，合法参数也可能指向危险文件或命令；参数校验只证明形状正确，不证明意图安全。
-
-### 5. 运行不受信任或无人监控的工作
-
-处理不受信任仓库、自己不准备密切审查的生成代码，或无人值守 automation 时，应在受控环境运行 Pi。可以使用 container、VM、micro-VM、remote sandbox 或 policy-controlled sandbox，并且只提供任务所需的文件与凭据。
-
-常见方案包括：
-
-1. 把整个 Pi 进程放进 container/sandbox；
-2. 让宿主 Pi 运行，但把内置工具执行路由到 Gondolin micro-VM；
-3. 只挂载 agent 应访问的 workspace 路径；
-4. 不需要访问宿主 session、settings 和 credentials 时，不挂载 host `~/.pi/agent`；
-5. 只传入最低权限、短期有效的 API key 或其他凭据；
-6. 任务不需要网络时关闭或限制网络；
-7. 把 diff 和输出复制回受信任系统前先人工审查。
-
-如果使用 read/write bind mount，容器或 VM 内的写入仍然可能直接改变宿主机文件。需要更强保护时使用 read-only mount，或者先把文件复制进隔离环境，再显式复制经过审查的结果出来。容器本身也不是配置正确的保证：错误的 mount、网络和 credential 设置仍会扩大权限。
-
-> 译者注：容器的关键不是“启动了 Docker”，而是可验证的 capability 集合。问自己三个问题：容器能看到哪些路径？能连接哪些网络？能拿到哪些凭据？这比在 README 中写“已沙箱化”更可靠。
-
-### 6. 报告安全问题
-
-报告安全问题时遵循仓库 [Security Policy](https://github.com/earendil-works/pi-mono/blob/main/SECURITY.md)，不要为安全敏感内容创建公开 issue。
-
-预期的本地 agent 行为、没有内建 sandbox、未受信任内容造成的 prompt injection，以及用户自行安装的 extensions 或 skills，通常都在这个项目定义的安全边界之外。只有当报告证明了真实的 privilege-boundary bypass，或证明 Pi 授予了本地用户原本没有的权限时，才属于典型安全问题。
-
-> 译者注：边界之外不等于“没有风险”，而是报告需要指出越权证据。比如“模型建议执行 `rm`”本身不是 Pi 的权限绕过；“Pi 在用户无权限时绕过操作系统读出文件”才是需要调查的安全断言。
-
-## 译者注：如何把安全边界落到 Harness
-
-Go/Java 教学实现可以有 `PermissionPolicy`、workspace path check、command denylist 和人工 approval callback，但它们都只是应用层 guard。Go 可用 `context.Context` 贯穿超时和取消，Java 可用 `CancellationToken`、`Future` 和线程中断；两者都必须把 token、路径和命令审计信息传给执行器。
-
-Java 的 `SecurityManager` 已不能作为现代通用 sandbox 的设计答案；Go 原生 `plugin` 也不提供隔离。生产系统应把 agent 放进最小权限账号和外部隔离环境，并把凭据、网络和文件挂载作为部署配置审查。
-
-## 动手实验：验证 Project Trust，不碰真实凭据
-
-### 目标
-
-观察受保护资源在 `ask`、`never` 和 `always` 下的差异，并证明 trust 不是 shell sandbox。
-
-### 准备
-
-在临时目录创建一个假的 `.pi/settings.json`、`.pi/skills/demo/SKILL.md` 和 `AGENTS.md`。使用本地假配置，不放 API key、SSH 文件或真实仓库。
-
-### 步骤
-
-1. 在临时目录启动交互模式，记录是否出现 trust prompt。
-2. 分别设置 `defaultProjectTrust` 为 `ask`、`never` 和 `always`，记录哪些 resources 被加载。
-3. 使用 `-p` 或 `--mode json` 重复实验，确认不会等待交互回答。
-4. 观察 `AGENTS.md` 是否仍作为 context file 出现，并与 `.pi/settings.json` 的加载结果比较。
-5. 为项目加入一个受控、只打印固定文字的 fake Extension；确认 Extension 是否在 trust 决定之前执行。
-6. 在隔离环境内运行一个无害的 `pwd`，核对当前目录、挂载列表和网络配置。
-
-### 排障清单
-
-| 现象 | 优先检查 |
-| --- | --- |
-| 交互能加载 skill，RPC 不能 | 保存的 trust、`defaultProjectTrust`、是否使用 `--approve` |
-| 拒绝 trust 后仍看到 AGENTS 内容 | 这是 context files 的预期行为，另看是否关闭 context loading |
-| 以为路径检查有效但仍能访问宿主文件 | 是否使用 bind mount；应用检查不是 OS 隔离 |
-| 容器里仍能联网 | network namespace、代理和 DNS 配置 |
-| 日志出现 key | header、异常 body、tool output 是否做了 redaction |
-
-### 思考题
-
-1. 为什么把 Project Trust 改成 `always` 不能解决 `bash("curl ...")` 的数据外传？
-2. 一个 JSON Schema 合法的 `path` 为什么仍可能越过 workspace？
-3. 为什么 read-only mount 仍需要凭据和网络策略？
-4. 如果 Extension 在加载时就执行代码，信任提示应该发生在什么时机？
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Security | 安全 |
-| Project Trust | 项目可信度（资源加载闸门） |
-| No Built-in Sandbox | 没有内建 Sandbox |
-| Running Untrusted or Unmonitored Work | 运行不受信任或无人监控的工作 |
-| Reporting Security Issues | 报告安全问题 |
-
-## 使用建议
-
-1. 先读本页的三层边界表，再读源文档附录；不要把 Project Trust 和 sandbox 混称。
-2. 结合 `reference/source-map` 定位 `src/core/project-trust.ts`、`trust-manager.ts` 和工具执行代码。
-3. 在临时目录、假凭据和受控网络内完成实验；任何“模型建议的命令”都先当作不可信输入。
-
-<Note>
-
-以下原文是完整核对附录。它保留英文 API、路径和安全措辞，便于逐项检查；中文译文中的解释和译者注不改变原文边界。
-
-</Note>
+预期的本地 Agent 行为、缺少内置 sandbox、来自不受信任内容的 prompt injection，以及用户自行安装的 Extension 或 Skill 行为，通常都不属于安全边界；除非报告能证明真实的权限边界绕过，或证明 Pi 授予了本地用户原本没有的访问权限。
 
 ## 完整原文对照
 

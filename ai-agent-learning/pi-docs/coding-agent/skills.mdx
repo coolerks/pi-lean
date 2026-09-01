@@ -1,163 +1,258 @@
 ---
-title: "Skills"
-description: "Skill 位置、SKILL.md frontmatter、验证、命令和仓库。"
+title: "Skills（技能）"
+description: "技能包的发现、渐进式披露、目录结构、Frontmatter 与校验。"
 ---
 
-# Skills
+# Skills（技能）
 
-> 本页是 `packages/coding-agent/docs/skills.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+> 本页根据 `packages/coding-agent/docs/skills.md` 从英文源文件重新翻译。研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、路径、配置字段、协议字段和代码标识符保持原样。
 
-## 中文导读
+Pi 的 Skill 是一个可以按需加载的、自包含的能力包。它可以包含专门的工作流程、安装说明、辅助脚本和参考资料。技能不会默认把所有正文塞进模型上下文，而是先提供简短描述，在任务真正匹配时再加载完整说明。这种做法称为渐进式披露（progressive disclosure）。
 
-Skill 是按需加载的、面向特定任务的能力包，内容可以包括工作流、安装步骤、辅助脚本、references 和 assets。Pi 实现 Agent Skills standard，但对多数规范问题只告警并继续加载；特别是 Pi 允许 `name` 与父目录名不同，以便多个 Harness 共用一个 Skill 目录。Skill 是资源和指令，不是 Extension 代码，也不是 MCP 传输。
+Pi 实现了 [Agent Skills 标准](https://agentskills.io/specification)。它会提醒大多数格式问题，但整体保持宽松。例如，标准不允许 Skill 名称与父目录不同，而 Pi 允许这样做；对于多个 Agent Harness 共享一个技能目录的场景，这条限制并不实用。
 
-## 源码级中文译文
+## 目录
 
-### 位置、可信度与发现规则
+- [位置](#位置)
+- [工作方式](#工作方式)
+- [Skill 命令](#skill-命令)
+- [目录结构](#目录结构)
+- [Frontmatter](#frontmatter)
+- [校验](#校验)
+- [示例](#示例)
+- [技能仓库](#技能仓库)
 
-全局 Skill 来自 `~/.pi/agent/skills/` 和 `~/.agents/skills/`；项目 Skill 来自已信任项目中的 `.pi/skills/`、`.agents/skills/` 及祖先目录；package 可以提供 `skills/` 或 `package.json` 的 `pi.skills`，settings 可用 `skills` 数组，命令行可重复使用 `--skill <path>`。`--no-skills` 禁止自动发现，但显式的 `--skill` 路径仍然加载。
+## 位置
 
-`~/.pi/agent/skills/` 和项目 `.pi/skills/` 可以把根目录有效 frontmatter 的 `.md` 当作 Skill；所有位置都递归发现含 `SKILL.md` 的目录。`.agents/skills/` 的根 `.md` 会忽略，分组目录中的有效 `.md` 仍可发现。普通 Markdown 若不像 Skill 会静默忽略。项目资源只在 project trusted 条件满足时加载。
+> **安全提示：** Skill 可以指示模型执行任意操作，也可以包含由模型调用的可执行代码。使用前必须检查 Skill 的内容。
 
-Skill 能让模型执行任意动作，也能携带模型会调用的 executable code，所以使用前必须审阅全部正文、scripts、references 和 assets。路径、脚本和外部网络权限不能因为文件名叫 Skill 就自动获得信任。
+Pi 会从以下位置加载 Skill：
 
-### Progressive disclosure 与命令
+- 全局位置：
+  - `~/.pi/agent/skills/`
+  - `~/.agents/skills/`
+- 项目位置（仅在项目受信任后加载）：
+  - `.pi/skills/`
+  - 当前 `cwd` 及其祖先目录中的 `.agents/skills/`，向上搜索直到 Git 仓库根目录；如果当前目录不在仓库中，则搜索到文件系统根目录
+- 包：`skills/` 目录，或 `package.json` 中的 `pi.skills` 条目
+- 设置：`skills` 数组中的文件或目录
+- CLI：`--skill <path>`，可以重复使用；即使同时指定 `--no-skills`，显式路径仍会被加载
 
-启动时 Pi 只扫描位置并提取 `name`/`description`，再把可用 Skill 以 XML 形式加入 System Prompt。任务匹配后，模型使用 `read` 读取完整 `SKILL.md`；必要时再按相对路径读取 references/assets。这样 50 个每个 2000 token 的全文不会在每次请求中消耗 100000 token，而只把短 metadata 常驻上下文；代价是模型可能忘记读取，必要时用 `/skill:name` 强制加载。
+发现规则如下：
 
-Skill 注册 `/skill:name` 命令，例如 `/skill:brave-search` 或带参数的 `/skill:pdf-tools extract`。命令后的文本会以 `User: <args>` 追加到 Skill 内容；是否启用命令由 `enableSkillCommands` 控制。Skill 正文中的脚本路径应相对于 Skill 目录，而不是当前项目 cwd。
+- 在 `~/.pi/agent/skills/` 和 `.pi/skills/` 中，如果根目录下的 `.md` 文件具有有效的 Skill frontmatter，且 `description` 非空，它会作为独立 Skill 被发现。
+- 在所有 Skill 位置中，包含 `SKILL.md` 的目录都会递归发现。
+- 在 `~/.agents/skills/` 和项目的 `.agents/skills/` 中，根目录的 `.md` 文件会被忽略；但分组目录中的 `.md` 文件如果声明了 Skill frontmatter，仍会被发现。
+- 没有有效 Skill frontmatter 的普通根目录 Markdown 文件会被静默忽略。
 
-### 目录和 `SKILL.md` 格式
+使用 `--no-skills` 可以关闭自动发现；显式传入的 `--skill` 路径仍然会加载。
 
-最小目录包含 `SKILL.md`；可选的 `scripts/` 放 helper、`references/` 放延迟加载的详细文档、`assets/` 放模板和数据。frontmatter 至少需要 `name` 与 `description`；可选 `license`、`compatibility`、`metadata`、`allowed-tools` 和 `disable-model-invocation`。`name` 最多 64 字符，只允许小写字母、数字和连字符，且不能以连字符开头/结尾或包含连续连字符；`description` 最多 1024 字符，应写清能力和触发场景，而不是“helps with PDFs”这类空泛句子。Pi 不强制 name 等于目录名，但标准通常要求二者一致。
+> 译者注：全局目录解决跨项目复用，项目目录适合项目约定。项目 Skill 的加载受信任状态控制，不能把“文件存在”误认为“代码已经获准执行”。
 
-frontmatter 通过后，Skill 正文可以自然地用 Setup、Usage 和具体步骤组织；脚本示例中的真实 API/path/参数保持原名。跨 Harness 共用时，可在 settings 中加入 `~/.claude/skills` 或 `~/.codex/skills`，但仍要检查这些目录的信任边界。
+### 使用其他 Harness 的 Skill
 
-### 验证、冲突与示例
+要使用 Claude Code 或 OpenAI Codex 的 Skill，请把对应目录加入设置：
 
-Pi 对名称超长、非法字符、连字符问题或 description 超长给 warning；未知 frontmatter 字段忽略。缺 `description` 的 declared Skill 不加载；frontmatter 损坏或没有 description 会 warning 并跳过；同名 Skill 冲突时保留发现顺序中第一个。验证一个 Skill 时要同时检查 metadata、路径、脚本的执行权限、凭据读取、网络调用和 prompt injection。
-
-> 译者注：Java 可以把 Skill discovery 实现为 `Path` 扫描 + YAML frontmatter DTO，Go 可以用 `filepath.WalkDir` + metadata struct；二者都应把“发现”和“读取全文”分成两步，并在把路径交给 Tool 前做 workspace/allowlist 检查。Skill 与 Plugin 的边界是：Skill 主要是按需文本/资源，Plugin 是带生命周期的代码；Skill 与 MCP 的边界是：MCP 是跨进程协议，Skill 不是远程调用协议。
-
-### 可执行步骤
-
-1. 创建一个只含 metadata 的 `SKILL.md`，确认它出现在 System Prompt，但全文没有被预先注入。
-2. 用 `read` 读取 Skill，再读取一个 reference；记录每一步 token 和实际路径。
-3. 分别测试 `--skill`、`--no-skills`、未信任项目、无 description、非法 name 和同名冲突。
-4. 在 fake workspace 中放置带脚本的 Skill，审阅脚本后才执行；验证凭据不会进入日志、Tool Result 或提交记录。
-
-### Discovery 与 progressive disclosure 的执行顺序
-
-Skill discovery 是启动阶段的目录扫描，不是把每个 `SKILL.md` 全文读入 Context。Pi 先收集可用 Skill 的 `name`、`description` 和路径，再以 XML 形式提供简短目录；模型判断任务匹配后，才通过 `read` 读取完整正文，随后按需要读取 `references/` 或 `assets/`。
-
-```text
-扫描目录
-  -> 解析 frontmatter
-  -> 保留 name/description/path
-  -> 写入 system prompt 的 Skill 列表
-  -> 模型决定需要某项能力
-  -> read SKILL.md
-  -> read scripts/references/assets
-  -> 按相对路径执行工作流
+```json
+{
+  "skills": [
+    "~/.claude/skills",
+    "~/.codex/skills"
+  ]
+}
 ```
 
-这样做不是为了隐藏能力，而是控制 Context 成本。若有 50 个 Skill、每个完整说明 2000 token，常驻全文约 100000 token；只保留平均 30 token 的 metadata，则约 1500 token，模型在需要时再付费加载相关正文。代价是模型可能不主动读取全文，因此任务明确要求时可使用 `/skill:name`。
+项目级 Claude Code Skill 可以在 `.pi/settings.json` 中配置：
 
-> 译者注：progressive disclosure 解决的是“什么时候把说明放进 Context”，不是安全隔离。Skill 仍可指示模型执行 shell、读取凭据或访问网络；真正的权限必须在 Tool/Runtime 层决定。Java/Go 实现都应把 discovery 和 content loading 做成两个可测试接口。
+```json
+{
+  "skills": ["../.claude/skills"]
+}
+```
 
-### 各个位置的差异
+## 工作方式
 
-全局位置 `~/.pi/agent/skills/`、`~/.agents/skills/` 影响用户所有项目；项目 `.pi/skills/` 和 `.agents/skills/` 需要 project trust；package 和 settings 是显式资源来源；CLI `--skill <path>` 是 additive 的人工指定。`--no-skills` 关闭自动发现，但不能抵消显式 `--skill`，否则用户无法在临时运行中选择一个明确 Skill。
+Pi 的加载过程可以概括为：
 
-根目录 Markdown 的规则有意不同：在 `~/.pi/agent/skills/` 和 `.pi/skills/` 中，带有效 Skill frontmatter 且有非空 `description` 的根 `.md` 可作为单文件 Skill；`.agents/skills/` 忽略根 `.md`，但会发现分组目录中的有效 `.md`。所有位置递归寻找目录内的 `SKILL.md`。普通 Markdown 若不符合 Skill 形状会静默忽略，避免把 README 当成可调用能力。
+1. 启动时扫描 Skill 位置，提取名称和描述。
+2. 按规范把可用 Skill 以 XML 形式写入 system prompt。
+3. 当任务与某个 Skill 匹配时，Agent 使用 `read` 读取完整的 `SKILL.md`。模型不一定会主动读取它；也可以用 `/skill:name` 强制加载。
+4. Agent 按 Skill 中的说明执行，并使用相对于 Skill 目录的路径访问脚本和资源。
 
-### `SKILL.md` 的文件结构
+这就是渐进式披露：完整说明只在需要时进入上下文，描述信息则始终可用。
 
-Skill 目录至少有 `SKILL.md`，其余文件由作者定义。常见布局是 `scripts/` 放辅助程序、`references/` 放按需文档、`assets/` 放模板或数据。正文内的相对路径以 Skill 目录为基准，不以当前项目 cwd 为基准；这使同一个 Skill 从不同仓库调用时仍能找到自己的资源。
+> 译者注：可以把它类比为后端服务先读取路由元数据，再按请求加载具体处理器。名称和描述帮助模型选择能力，正文才提供真正的操作步骤；这两层不能混成一份永远放在 system prompt 中的大文档。
 
-```text
-review-skill/
+## Skill 命令
+
+Skill 会注册成 `/skill:name` 命令：
+
+```bash
+/skill:brave-search           # 加载并执行 Skill
+/skill:pdf-tools extract      # 加载 Skill 并传入参数
+```
+
+可以在交互模式的 `/settings` 中，或在 `settings.json` 中切换 Skill 命令：
+
+```json
+{
+  "enableSkillCommands": true
+}
+```
+
+命令后的参数会追加到 Skill 内容末尾，形式为 `User: <args>`。
+
+## 目录结构
+
+一个 Skill 目录必须包含 `SKILL.md`，其他内容由 Skill 自己决定：
+
+````text
+my-skill/
+├── SKILL.md              # 必需：frontmatter + 指令
+├── scripts/              # 辅助脚本
+│   └── process.sh
+├── references/           # 按需加载的详细资料
+│   └── api-reference.md
+└── assets/
+    └── template.json
+````
+
+### `SKILL.md` 格式
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it. Be specific.
+---
+
+# My Skill
+
+## Setup
+
+Run once before first use:
+```bash
+cd /path/to/skill && npm install
+```
+
+## Usage
+
+```bash
+./scripts/process.sh <input>
+```
+```
+
+Skill 内部应使用相对于 Skill 目录的路径：
+
+```markdown
+See [the reference guide](/pi-docs/coding-agent/references/REFERENCE) for details.
+```
+
+## Frontmatter
+
+按照 [Agent Skills 规范](https://agentskills.io/specification#frontmatter-required)，以下字段定义了 Skill 的元数据：
+
+| 字段 | 必需 | 说明 |
+|---|---|---|
+| `name` | 是 | 最长 64 个字符，只能包含小写字母 a-z、数字和连字符。与标准不同，Pi 不要求它与父目录名称一致，因为共享 Skill 目录时这条要求并不实用。 |
+| `description` | 是 | 最长 1024 个字符，说明 Skill 做什么以及何时使用。 |
+| `license` | 否 | 许可证名称，或随包提供的许可证文件引用。 |
+| `compatibility` | 否 | 最长 500 个字符，说明环境要求。 |
+| `metadata` | 否 | 任意键值映射。 |
+| `allowed-tools` | 否 | 以空格分隔的预批准工具列表（实验性字段）。 |
+| `disable-model-invocation` | 否 | 为 `true` 时从 system prompt 隐藏，用户必须使用 `/skill:name`。 |
+
+### 名称规则
+
+- 长度为 1–64 个字符。
+- 只能使用小写字母、数字和连字符。
+- 不能以连字符开头或结尾。
+- 不能出现连续连字符。
+
+Pi 不要求名称与父目录一致。Agent Skills 标准有这个要求，但共享 Skill 目录由多个工具使用时，这条要求并不实用。
+
+有效名称：`pdf-processing`、`data-analysis`、`code-review`。
+
+无效名称：`PDF-Processing`、`-pdf`、`pdf--processing`。
+
+### 描述的写法
+
+描述决定 Agent 何时加载 Skill，因此必须具体说明能力和触发场景。
+
+好的写法：
+
+```yaml
+description: Extracts text and tables from PDF files, fills PDF forms, and merges multiple PDFs. Use when working with PDF documents.
+```
+
+不好的写法：
+
+```yaml
+description: Helps with PDFs.
+```
+
+## 校验
+
+Pi 会依据 Agent Skills 标准校验 Skill。大多数问题只产生警告，但 Skill 仍可能加载：
+
+- 名称超过 64 个字符或包含非法字符。
+- 名称以连字符开头、结尾，或包含连续连字符。
+- 描述超过 1024 个字符。
+
+未知的 frontmatter 字段会被忽略。
+
+缺少描述的声明式 Skill 不会被加载。格式错误的 `SKILL.md`，以及没有 `description` 的 `SKILL.md`，会产生警告并被跳过。没有有效 Skill frontmatter 的其他 Markdown 文件会被静默忽略。
+
+如果多个位置出现相同名称，会产生冲突警告，并保留最先发现的 Skill。
+
+## 示例
+
+下面的目录包含一个搜索 Skill：
+
+````text
+brave-search/
 ├── SKILL.md
-├── scripts/check.sh
-├── references/style.md
-└── assets/template.json
+├── search.js
+└── content.js
+````
+
+**`SKILL.md`：**
+
+````markdown
+---
+name: brave-search
+description: Web search and content extraction via Brave Search API. Use for searching documentation, facts, or any web content.
+---
+
+# Brave Search
+
+## Setup
+
+```bash
+cd /path/to/brave-search && npm install
 ```
 
-一个可执行 Skill 应在正文中分开写 Setup、Usage、输入输出和失败处理；不要只写“运行脚本即可”。脚本需要说明依赖、超时、网络、文件输出和凭据来源。资源文件虽不是 prompt text，也可能包含 prompt injection 或恶意 payload，加载前仍需审阅。
+## Search
 
-> 译者注：`SKILL.md` 是给模型阅读的说明，不等于宿主已经验证过的计划。把它类比成 Java classpath 上的一份操作手册更合适，而不是已注册的安全 Service。Go 的 `filepath.WalkDir` 或 Java 的 `Files.walk` 只能发现文件，不能替代后续 allowlist 和审批。
+```bash
+./search.js "query"              # Basic search
+./search.js "query" --content    # Include page content
+```
 
-### Frontmatter 校验与 name 规则
+## Extract Page Content
 
-必填字段是 `name` 和 `description`。`name` 长度 1–64，只允许小写字母、数字和连字符，不能首尾连字符或连续连字符；`description` 最多 1024 字符，应写“做什么以及什么时候使用”。可选字段包括 `license`、`compatibility`、`metadata`、`allowed-tools` 和 `disable-model-invocation`。
+```bash
+./content.js https://example.com
+```
+````
 
-Pi 对多数违规只发 warning 并继续，但缺少 description 的 declared Skill 不会加载，损坏的 frontmatter 也会被跳过。未知字段会被忽略。Pi 允许 name 与父目录名不同，这是它与标准的一处有意差异；共享 Skill 目录时这很方便，但会增加路径和名称排查成本。
+## 技能仓库
 
-有效示例：`pdf-processing`、`data-analysis`、`code-review`；无效示例：`PDF-Processing`、`-pdf`、`pdf--processing`。description “Helps with PDFs” 太宽泛，应该写清提取文本、表格、表单和使用场景，帮助模型做出 discovery 决策。
-
-### 冲突、失败与安全检查
-
-同名 Skill 冲突时，Pi 发 warning 并保留发现顺序中第一个。多个目录都存在 `review` 时，不要只看名称，应记录来源路径、scope、发现顺序和实际 `SKILL.md`。验证失败不只看 frontmatter，还应检查：脚本是否可执行、相对路径是否越出 Skill 根目录、是否读取环境凭据、是否连接网络、输出是否包含秘密，以及正文是否试图绕过用户确认。
-
-Skill 可携带任意指令，甚至让模型执行 executable code，所以第三方 Skill 与第三方 Extension 一样需要源代码审查。区别是 Extension 直接运行宿主代码并注册事件/工具；Skill 通常通过文字指导模型使用已有 Tool。MCP 是跨进程协议，Skill 不是 MCP server，也不会因为写出 `tools/call` 就自动拥有远端连接。
-
-> 译者注：安全策略要放在最终 effect 前。即使 Skill 声称“只读”，模型仍可能把路径传给 `bash`；因此 Tool Registry、PermissionPolicy 和 sandbox 必须独立校验。Go/Java 示例中的 skill discovery 只能演示 metadata 和资源读取，不能当作生产隔离。
-
-### 可执行实验：观察一次 Skill 加载
-
-1. 在临时项目创建 `skills/review/SKILL.md`，只写合法 `name`、`description` 和一段正文。
-2. 让项目通过 trust，再启动 Pi，记录 system prompt 里出现的 metadata；确认完整正文尚未自动注入。
-3. 输入匹配任务，让模型或用户执行 `/skill:review`，使用 `read` 获取全文。
-4. 再读取一个 reference，检查路径相对于 Skill 目录解析。
-5. 使用坏 name、空 description、重复 name 和缺失文件重复测试，记录 warning 与是否加载。
-6. 加入一个脚本但先只审阅，不执行；测试脚本调用的 Tool 是否经过正常权限检查。
-7. 对照 `--no-skills` 和显式 `--skill ./path`，确认 additive 规则。
-
-实验报告应包含 discovery path、frontmatter 结果、system prompt 摘要、实际读取文件、token 变化、权限判断和失败日志。不要在实验 Skill 中放 API key、SSH 文件或会修改真实仓库的脚本。
-
-> 译者注：如果模型没有读取 Skill 全文，优先检查 description 是否足够具体、任务是否真正匹配，以及是否启用了 `enableSkillCommands`；不要立刻把全文硬编码进 system prompt。这样会破坏 progressive disclosure 的成本边界。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Skills | Skills |
-| Table of Contents | 目录 |
-| Locations | 位置 |
-| Using Skills from Other Harnesses | Using Skills from Other Harnesses |
-| How Skills Work | How Skills Work |
-| Skill Commands | Skill Commands |
-| Skill Structure | Skill Structure |
-| SKILL.md Format | Skill.md Format |
-| My Skill | My Skill |
-| Setup | Setup |
-| Usage | 使用方式 |
-| Frontmatter | Frontmatter |
-| Name Rules | Name Rules |
-| Description Best Practices | Description Best Practices |
-| Validation | Validation |
-| Example | Example |
-| Brave Search | Brave Search |
-| Setup | Setup |
-| Search | Search |
-| Extract Page Content | Extract Page Content |
-| Skill Repositories | Skill Repositories |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+- [Anthropic Skills](https://github.com/anthropics/skills)：文档处理（docx、pdf、ppt、xlsx）和 Web 开发。
+- [Pi Skills](https://github.com/badlogic/pi-skills)：Web 搜索、浏览器自动化、Google API 和转录。
 
 ## 完整原文对照
 
-[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/skills.md)
+[在 GitHub 打开固定 commit 的英文源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/skills.md)
 
 ````markdown
 > pi can create skills. Ask it to build one for your use case.

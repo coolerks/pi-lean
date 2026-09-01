@@ -1,88 +1,47 @@
 ---
-title: "Termux（Android）设置"
-description: "Android Termux 的安装、剪贴板、共享存储和故障排查。"
+title: "Termux（Android）配置"
+description: "在 Android 的 Termux 环境中安装和使用 Pi。"
 ---
 
-# Termux（Android）设置
+# Termux（Android）配置
 
-> 本页是 `packages/coding-agent/docs/termux.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+> 本页根据 `packages/coding-agent/docs/termux.md` 从英文源文件重新翻译。研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、路径、包名和配置文件保持原样。
 
-## 中文导读
+Pi 可以通过 [Termux](https://termux.dev/) 在 Android 上运行。Termux 同时提供终端模拟器和 Linux 环境。
 
-Termux 不是 Android 上的普通 terminal app，而是一个终端 emulator 加 Linux user space。Pi 运行在 Termux 提供的 Node.js 环境中，但文件访问、剪贴板、相机、通知和共享存储仍受 Android 应用权限与 Termux:API 约束。
+## 前置条件
 
-本译文按安装、剪贴板、环境文件、限制和故障排查展开。第一次配置时要把 Termux 应用、Termux:API 应用和 Termux 内的 `termux-api` 命令包看成三个层次；缺少任意一层，都可能导致“命令存在但没有设备结果”。
+1. 从 GitHub 或 F-Droid 安装 [Termux](https://github.com/termux/termux-app#installation)，不要从 Google Play 安装；Google Play 版本已经废弃。
+2. 从 GitHub 或 F-Droid 安装 [Termux:API](https://github.com/termux/termux-api#installation)，它为剪贴板和其他设备集成提供支持。
 
-## 中文译文
-
-### 前置条件：安装正确的两个应用
-
-从 [GitHub](https://github.com/termux/termux-app#installation) 或 F-Droid 安装 Termux，不要使用 Google Play 版本；源文档说明该版本已废弃。Termux 提供终端和 Linux 环境，是 Pi 的运行容器。
-
-还需要从 GitHub 或 F-Droid 安装 [Termux:API](https://github.com/termux/termux-api#installation)，用于剪贴板和其他设备集成。Termux:API 应用和 Termux 主应用应来自兼容的来源；只在 Termux 中安装命令包，不会自动安装 Android companion app。
-
-> 译者注：Android 应用权限和 Linux 命令权限是两套检查。`pkg install termux-api` 只安装命令行客户端，真正执行还需要 Termux:API 应用和系统授权。
-
-### 安装 Pi
-
-在 Termux 中更新软件包并安装依赖：
+## 安装
 
 ```bash
-# Update packages
+# 更新软件包
 pkg update && pkg upgrade
 
-# Install dependencies
+# 安装依赖
 pkg install nodejs termux-api git
 
-# Install pi
+# 安装 pi
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
-# Create config directory
+# 创建配置目录
 mkdir -p ~/.pi/agent
 
-# Run pi
+# 运行 pi
 pi
 ```
 
-每一步的作用不同：
+## 剪贴板支持
 
-| 命令 | 作用 | 失败时先检查 |
-| --- | --- | --- |
-| `pkg update && pkg upgrade` | 更新 Termux 软件源和已装包 | 网络、镜像源、存储空间 |
-| `pkg install nodejs termux-api git` | 安装 Node.js、API 命令和 Git | 包名、架构、仓库状态 |
-| `npm install -g ...` | 全局安装 Pi CLI | Node/npm、网络、prefix |
-| `mkdir -p ~/.pi/agent` | 创建 Pi 全局配置目录 | home 权限 |
-| `pi` | 在当前 cwd 启动 | PATH、认证、终端协议 |
+在 Termux 中运行时，剪贴板操作会使用 `termux-clipboard-set` 和 `termux-clipboard-get`。要让这些命令工作，必须安装 Termux:API 应用。
 
-`--ignore-scripts` 关闭 npm dependency lifecycle scripts。它减少安装阶段的隐式执行，但不代表 Pi 运行时不会执行 Tool，也不替代 Android 权限、Project trust 或 shell policy。
+Termux 不支持图片剪贴板；`ctrl+v` 图片粘贴功能无法使用。
 
-安装后可以先验证：
+## Termux 环境的 `AGENTS.md` 示例
 
-```bash
-node --version
-npm --version
-pi --help
-pwd
-```
-
-不要一开始就让模型执行写文件或访问共享存储；先用只读请求确认 cwd 和 Provider。
-
-### 剪贴板支持
-
-在 Termux 中，文本剪贴板通过 `termux-clipboard-set` 和 `termux-clipboard-get` 操作：
-
-```bash
-termux-clipboard-set "hello from termux"
-termux-clipboard-get
-```
-
-前提是 Termux:API 应用已安装且 Android 允许它工作。Pi 的图片剪贴板在 Termux 不支持，因此 `ctrl+v` 的图片粘贴功能不会工作；文本剪贴板和图片输入是两个独立能力。
-
-可以先不启动 Pi，单独测试命令输出。若 `termux-clipboard-get` 为空，先确认 set/get 的系统剪贴板是否一致，再检查 companion app，而不是把问题归因给 Model。
-
-### Termux 环境的 `AGENTS.md`
-
-可以创建 `~/.pi/agent/AGENTS.md`，让模型知道 Android 的路径和可用命令：
+可以创建 `~/.pi/agent/AGENTS.md`，帮助 Agent 了解 Termux 环境：
 
 ````markdown
 # Agent Environment: Termux on Android
@@ -141,43 +100,20 @@ termux-camera-photo out.jpg   # Take photo
 - Storage permission needed for `/storage/emulated/0` access
 ````
 
-这个文件的价值是把环境事实加入 Context，而不是授予权限。`termux-open`、相机和通知都会产生宿主副作用；Agent 仍应遵守 Tool allowlist、用户确认和输出路径限制。
+## 限制
 
-环境信息应保持准确。若设备使用不同的 home、共享存储映射或企业 MDM 限制，修改示例中的路径和说明；不要让模型根据默认路径猜测文件位置。
+- **没有图片剪贴板：** Termux 剪贴板 API 只支持文本。
+- **没有原生二进制文件：** 某些可选原生依赖（例如剪贴板模块）在 Android ARM64 上不可用，安装时会跳过。
+- **存储访问：** 要访问 `/storage/emulated/0`（Downloads 等）中的文件，需要运行一次 `termux-setup-storage` 授予权限。
 
-### 共享存储与权限
+## 故障排查
 
-访问 `/storage/emulated/0`（Downloads、Documents 等）前运行一次：
-
-```bash
-termux-setup-storage
-```
-
-Android 会弹出权限对话框。批准后再检查目标目录：
-
-```bash
-ls -la /storage/emulated/0
-ls -la ~/storage
-```
-
-Termux 私有 home（通常 `/data/data/com.termux/files/home`）和 Android shared storage 不是同一安全域。共享存储可能被其他 Android app 看到，私有目录则受 Termux 应用沙箱保护；不要把 API key、session 或 SSH 私钥复制到共享目录。
-
-### 限制
-
-- **No image clipboard**：Termux clipboard API 只支持文本，Pi 的 `ctrl+v` 图片粘贴不可用。
-- **No native binaries**：Android ARM64 上某些可选 native dependency（例如 clipboard module）不可用，安装时会跳过；这不等于 Node.js 或 Pi 核心损坏。
-- **Storage access**：共享存储需要 `termux-setup-storage` 和 Android permission；普通 Linux 路径推断不能代替授权。
-- **后台限制**：Android 可能暂停后台进程、回收内存或限制网络。长时间 Agent Run 应保存 session、控制超时，并考虑设备电源设置。
-- **键盘/终端差异**：手机键盘和桌面 terminal 的 modifier、鼠标和 fullscreen 能力不同，必要时使用 external keyboard 或 regular 模式。
-
-> 译者注：Termux 的“可运行”不表示拥有 Android 全部能力。每个 `termux-*` 命令都应当视作跨进程 Tool，需单独考虑授权、失败和敏感输出。
-
-### 故障排查：Clipboard not working
+### 剪贴板不工作
 
 确认两个应用都已安装：
 
-1. Termux（GitHub 或 F-Droid）。
-2. Termux:API（GitHub 或 F-Droid）。
+1. Termux（从 GitHub 或 F-Droid 安装）。
+2. Termux:API（从 GitHub 或 F-Droid 安装）。
 
 然后安装命令行工具：
 
@@ -185,84 +121,25 @@ Termux 私有 home（通常 `/data/data/com.termux/files/home`）和 Android sha
 pkg install termux-api
 ```
 
-单独测试：
+### 共享存储权限被拒绝
 
-```bash
-termux-clipboard-set "probe"
-termux-clipboard-get
-```
-
-如果命令找不到，检查 `$PREFIX/bin` 和 package 安装；如果命令存在但无结果，检查 Termux:API app、Android 权限和版本来源。
-
-### 故障排查：共享存储 Permission denied
-
-运行：
+运行一次以下命令以授予存储权限：
 
 ```bash
 termux-setup-storage
 ```
 
-在 Android 对话框中允许访问后重新打开 Termux 或重新执行 `ls`。若仍失败，确认路径是 `/storage/emulated/0`，不是把桌面 Linux 的 `/mnt` 路径直接复制过来；也检查 Android 系统设置中的应用权限。
+### Node.js 安装问题
 
-### 故障排查：Node.js 安装问题
-
-先确认 `pkg update` 已成功、存储空间足够、仓库镜像可访问。如果 npm 安装失败，可清理缓存：
+如果 npm 执行失败，可以尝试清理缓存：
 
 ```bash
 npm cache clean --force
 ```
 
-清缓存会删除本地 npm cache，不能修复 Android storage permission、错误的 Node 架构或网络代理。清理后重新执行安装，并保留完整的错误文本（脱敏后）用于定位。
-
-## 可执行实验：在受限目录验证 Termux 集成
-
-### 目标
-
-分别验证 Node/Pi、文本剪贴板、共享存储和 context file，不触碰真实凭据。
-
-### 步骤
-
-1. 从推荐来源安装 Termux 与 Termux:API。
-2. 在 Termux 中执行 `pkg update && pkg upgrade`。
-3. 安装 `nodejs termux-api git` 并运行 `node --version`。
-4. 用 `termux-clipboard-set/get` 做文本 round trip。
-5. 执行 `termux-setup-storage`，只在 Downloads 下创建临时文件。
-6. 创建最小 `~/.pi/agent/AGENTS.md`，注明 Android 路径和禁止访问 key 的规则。
-7. 启动 Pi，先发“只读取 README，不要修改文件”。
-8. 用 `/reload` 观察 context 更新，再退出并清理实验文件。
-
-### 观察点
-
-记录命令属于 Termux package、Termux:API app 还是 Android system permission；记录 Pi 是否能看到路径、是否产生 session、是否执行了 Tool。不要把“模型知道路径”误记成“模型已经获得路径权限”。
-
-### 思考题
-
-1. 为什么安装 `termux-api` 命令包仍可能无法执行 `termux-clipboard-get`？
-2. 为什么共享存储不适合保存 credentials 和 session？
-3. Android 回收后台进程时，Agent Harness 需要哪些 session 和恢复能力？
-4. 如果模型想调用 `termux-camera-photo`，权限审批应放在 Skill、Tool 还是宿主策略？
-5. Termux 中 regular TUI 与 fullscreen TUI 哪个更稳？请根据手机输入、滚动和键盘协议说明。
-
-> 译者注：这篇官方文档看似是安装说明，真正的工程重点是跨进程和跨权限边界。把每个 Android 集成命令当作 Tool，才能正确设计 Harness 的取消、审计和错误处理。
-
-## 与 Go、Java 和 Pi 的对照
-
-| Termux 能力 | Pi/TypeScript | Go 示例 | Java 示例 |
-| --- | --- | --- | --- |
-| 剪贴板/设备命令 | coding-agent Tool/Extension 可接入 | `exec.CommandContext` 的受控边界（示例 policy） | `ProcessBuilder` 的受控边界（示例 policy） |
-| 取消 | `AbortSignal` | `context.Context` | `CancellationToken` + interruption |
-| 配置路径 | `~/.pi/agent` | session path 显式传入 | `Path` 显式传入 |
-| 测试 | faux/provider fixtures | `ScriptedModel` + temp dir | `ScriptedModel` + JUnit temp dir |
-
-> 译者注：Go/Java 对照只说明宿主边界，不表示这些示例自动获得 Android API；真实移动端集成仍需系统权限、命令可用性和用户审批。
-
-## 小结
-
-Termux 提供运行环境，Termux:API 提供设备桥接，Android permission 决定能否访问资源，Pi Tool 决定模型能否提出动作。分清这四层，安装和排障就不会变成反复重装 npm；也能在移动设备上为 session、取消和敏感输出保留可靠边界。
-
 ## 完整原文对照
 
-[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/termux.md)
+[在 GitHub 打开固定 commit 的英文源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/termux.md)
 
 ````markdown
 # Termux (Android) Setup

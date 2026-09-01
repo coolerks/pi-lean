@@ -1,107 +1,203 @@
 ---
-title: "Keybindings"
-description: "TUI 编辑器和应用快捷键配置。"
+title: "键位绑定"
+description: "配置 Pi 的编辑器、全屏界面、会话、模型和树导航快捷键。"
 ---
 
-# Keybindings
+# 键位绑定
 
-> 本页是 `packages/coding-agent/docs/keybindings.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
+Pi 的快捷键可以通过 `~/.pi/agent/keybindings.json` 自定义。每个动作可以绑定一个或多个按键。配置使用 Pi 内部以及 Extension 作者在 `keyHint()` 和注入的 `keybindings` 管理器中使用的命名空间键位 ID。
 
-## 中文导读
+旧版本配置中使用的 `cursorUp`、`expandTools` 等未命名空间化 ID，会在启动时自动迁移到新的 ID。修改 `keybindings.json` 后，在 Pi 中执行 `/reload`，即可应用修改而不必重新启动当前会话。
 
-TUI 编辑器和应用快捷键配置。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+## 按键格式
 
-## 中文译文
+按键写成 `modifier+key`。这里的 modifier 表示修饰键，可以是 `ctrl`、`shift`、`alt`、`super`，多个修饰键可以组合。可用按键包括：
 
-### 配置原则与按键格式
+- **字母：** `a-z`
+- **数字：** `0-9`
+- **特殊键：** `escape`、`esc`、`enter`、`return`、`tab`、`space`、`backspace`、`delete`、`insert`、`clear`、`home`、`end`、`pageUp`、`pageDown`、`up`、`down`、`left`、`right`
+- **功能键：** `f1`–`f12`
+- **符号：** `` ` ``、`-`、`=`、`[`、`]`、`\`、`;`、`'`、`,`、`.`、`/`、`!`、`@`、`#`、`$`、`%`、`^`、`&`、`*`、`(`、`)`、`_`、`+`、`|`、`~`、`{`、`}`、`:`、`<`、`>`、`?`
 
-Pi 的所有快捷键都可以在 `~/.pi/agent/keybindings.json` 中配置。一个 action 可以绑定一个按键，也可以绑定按键数组。配置使用带命名空间的 action id；扩展作者在 `keyHint()` 和注入的 `keybindings` manager 中也使用同一组 id。旧配置中的 `cursorUp`、`expandTools` 等未命名空间 id 会在启动时自动迁移。编辑文件后，在 Pi 内执行 `/reload`，不用重启当前 session。
+例如：`ctrl+shift+x`、`alt+ctrl+x`、`ctrl+shift+alt+x`、`super+k`、`ctrl+super+k` 和 `ctrl+1` 都是合法组合。
 
-按键格式为 `modifier+key`。modifier 可以组合使用：`ctrl`、`shift`、`alt`、`super`；key 可以是 `a-z`、`0-9`、`escape`/`esc`、`enter`/`return`、`tab`、`space`、`backspace`、`delete`、`insert`、`clear`、`home`、`end`、`pageUp`、`pageDown`、四个方向键、`f1-f12` 以及常见符号。比如 `ctrl+shift+x`、`alt+ctrl+x`、`super+k`、`ctrl+1`。`super` 需要终端单独报告该 modifier，通常依赖 Kitty keyboard protocol；终端链路不支持时不会生效。
+`super` 绑定要求终端能够单独报告这个修饰键，通常需要 Kitty 键盘协议。没有这项支持的终端可能无法识别相关快捷键。
 
-### TUI 编辑器和输入
+> 译者注：配置文件中的键位 ID 是程序契约，不能把 `tui.editor.cursorUp` 改写成中文。可以翻译界面说明，但配置键、按键值和命令必须保持原样，否则 `/reload` 无法识别。
 
-| action id | 默认按键 | 中文行为 |
-| --- | --- | --- |
-| `tui.editor.cursorUp` / `cursorDown` | `up` / `down` | 上下移动；在边界浏览更旧/更新的历史 |
-| `tui.editor.historyPrevious` / `historyNext` | 无 | 选择上一条/下一条 prompt 历史 |
-| `tui.editor.cursorLeft` / `cursorRight` | `left`, `ctrl+b` / `right`, `ctrl+f` | 左右移动 |
-| `tui.editor.cursorWordLeft` / `cursorWordRight` | `alt+left`, `ctrl+left`, `alt+b` / `alt+right`, `ctrl+right`, `alt+f` | 按单词移动 |
-| `tui.editor.cursorLineStart` / `cursorLineEnd` | `home`, `ctrl+home`, `ctrl+a` / `end`, `ctrl+end`, `ctrl+e` | 跳到行首/行尾 |
-| `tui.editor.jumpForward` / `jumpBackward` | `ctrl+]` / `ctrl+alt+]` | 跳到下一个/上一个字符 |
-| `tui.editor.pageUp` / `pageDown` | `pageUp`, `ctrl+pageUp` / `pageDown`, `ctrl+pageDown` | 按页滚动 |
-| `tui.editor.deleteCharBackward` / `deleteCharForward` | `backspace` / `delete`, `ctrl+d` | 删除前一个/后一个字符 |
-| `tui.editor.deleteWordBackward` / `deleteWordForward` | `ctrl+w`, `alt+backspace` / `alt+d`, `alt+delete` | 删除前一个/后一个单词 |
-| `tui.editor.deleteToLineStart` / `deleteToLineEnd` | `ctrl+u` / `ctrl+k` | 删除到行首/行尾 |
-| `tui.input.newLine` | `shift+enter`, `ctrl+j` | 插入换行 |
+## 所有动作
+
+### TUI 编辑器：光标移动
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `tui.editor.cursorUp` | `up` | 光标上移；到达顶部时浏览较早的历史记录 |
+| `tui.editor.cursorDown` | `down` | 光标下移；到达底部时浏览较新的历史记录 |
+| `tui.editor.historyPrevious` | *(无)* | 选择上一条提示词历史 |
+| `tui.editor.historyNext` | *(无)* | 选择下一条提示词历史 |
+| `tui.editor.cursorLeft` | `left`、`ctrl+b` | 光标左移 |
+| `tui.editor.cursorRight` | `right`、`ctrl+f` | 光标右移 |
+| `tui.editor.cursorWordLeft` | `alt+left`、`ctrl+left`、`alt+b` | 光标向左移动一个单词 |
+| `tui.editor.cursorWordRight` | `alt+right`、`ctrl+right`、`alt+f` | 光标向右移动一个单词 |
+| `tui.editor.cursorLineStart` | `home`、`ctrl+home`、`ctrl+a` | 移到行首 |
+| `tui.editor.cursorLineEnd` | `end`、`ctrl+end`、`ctrl+e` | 移到行尾 |
+| `tui.editor.jumpForward` | `ctrl+]` | 跳到后面的字符 |
+| `tui.editor.jumpBackward` | `ctrl+alt+]` | 跳到前面的字符 |
+| `tui.editor.pageUp` | `pageUp`、`ctrl+pageUp` | 向上翻一页 |
+| `tui.editor.pageDown` | `pageDown`、`ctrl+pageDown` | 向下翻一页 |
+
+专用历史动作无论光标位于多行提示中的什么位置，都会切换历史记录。主编辑器获得焦点时，显式配置的历史绑定优先于应用级动作。因此，把 `tui.editor.historyPrevious` 绑定为 `ctrl+p`，只会覆盖编辑器中的模型切换操作，不会改变选择器中的 `Ctrl+P`。
+
+### TUI 编辑器：删除
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `tui.editor.deleteCharBackward` | `backspace` | 删除光标前的字符 |
+| `tui.editor.deleteCharForward` | `delete`、`ctrl+d` | 删除光标后的字符 |
+| `tui.editor.deleteWordBackward` | `ctrl+w`、`alt+backspace` | 删除光标前的单词 |
+| `tui.editor.deleteWordForward` | `alt+d`、`alt+delete` | 删除光标后的单词 |
+| `tui.editor.deleteToLineStart` | `ctrl+u` | 删除到行首 |
+| `tui.editor.deleteToLineEnd` | `ctrl+k` | 删除到行尾 |
+
+### TUI 输入
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `tui.input.newLine` | `shift+enter`、`ctrl+j` | 插入换行 |
 | `tui.input.submit` | `enter` | 提交输入 |
-| `tui.input.tab` | `tab` | Tab/自动补全 |
-| `tui.editor.yank` / `yankPop` | `ctrl+y` / `alt+y` | 粘贴最近删除内容/轮换删除环 |
-| `tui.editor.undo` | `ctrl+-`（Windows 为 `ctrl+z`，WSL 为 `alt+z`） | 撤销上次编辑 |
+| `tui.input.tab` | `tab` | Tab / 自动补全 |
+
+### TUI Kill Ring
+
+Kill ring（剪切环）是编辑器保存最近删除文本的区域，以便之后取回。
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `tui.editor.yank` | `ctrl+y` | 粘贴最近删除的文本 |
+| `tui.editor.yankPop` | `alt+y` | 在 yank 后循环选择其他已删除文本 |
+| `tui.editor.undo` | `ctrl+-`（Windows 为 `ctrl+z`；WSL 为 `alt+z`） | 撤销上一次编辑 |
+
+### TUI 剪贴板和选择
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
 | `tui.input.copy` | `ctrl+c` | 复制选中内容 |
-
-history action 不受多行光标位置影响，总是切换历史条目。编辑器获得焦点时，显式绑定的 history action 优先于应用 action；例如把 `tui.editor.historyPrevious` 绑定到 `ctrl+p`，只会改变主编辑器，不会改变选择器中的 `Ctrl+P`。
-
-### 选择器和全屏 transcript
-
-| action id | 默认按键 | 中文行为 |
-| --- | --- | --- |
-| `tui.select.up` / `down` | `up` / `down` | 上移/下移选项 |
-| `tui.select.pageUp` / `pageDown` | `pageUp` / `pageDown` | 按页移动 |
+| `tui.select.up` | `up` | 向上移动选择 |
+| `tui.select.down` | `down` | 向下移动选择 |
+| `tui.select.pageUp` | `pageUp` | 列表向上翻页 |
+| `tui.select.pageDown` | `pageDown` | 列表向下翻页 |
 | `tui.select.confirm` | `enter` | 确认选择 |
-| `tui.select.cancel` | `escape`, `ctrl+c` | 取消选择 |
-| `tui.altScreen.pageUp` / `pageDown` | `pageUp` / `pageDown` | transcript 上/下滚动一页 |
-| `tui.altScreen.halfPageUp` / `halfPageDown` | 无 | 上/下滚动半页 |
-| `tui.altScreen.lineUp` / `lineDown` | 无 | 上/下滚动一行 |
-| `tui.altScreen.previousPrompt` / `nextPrompt` | `ctrl+shift+up`, `ctrl+up` / `ctrl+shift+down`, `ctrl+down` | 跳到前一个/后一个标记消息；Windows/WSL 默认只有 `ctrl+up/down` |
-| `tui.altScreen.search` | `ctrl+shift+f`（Windows/WSL 为 `ctrl+f`） | 搜索渲染后的 transcript |
-| `tui.altScreen.searchNext` / `searchPrevious` | `enter`, `ctrl+g` / `shift+enter`, `ctrl+shift+g` | 选下一个/上一个匹配 |
-| `tui.altScreen.searchClose` | `escape` | 关闭搜索 |
-| `tui.altScreen.top` / `bottom` | `home` / `end` | 跳到 transcript 开头/结尾并跟随新输出 |
+| `tui.select.cancel` | `escape`、`ctrl+c` | 取消选择 |
 
-`--tui-mode fullscreen` 时，鼠标滚轮和触控板滚动 transcript；`home`、`end`、`pageUp`、`pageDown` 也指向 transcript，而带 `ctrl` 的版本仍控制编辑器。regular 模式下两组都控制编辑器。fullscreen transcript binding 优先于 editor binding。可以把 action 绑定设为空数组来禁用，例如 `"tui.altScreen.pageUp": []`；也可以把 `tui.altScreen.pageUp` 改绑到 `ctrl+pageUp`。OSC 8 链接可点击，拖拽主鼠标键会选择并复制文本。
+### TUI 全屏视口
 
-### 应用、Session、模型和消息队列
+以下动作在交互模式下使用 `--tui-mode fullscreen` 时生效，作用对象是主对话记录的滚动区域。双指触控板和鼠标滚轮会滚动指针所在区域；如果指针不在可滚动区域，则回退到固定编辑区、状态栏和底部栏上方的对话记录。点击 OSC 8 超链接会交给默认处理程序打开。按住鼠标左键拖动可以选择文本并复制到剪贴板；当指针停在对话记录顶部或底部时，界面会自动滚动到屏幕外的新内容。终端相关的鼠标和触控板行为见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。
 
-| action id | 默认按键 | 中文行为 |
-| --- | --- | --- |
-| `app.interrupt` | `escape` | 取消/中止当前运行 |
-| `app.clear` | `ctrl+c` | 第一次清空编辑器，第二次退出 |
+全屏对话记录的绑定优先于编辑器绑定。因此在全屏模式下，未修改的方向键负责对话记录导航，而带 `ctrl` 的版本继续控制编辑器；离开全屏后，两种版本都控制编辑器。
+
+| Key | 默认模式 | 全屏模式 |
+|-----|--------------|-----------------|
+| `home`、`end` | 编辑器 | 对话记录 |
+| `ctrl+home`、`ctrl+end` | 编辑器 | 编辑器 |
+| `pageUp`、`pageDown` | 编辑器 | 对话记录 |
+| `ctrl+pageUp`、`ctrl+pageDown` | 编辑器 | 编辑器 |
+
+这套路由仍可通过普通动作绑定进行配置。例如，`"tui.altScreen.pageUp": "ctrl+pageUp"` 会让全屏模式下的 `pageUp` 控制编辑器，而 `ctrl+pageUp` 控制对话记录。可以为半页移动绑定 `tui.altScreen.halfPageUp` 和 `tui.altScreen.halfPageDown`，为单行移动绑定 `tui.altScreen.lineUp` 和 `tui.altScreen.lineDown`。将 `"tui.altScreen.pageUp": []` 设置为空数组，可以完全关闭该对话记录快捷键。用户配置会替换该动作的默认绑定。
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `tui.altScreen.pageUp` | `pageUp` | 对话记录向上翻一页 |
+| `tui.altScreen.pageDown` | `pageDown` | 对话记录向下翻一页 |
+| `tui.altScreen.halfPageUp` | *(无)* | 对话记录向上翻半页 |
+| `tui.altScreen.halfPageDown` | *(无)* | 对话记录向下翻半页 |
+| `tui.altScreen.lineUp` | *(无)* | 对话记录向上滚动一行 |
+| `tui.altScreen.lineDown` | *(无)* | 对话记录向下滚动一行 |
+| `tui.altScreen.previousPrompt` | `ctrl+shift+up`、`ctrl+up`（Windows 和 WSL 仅为 `ctrl+up`） | 跳到上一条标记消息 |
+| `tui.altScreen.nextPrompt` | `ctrl+shift+down`、`ctrl+down`（Windows 和 WSL 仅为 `ctrl+down`） | 跳到下一条标记消息 |
+| `tui.altScreen.search` | `ctrl+shift+f`（Windows 和 WSL 为 `ctrl+f`） | 搜索渲染后的对话记录 |
+| `tui.altScreen.searchNext` | `enter`、`ctrl+g` | 搜索时选择下一个匹配项 |
+| `tui.altScreen.searchPrevious` | `shift+enter`、`ctrl+shift+g` | 搜索时选择上一个匹配项 |
+| `tui.altScreen.searchClose` | `escape` | 关闭对话记录搜索 |
+| `tui.altScreen.top` | `home` | 滚动到对话记录开头 |
+| `tui.altScreen.bottom` | `end` | 滚动到对话记录末尾，并跟随新输出 |
+
+### 应用级动作
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `app.interrupt` | `escape` | 取消 / 中止 |
+| `app.clear` | `ctrl+c` | 清空编辑器（第一次）/退出（第二次） |
 | `app.exit` | `ctrl+d` | 编辑器为空时退出 |
-| `app.suspend` | `ctrl+z`（Windows 无默认值） | 挂起到后台 |
-| `app.editor.external` | `ctrl+g` | 使用 `externalEditor`、`$VISUAL`、`$EDITOR`、Windows Notepad 或其他平台 `nano` 打开外部编辑器 |
-| `app.clipboard.pasteImage` | `ctrl+v`（Windows/WSL 为 `alt+v`） | 粘贴图像或文本 |
-| `app.session.new` / `tree` / `fork` / `resume` | 无 | 新建、打开树导航、fork、恢复 session |
-| `app.session.togglePath` | `ctrl+p` | 显示/隐藏路径 |
-| `app.session.toggleSort` | `ctrl+s` | 切换排序 |
-| `app.session.toggleNamedFilter` | `ctrl+n` | 只看命名 session |
-| `app.session.rename` / `delete` | `ctrl+r` / `ctrl+d` | 重命名/删除 session |
-| `app.session.deleteNoninvasive` | `ctrl+backspace` | query 为空时删除 session |
+| `app.suspend` | `ctrl+z`（Windows 无默认绑定） | 挂起到后台 |
+| `app.editor.external` | `ctrl+g` | 用外部编辑器打开（`externalEditor`、`$VISUAL`、`$EDITOR`、Windows 上的 Notepad，或其他系统上的 `nano`） |
+| `app.clipboard.pasteImage` | `ctrl+v`（Windows 和 WSL 为 `alt+v`） | 从剪贴板粘贴图像或文本 |
+
+### 会话
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `app.session.new` | *(无)* | 新建会话（`/new`） |
+| `app.session.tree` | *(无)* | 打开会话树导航器（`/tree`） |
+| `app.session.fork` | *(无)* | 从当前会话分叉（`/fork`） |
+| `app.session.resume` | *(无)* | 打开会话恢复选择器（`/resume`） |
+| `app.session.togglePath` | `ctrl+p` | 切换路径显示 |
+| `app.session.toggleSort` | `ctrl+s` | 切换排序模式 |
+| `app.session.toggleNamedFilter` | `ctrl+n` | 切换仅显示命名会话 |
+| `app.session.rename` | `ctrl+r` | 重命名会话 |
+| `app.session.delete` | `ctrl+d` | 删除会话 |
+| `app.session.deleteNoninvasive` | `ctrl+backspace` | 查询为空时删除会话 |
+
+### 模型与思考
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
 | `app.model.select` | `ctrl+l` | 打开模型选择器 |
-| `app.model.cycleForward` / `cycleBackward` | `ctrl+p` / `shift+ctrl+p`（Windows/WSL 为 `alt+p`） | 下一个/上一个模型 |
-| `app.thinking.cycle` / `toggle` | `shift+tab` / `ctrl+t` | 切换 thinking level/折叠 thinking block |
-| `app.tools.expand` | `ctrl+o` | 展开/折叠工具输出 |
-| `app.message.copy` | `ctrl+x` | 在 tree 复制选中消息，否则复制最后一条 assistant 或 fullscreen 选区 |
-| `app.message.followUp` | `alt+enter`（Windows/WSL 为 `ctrl+q`） | 排队 follow-up |
-| `app.message.dequeue` | `alt+up`（Windows/WSL 为 `alt+q`） | 将排队消息放回编辑器 |
+| `app.model.cycleForward` | `ctrl+p` | 切换到下一个模型 |
+| `app.model.cycleBackward` | `shift+ctrl+p`（Windows 和 WSL 为 `alt+p`） | 切换到上一个模型 |
+| `app.thinking.cycle` | `shift+tab` | 循环切换思考级别 |
+| `app.thinking.toggle` | `ctrl+t` | 折叠或展开思考区块 |
 
-### Tree 和 scoped models
+### 显示和消息队列
 
-| action id | 默认按键 | 中文行为 |
-| --- | --- | --- |
-| `app.tree.foldOrUp` / `unfoldOrDown` | `ctrl+left`, `alt+left` / `ctrl+right`, `alt+right` | 折叠当前分支片段或跳到前一段/后一段 |
-| `app.tree.editLabel` | `shift+l` | 编辑节点 label |
-| `app.tree.toggleLabelTimestamp` | `shift+t` | 切换 label 时间戳 |
-| `app.tree.filter.default` / `noTools` / `userOnly` / `labeledOnly` / `all` | `ctrl+d` / `ctrl+t` / `ctrl+u` / `ctrl+l` / `ctrl+a` | 设置默认、隐藏 Tool、仅用户、仅已标记或全部过滤 |
-| `app.tree.filter.cycleForward` / `cycleBackward` | `ctrl+o` / `shift+ctrl+o` | 前后切换 tree filter |
-| `app.models.save` | `ctrl+s` | 保存当前模型选择到 settings |
-| `app.models.enableAll` / `clearAll` | `ctrl+a` / `ctrl+x` | 启用全部/清空全部模型（可受当前搜索限制） |
-| `app.models.toggleProvider` | `ctrl+p` | 切换当前 Provider 的全部模型 |
-| `app.models.reorderUp` / `reorderDown` | `alt+up` / `alt+down` | 调整循环顺序 |
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `app.tools.expand` | `ctrl+o` | 折叠或展开工具输出 |
+| `app.message.copy` | `ctrl+x` | 在 `/tree` 中复制选中消息；否则复制最后一条 assistant 消息，或者在 `fullscreenCopyOnSelect` 关闭时复制当前全屏文本选择 |
+| `app.message.followUp` | `alt+enter`（Windows 和 WSL 为 `ctrl+q`） | 将后续消息加入队列 |
+| `app.message.dequeue` | `alt+up`（Windows 和 WSL 为 `alt+q`） | 将排队消息恢复到编辑器 |
 
-`/scoped-models` 打开的 scoped models selector 使用最后一组 action。Windows 原生环境不支持 Unix job control；即使手动绑定 `app.suspend`，Pi 也只显示状态而不会真正挂起。WSL 仍使用 Linux 的 `ctrl+z`/`fg` 语义。
+### 树导航
 
-### 自定义配置示例
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `app.tree.foldOrUp` | `ctrl+left`、`alt+left` | 折叠当前分支片段，或跳到上一个片段开头 |
+| `app.tree.unfoldOrDown` | `ctrl+right`、`alt+right` | 展开当前分支片段，或跳到下一个片段开头/分支末尾 |
+| `app.tree.editLabel` | `shift+l` | 编辑选中树节点的标签 |
+| `app.tree.toggleLabelTimestamp` | `shift+t` | 切换树中的标签时间戳 |
+| `app.tree.filter.default` | `ctrl+d` | 将树过滤器设为默认视图 |
+| `app.tree.filter.noTools` | `ctrl+t` | 切换隐藏工具结果的树过滤器 |
+| `app.tree.filter.userOnly` | `ctrl+u` | 切换只显示用户消息的树过滤器 |
+| `app.tree.filter.labeledOnly` | `ctrl+l` | 切换为只显示带标签条目的树过滤器 |
+| `app.tree.filter.all` | `ctrl+a` | 切换为显示全部条目的树过滤器 |
+| `app.tree.filter.cycleForward` | `ctrl+o` | 向前循环树过滤器 |
+| `app.tree.filter.cycleBackward` | `shift+ctrl+o` | 向后循环树过滤器 |
+
+### 作用域模型选择器
+
+以下动作在通过 `/scoped-models` 打开的作用域模型选择器中使用。
+
+| Keybinding id | 默认值 | 说明 |
+|--------|---------|-------------|
+| `app.models.save` | `ctrl+s` | 将当前模型选择保存到设置 |
+| `app.models.enableAll` | `ctrl+a` | 启用全部模型（或当前搜索匹配的模型） |
+| `app.models.clearAll` | `ctrl+x` | 清除全部模型（或当前搜索匹配的模型） |
+| `app.models.toggleProvider` | `ctrl+p` | 切换当前模型提供商的全部模型 |
+| `app.models.reorderUp` | `alt+up` | 将选中模型向上移动 |
+| `app.models.reorderDown` | `alt+down` | 将选中模型向下移动 |
+
+## 自定义配置
+
+创建 `~/.pi/agent/keybindings.json`：
 
 ```json
 {
@@ -111,109 +207,38 @@ history action 不受多行光标位置影响，总是切换历史条目。编�
 }
 ```
 
-单个 action 可以是字符串或数组；用户配置覆盖默认值。Emacs 常见映射使用 `ctrl+b/f`、`alt+b/f`、`ctrl+p/n` 和 `ctrl+h`；Vim 风格可以把方向键额外映射到 `alt+h/j/k/l`。这些配置只改变按键到 action 的映射，不改变 action 本身的队列或模型语义。
+每个动作可以配置单个按键，也可以配置按键数组。用户配置会覆盖默认值。
 
-### Action、按键与焦点的关系
+在原生 Windows 上，`app.suspend` 没有默认绑定，因为 Windows 终端不支持 Unix 作业控制。如果手动绑定，Pi 会显示状态消息，而不是执行挂起。在 WSL 中，正常的 Linux `ctrl+z`/`fg` 行为仍然适用。
 
-配置文件保存的是“按键如何映射到 action”，不是把某个字符直接绑定到一个函数。TUI 先读取终端输入并解析 modifier，再根据当前焦点选择 editor、selector、fullscreen transcript 或应用层的 keybinding manager。最后才由对应 action 改变编辑器、session、模型选择器或运行状态。因此同一个 `ctrl+p` 在主编辑器里可以是历史导航，在模型选择器里又可以是切换模型；这不是冲突，而是焦点路由的结果。
-
-例如，下面的设置只改变主编辑器焦点下的行为：
+### Emacs 示例
 
 ```json
 {
   "tui.editor.historyPrevious": "ctrl+p",
-  "app.model.cycleForward": "alt+p"
+  "tui.editor.historyNext": "ctrl+n",
+  "tui.editor.cursorLeft": ["left", "ctrl+b"],
+  "tui.editor.cursorRight": ["right", "ctrl+f"],
+  "tui.editor.cursorWordLeft": ["alt+left", "alt+b"],
+  "tui.editor.cursorWordRight": ["alt+right", "alt+f"],
+  "tui.editor.deleteCharForward": ["delete", "ctrl+d"],
+  "tui.editor.deleteCharBackward": ["backspace", "ctrl+h"],
+  "tui.input.newLine": ["shift+enter", "ctrl+j"]
 }
 ```
 
-如果当前焦点是 selector，`ctrl+p` 仍可能由 selector 的 action 处理。不要通过删除 selector 的默认配置来解决一个 editor 绑定问题。先确认焦点、模式和 action namespace，再检查配置是否成功加载。
-
-> 译者注：这是 keybinding 文档最容易被误读的地方。`ctrl+p` 不是一个全局 JavaScript callback 名称，而是经过“终端输入 → 当前组件 → action id”三层路由。Java 中可以把它类比成不同 Swing/JavaFX 组件的 `InputMap`，Go 中则像把事件交给当前拥有焦点的 handler。
-
-### 配置覆盖、数组与禁用
-
-单个字符串表示一个按键，数组表示多个等价按键。用户配置会覆盖该 action 的默认值，而不是自动把用户值与默认值合并。例如：
+### Vim 示例
 
 ```json
 {
-  "tui.editor.cursorLeft": ["left", "ctrl+b"],
-  "tui.altScreen.pageUp": [],
-  "app.message.followUp": "alt+enter"
+  "tui.editor.cursorUp": ["up", "alt+k"],
+  "tui.editor.cursorDown": ["down", "alt+j"],
+  "tui.editor.cursorLeft": ["left", "alt+h"],
+  "tui.editor.cursorRight": ["right", "alt+l"],
+  "tui.editor.cursorWordLeft": ["alt+left", "alt+b"],
+  "tui.editor.cursorWordRight": ["alt+right", "alt+w"]
 }
 ```
-
-第一项明确提供两个快捷键；第二项完全禁用 transcript 的 page-up action；第三项只保留一个 follow-up 快捷键。数组为空与省略配置不同：省略表示沿用默认值，空数组表示用户有意关闭它。
-
-修改后要在同一个 Pi session 中执行 `/reload`。如果没有生效，依次检查：JSON 是否合法、action id 是否拼写正确、当前工作目录和 settings 文件是否正确、当前组件是否拥有焦点、是否运行在 fullscreen 模式。配置字段的拼写错误不会变成一个新的 action。
-
-### 编辑器、选择器和应用 action 的范围
-
-编辑器 action 处理光标、单词、行、删除、撤销和 kill ring。`historyPrevious` 与 `historyNext` 不依赖光标是否位于多行 prompt 的首尾，它们直接切换历史条目。`tui.input.submit` 会提交 prompt，而 `tui.input.newLine` 只插入换行；把二者混淆会让多行代码提前发送给模型。
-
-选择器 action 只作用于当前 list，例如 `tui.select.up`、`confirm` 和 `cancel`。它们不应该被当作 session tree action。应用 action 则处理 `app.interrupt`、session、model、thinking、tool output 和 follow-up。源码或扩展注册快捷键时，应使用完整 namespace，避免扩展和宿主共享短名称造成迁移歧义。
-
-### Fullscreen、Windows 与终端差异
-
-`--tui-mode fullscreen` 时，未带 modifier 的 `home`、`end`、`pageUp`、`pageDown` 优先作用于 transcript；带 `ctrl` 的版本继续控制编辑器。regular 模式下这些键都指向编辑器。`tui.altScreen.*` 是 transcript action，因此把 `tui.editor.pageUp` 改绑并不会自动改变 fullscreen transcript 的滚动。
-
-`super` 是否可用取决于终端是否按 Kitty keyboard protocol 单独上报 modifier。鼠标和触控板是否能滚动 transcript 还取决于终端设置，详见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。原生 Windows 不支持 Unix job control，所以 `app.suspend` 没有默认绑定；WSL 仍可以使用 Linux 的 `ctrl+z`/`fg`。
-
-> 译者注：这解释了“配置正确但快捷键仍不响应”的常见故障。Pi 能否执行 action 与终端是否把原始按键编码成可辨识事件是两件事；调试时先用终端输入报告工具确认字节/修饰键，再看 Pi action 路由。
-
-### 与 Agent 状态的关系
-
-快捷键只触发控制入口，不直接修改模型历史。例如 `app.message.followUp` 将消息放入 follow-up 队列，实际何时进入下一次模型请求由 Agent Loop 的 turn boundary 决定；`app.interrupt` 请求取消当前运行，是否能停止远端 HTTP 请求则取决于 provider 和 abort signal。`app.tools.expand` 只改变展示，不改变 Tool Result。
-
-这条边界很重要：如果扩展把一个 keybinding 直接连接到文件写入，就绕过了 Agent Runtime 的权限、事件和审计路径。正确做法是触发一个 command，让宿主按正常 capability 和 permission 流程处理。
-
-### 可执行实验：定位一个“失效”快捷键
-
-1. 复制当前 `~/.pi/agent/keybindings.json` 到临时目录，并只加入 `tui.editor.historyPrevious: ["ctrl+p"]`。
-2. 启动 Pi，输入两条不同 prompt；先在编辑器焦点下按 `ctrl+p`，再在 model selector 中按同一键。
-3. 切换 `--tui-mode fullscreen`，比较 `pageUp` 与 `ctrl+pageUp` 的对象。
-4. 将 `tui.altScreen.pageUp` 改为空数组并执行 `/reload`，确认 transcript 不再响应该 action。
-5. 在 Windows/WSL 或支持 Kitty protocol 的终端重复测试，记录平台差异。
-
-观察点是“输入事件、焦点、action、状态变化”四个阶段。预期结果：相同按键在不同焦点可能触发不同 action，但每个 action 的语义保持不变。
-
-> 译者注：如果你要把这套机制移植到 Go/Java，不要从 `switch key == "ctrl+p"` 开始。Go 可以用 `map[ActionID][]Key` 加当前 handler，Java 可以用 `Map<ActionId, Set<KeyStroke>>` 加 Listener；这样用户配置仍然可覆盖默认值，测试也能断言路由而非终端细节。
-
-> 译者注：配置快捷键时应优先绑定语义 action，而不是依赖某个默认组合键。这样换终端、换操作系统或升级默认配置时，用户意图仍然稳定，自动化测试也能直接断言 action。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Keybindings | Keybindings |
-| Key Format | Key Format |
-| All Actions | All Actions |
-| TUI Editor Cursor Movement | TUI Editor Cursor Movement |
-| TUI Editor Deletion | TUI Editor Deletion |
-| TUI Input | TUI Input |
-| TUI Kill Ring | TUI Kill Ring |
-| TUI Clipboard and Selection | TUI Clipboard and Selection |
-| TUI Fullscreen Viewport | TUI Fullscreen Viewport |
-| Application | Application |
-| Sessions | Sessions |
-| Models and Thinking | Models and Thinking |
-| Display and Message Queue | Display and Message Queue |
-| Tree Navigation | Tree Navigation |
-| Scoped Models Selector | Scoped Models Selector |
-| Custom Configuration | Custom 配置 |
-| Emacs Example | Emacs Example |
-| Vim Example | Vim Example |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
 
 ## 完整原文对照
 

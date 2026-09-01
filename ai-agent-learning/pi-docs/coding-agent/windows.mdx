@@ -1,101 +1,31 @@
 ---
 title: "Windows 设置"
-description: "PowerShell 工具和自定义 Bash 路径。"
+description: "Windows 上的 Bash 选择、PowerShell 工具和自定义 shell 路径。"
 ---
 
 # Windows 设置
 
-> 本页是 `packages/coding-agent/docs/windows.md` 的中文参考译本，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。API 名称、命令、路径、配置字段和代码标识符保留原样。
-
-## 中文导读
-
-PowerShell 工具和自定义 Bash 路径。 本页先用中文说明阅读重点，再保留源文件的完整内容以便逐项核对。涉及实现行为时，以当前工作区源码为准；文档和源码出现差异时，不用猜测填补。
+> 本页根据 `packages/coding-agent/docs/windows.md` 重新翻译，研究基线为 commit `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、路径、配置字段和工具名称保持原样。
 
 ## 中文译文
 
-### 先理解 Windows 上的两个 shell 入口
+Pi 在 Windows 上默认使用 Git Bash，并按以下顺序查找可执行文件：
 
-Windows 版 Pi 至少涉及两种不同的命令入口：模型可以调用的 Tool，以及用户在编辑器中输入的 `!`/`!!` 命令。配置 `defaultTools` 只影响前者；它不会把编辑器命令改成 PowerShell。
+1. `~/.pi/agent/settings.json` 中配置的自定义路径；
+2. Git Bash：`C:\Program Files\Git\bin\bash.exe`；
+3. PATH 中的 `bash.exe`，可能来自 Cygwin、MSYS2 或 WSL。
 
-另一个容易混淆的点是“Windows 上的 Bash”并不只有一种实现。Git Bash、Cygwin、MSYS2 和 WSL 都可能提供名为 `bash.exe` 的程序，但它们的路径语义、环境变量、可执行文件查找和与 Windows 的互操作能力并不完全相同。
+对大多数用户来说，安装 [Git for Windows](https://git-scm.com/download/win) 就足够了。实际选择仍取决于设置文件和启动 Pi 的环境，不能只因为 PATH 中存在 `bash.exe` 就断定 Pi 一定会使用它。
 
-本页的配置只决定 Pi 选择哪个 shell，不会自动提供 sandbox、权限审批或跨平台路径转换。生产环境仍应在 Tool 执行前做 workspace 限制、命令 allowlist、timeout 和审计。
+## PowerShell 工具
 
-> 译者注：如果你从 Java 后端的角度理解，`defaultTools` 更像是注册到模型请求里的 capability 列表；编辑器 `!` 命令则是 CLI/TUI 的另一条本地执行通道。两者都可能启动 shell，但生命周期和调用方不同。
-
-### Pi 默认如何选择 Bash
-
-Pi 在 Windows 上默认使用 Git Bash，并按以下顺序检查位置：
-
-1. `~/.pi/agent/settings.json` 中配置的自定义路径。
-2. Git Bash 的常见安装位置：`C:\\Program Files\\Git\\bin\\bash.exe`。
-3. PATH 上的 `bash.exe`，可能来自 Cygwin、MSYS2 或 WSL。
-
-对多数用户，安装 [Git for Windows](https://git-scm.com/download/win) 就足够。安装后应在启动 Pi 的同一个终端中检查 `bash.exe` 的解析结果；不要只在另一个 shell 中测试，因为 PATH 会随终端、Git Bash、PowerShell 和 IDE 设置而变化。
-
-可执行检查：
-
-```powershell
-Get-Command bash.exe
-where.exe bash.exe
-bash.exe --version
-```
-
-如果你在 PowerShell 中运行这些命令，`Get-Command` 会显示当前 PowerShell 解析到的程序，`where.exe` 会列出 PATH 中可见的候选项。Pi 的实际选择还会先看 `settings.json` 的 `shellPath`，所以“PATH 上有 bash”不等于最终一定使用它。
-
-#### 路径选择的失败 trace
-
-```text
-settings.json 没有 shellPath
-  -> PATH 中第一个 bash.exe 来自 WSL
-  -> Pi 在 Windows 配置下启动它
-  -> 工具返回的路径/环境与 Git Bash 预期不同
-  -> 读写、脚本或 Windows 命令行为出现差异
-```
-
-如果遇到这种情况，先明确你要的是 Git Bash、Cygwin、MSYS2 还是 WSL，再在 settings 中写绝对路径。不要把一个环境的路径格式复制到另一个环境。
-
-> 译者注：Windows 路径 `C:\\work\\repo`、Git Bash 路径 `/c/work/repo` 和 WSL 路径 `/mnt/c/work/repo` 看起来都能表达同一目录，但它们不一定能在同一个进程中直接使用。路径转换应发生在 shell adapter 或 Tool 边界，不应依赖模型自己猜。
-
-### 配置自定义 Bash 路径
-
-在 `~/.pi/agent/settings.json` 中设置 `shellPath`：
-
-```json
-{
-  "shellPath": "C:\\\\cygwin64\\\\bin\\\\bash.exe"
-}
-```
-
-这里的双反斜杠是 JSON 转义后的表示，实际 Windows 路径只有一个反斜杠。常见错误是把 JSON 中的 `C:\\cygwin64\\bin\\bash.exe` 当成 shell 中需要输入的路径，或者少写转义导致 JSON 无法解析。
-
-修改后完全重启 Pi，或按当前版本支持的资源 reload 流程重新加载配置。若配置未生效，按以下顺序检查：
-
-1. 文件是否确实位于 `~/.pi/agent/settings.json`。
-2. JSON 是否能被解析。
-3. `shellPath` 指向的文件是否存在且可执行。
-4. 启动 Pi 的用户是否有权限访问安装目录。
-5. 是否有另一个 settings 层覆盖了当前值。
-
-### PowerShell Tool 的行为
-
-可选的 `powershell` Tool 在有 `pwsh.exe` 时使用它；否则回退到 Windows PowerShell。它启动 PowerShell 时使用：
+可选的 `powershell` 工具在可用时通过 `pwsh.exe` 执行命令，否则回退到 Windows PowerShell。它使用以下启动参数：
 
 ```text
 -NoProfile -NonInteractive -ExecutionPolicy Bypass
 ```
 
-每个参数的含义不同：
-
-- `-NoProfile`：不加载用户 profile，减少 profile 别名、提示符和启动脚本造成的不确定性。
-- `-NonInteractive`：不等待交互式输入，避免 Agent 运行挂起在隐藏的确认提示上。
-- `-ExecutionPolicy Bypass`：请求当前进程绕过普通脚本执行策略。
-
-管理员或组织策略强制设置的 execution policy 仍可能优先于命令行参数。因此 `Bypass` 不是安全保证，也不是绕过企业控制的承诺。PowerShell 进程仍应受到 workspace、timeout、网络和权限层约束。
-
-> 译者注：`-ExecutionPolicy Bypass` 只改变 PowerShell 对脚本策略的处理方式，不会让进程获得管理员权限，也不会自动阻止危险命令。把它翻译成“无限制执行”会造成错误的安全预期。
-
-### 让模型使用 PowerShell
+这几个参数分别表示不加载用户 profile、不等待交互输入，以及请求当前进程绕过普通脚本执行策略。管理员或组织策略仍可能优先于命令行参数，所以 `Bypass` 不是安全隔离，也不等于获得管理员权限。
 
 使用 `defaultTools` 替换模型可见的 `bash`：
 
@@ -105,9 +35,7 @@ settings.json 没有 shellPath
 }
 ```
 
-这组配置表示模型能看到 `read`、`powershell`、`edit` 和 `write`，而不会看到 model-facing 的 `bash`。它不意味着文件系统访问被限制到某个目录；仍要看每个 Tool 的权限策略和当前工作目录。
-
-如果需要比较两个 Tool 的行为，可以同时启用：
+也可以同时启用两个工具以比较行为：
 
 ```json
 {
@@ -115,108 +43,31 @@ settings.json 没有 shellPath
 }
 ```
 
-此时模型可能根据描述选择任意一个。为了得到可复现的实验，给模型明确指令，例如“只使用 `powershell`，不要使用 `bash`”，并在事件/日志中记录实际的 tool name。
+配置 `defaultTools` 只影响模型可调用的工具。编辑器中的 `!` 和 `!!` 命令仍使用 Bash，因此从列表删除 `bash` 不会把用户命令转换成 PowerShell。
 
-### `!` 与 `!!` 为什么仍然使用 Bash
+> 译者注：可以把 `defaultTools` 看作加入模型请求的能力列表，把 `!`/`!!` 看作 CLI/TUI 的另一条本地执行通道。两者都可能启动 shell，但调用方和生命周期不同。
 
-编辑器中的 `!` 和 `!!` 命令仍使用 Bash。它们不是模型通过 `defaultTools` 选择的 `powershell` Tool，因此替换 `bash` 不会替换这两个用户命令入口。
+## 自定义 Bash 路径
 
-一个常见误判是：
-
-```text
-配置 defaultTools 删除 bash
-  -> 用户输入 ! Get-ChildItem
-  -> 仍由 Bash 入口解释
-  -> PowerShell 语法可能失败
+```json
+{
+  "shellPath": "C:\\cygwin64\\bin\\bash.exe"
+}
 ```
 
-如果你要运行 PowerShell 语法，应让模型调用 `powershell` Tool，或者确认编辑器命令链路的 Bash 能否转发到目标程序；不能把两条路径混为一谈。
+修改 `shellPath` 后，Pi 会使用这个路径作为 Bash。JSON 中的双反斜杠表示实际路径中的单个反斜杠。常见错误是忘记 JSON 转义，或者把 Git Bash、WSL 和 Windows 的路径格式混用。
 
-### Go 与 Java 的配置类比
+如果需要排查路径，先在启动 Pi 的同一个终端中运行：
 
-| Windows/Pi 概念 | Go 类比 | Java 类比 |
-| --- | --- | --- |
-| `shellPath` | 构造 `exec.CommandContext` 时的可执行文件路径 | `ProcessBuilder` 的第一个命令 |
-| `defaultTools` | Tool registry 的 allowlist | Tool registry/策略列表 |
-| `powershell` Tool | 受策略包裹的 command runner | 受策略包裹的 `ProcessBuilder` |
-| `!`/`!!` | CLI handler 直接调用 shell | TUI action 直接调用 shell |
-| `-NonInteractive` | 不从 stdin 等待输入 | 明确关闭交互 stdin |
+```powershell
+Get-Command bash.exe
+where.exe bash.exe
+bash.exe --version
+```
 
-语言类比只说明边界，不代表 Go/Java 示例可以绕过权限。所有 shell 都应接收 context/token、timeout、工作目录和输出上限。
+如果未设置自定义路径，检查结果可以帮助确认 PATH 候选；如果设置了 `shellPath`，还要单独检查该文件是否存在、可执行且当前用户有权限访问。
 
-> 译者注：把 shell 实现替换成另一个可执行文件，不等于改变 Tool schema。模型仍然输出结构化参数，Runtime 负责选择 executable、规范化路径、审批命令并把 stdout/stderr 转成 Tool Result。
-
-### 可执行实验：比较 Git Bash、PowerShell 与 WSL
-
-#### 目标
-
-确认 Pi 实际使用的 Bash 路径、模型可见 Tool，以及用户命令入口彼此独立。
-
-#### 准备
-
-1. Windows 原生环境准备 Git for Windows；可选安装 PowerShell 7（`pwsh.exe`）。
-2. 若测试 WSL，确认 WSL distribution 已安装，并记录 Windows 与 Linux 路径差异。
-3. 在 `~/.pi/agent/settings.json` 备份原有 settings，不要覆盖生产配置。
-
-#### 步骤
-
-1. 在 PowerShell 中运行 `Get-Command bash.exe`、`where.exe bash.exe` 和 `bash.exe --version`。
-2. 暂不设置 `shellPath`，启动 Pi，记录 shell Tool 的实际行为。
-3. 设置 `shellPath` 为 Git Bash 或 Cygwin 的绝对路径，重新启动 Pi。
-4. 将 `defaultTools` 设置为只含 `powershell` 与文件工具。
-5. 用一个无副作用命令比较 `pwd`/`Get-Location`、环境变量和路径格式。
-6. 再把 `bash` 加回 `defaultTools`，让模型明确选择不同 Tool。
-7. 分别测试 `!`/`!!`，确认它们没有变成 PowerShell Tool。
-
-#### 观察点
-
-- settings 中的 `shellPath` 优先于 PATH 候选。
-- `defaultTools` 改变模型能调用的 Tool，但不改变编辑器命令。
-- `pwsh.exe` 与 Windows PowerShell 的版本、模块和语法支持可能不同。
-- 同一文件在 Git Bash、PowerShell 和 WSL 中的路径表示可能不同。
-
-#### 预期结果
-
-你能明确说出：Pi 选择的是哪个 shell；模型看到哪些 Tool；用户 `!`/`!!` 走哪条入口；失败时是路径、PATH、execution policy、权限还是 Tool allowlist 问题。
-
-### 故障排查表
-
-| 现象 | 可能原因 | 处理顺序 |
-| --- | --- | --- |
-| 找不到 Bash | Git for Windows 未安装或 PATH 不含 bash | 安装 Git for Windows，运行 `where.exe bash.exe` |
-| `shellPath` 无效 | JSON 反斜杠未转义或文件不存在 | 校验 JSON，再检查绝对路径 |
-| 用到了错误的 Bash | PATH 候选顺序或旧 settings | 显式设置 `shellPath`，重启 Pi |
-| 找不到 `pwsh.exe` | 未安装 PowerShell 7 | 安装后确认 `Get-Command pwsh.exe`；否则接受 Windows PowerShell 回退 |
-| PowerShell 仍拒绝脚本 | 管理员/组织策略覆盖 | 查看有效策略，不把 `Bypass` 当成强制覆盖 |
-| `!` 命令的 PowerShell 语法失败 | `!` 仍走 Bash | 使用正确的 Bash 语法或调用 `powershell` Tool |
-| 文件路径跨环境失败 | Git Bash/WSL/Windows 路径不同 | 在 Tool 边界转换并打印规范化路径 |
-| Tool 不在模型 definitions | `defaultTools` 未包含它 | 检查 active tools/allowlist 和当前 session 配置 |
-
-### 小结
-
-Windows 配置的核心不是“选一个更强的 shell”，而是识别调用边界：Pi 默认按 settings → Git Bash → PATH 的顺序找 Bash；`powershell` Tool 是模型-facing 能力；`!`/`!!` 仍是 Bash 编辑器命令。先用无副作用检查确认实际 executable 和路径，再设置 `shellPath`、`defaultTools` 与权限策略。这样遇到问题时能把环境差异、模型工具选择和用户命令入口分开排查。
-
-> 译者注：对后续 Harness 设计，shell adapter 应报告 executable、cwd、退出码、stdout/stderr 截断和取消结果；只返回一段“命令失败”文本，会让重试、审计和恢复都失去可观察信息。
-
-## 章节对照
-
-| 源文档标题 | 中文阅读标题 |
-| --- | --- |
-| Windows Setup | Windows Setup |
-| PowerShell Tool | PowerShell Tool |
-| Custom Bash Path | Custom Bash Path |
-
-## 使用建议
-
-1. 先阅读本页标题和章节对照，明确你要解决的操作。
-2. 再阅读下方完整内容，命令和代码可以直接复制，但先检查平台、权限和版本。
-3. 如果页面描述了运行时行为，回到 `reference/source-map` 和固定 commit 的源码 symbol 验证。
-
-<Note>
-
-以下原文是完整核对附录，不代表英文术语可以替代中文解释；它用于避免翻译过程中遗漏配置字段、示例和边界条件。
-
-</Note>
+> 译者注：`C:\work\repo`、`/c/work/repo` 和 `/mnt/c/work/repo` 分别可能属于 Windows、Git Bash 和 WSL 的路径表示。路径转换应由 shell 适配器或 Tool 边界负责，不能让模型猜测。
 
 ## 完整原文对照
 

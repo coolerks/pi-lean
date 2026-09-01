@@ -1,478 +1,273 @@
 ---
 title: "使用 Pi"
-description: "交互模式、斜杠命令、队列、Session、CLI 参数和设计原则。"
+description: "交互模式、消息队列、会话、CLI 参数以及 print、JSON 和 RPC 模式。"
 ---
+
 # 使用 Pi
 
-> 本页对应 `packages/coding-agent/docs/usage.md`，研究 commit 为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。这是逐节中文参考译本；命令、选项、路径、配置字段和 API 名称保留原样。
+> 本页根据 `packages/coding-agent/docs/usage.md` 从英文源文件重新翻译。研究基线为 `853a80d26c90a14c1886f0ebb8ffaae133ca2185`。命令、选项、路径、配置字段和 API 名称保持原样。
 
-## 中文导读
+本页补充 quickstart 中没有展开的日常使用细节。
 
-这份页面补充快速开始文档没有展开的日常使用细节。阅读顺序建议是：先理解交互界面的四个区域，再掌握消息队列和 Session，最后根据任务选择 interactive、print、JSON 或 RPC mode。
+## 交互模式
 
-本页有两个边界必须先记住：
+<p align="center"><img src="https://raw.githubusercontent.com/coolerks/pi-lean/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/images/interactive-mode.png" alt="Interactive mode interface" width="600" /></p>
 
-1. **模型只生成候选输出。** 它不会因为看见 `read` 或 `bash` 就直接操作本机。
-2. **Pi Runtime 才执行工具并维护状态。** CLI/TUI 负责输入和呈现，Session 负责保存历史，Extension/Skill 负责扩展资源。
+界面主要分为四个区域：
 
-## 中文译文
+- **启动信息区**：快捷键、已加载的上下文文件、提示词模板、Skill 和 Extension。
+- **消息区**：用户消息、助手响应、工具调用、工具结果、通知、错误以及 Extension UI。
+- **编辑器**：输入内容的位置；边框颜色表示当前思考级别。
+- **底栏**：工作目录、会话名称、token/cache 用量、费用、上下文用量和当前模型。总量包含助手响应、工具报告的用量以及摘要生成的用量。
 
-<Info>
+内置 UI（例如 `/settings`）或自定义 Extension UI 可以临时替代编辑器。
 
-文中的命令以当前源码和官方文档为准。不同终端对 `Alt`、`Ctrl`、鼠标和 Kitty graphics protocol 的支持不同；遇到按键无效，先检查 [Keybindings](/pi-docs/coding-agent/keybindings) 和 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。
+### 编辑器功能
 
-</Info>
+| 功能 | 操作 |
+|---|---|
+| 文件引用 | 输入 `@`，模糊搜索项目文件 |
+| 路径补全 | 按 Tab 补全路径 |
+| 多行输入 | `Shift+Enter`；在 Windows Terminal 中也可以使用 `Ctrl+Enter` |
+| 复制响应 | 在 `/tree` 中复制当前选中的消息；其他情况下复制最后一条助手消息；如果 `fullscreenCopyOnSelect` 关闭，则复制全屏模式中当前选中的文本 |
+| 图片 | 使用 `Ctrl+V` 粘贴；Windows 使用 `Alt+V`；也可以拖入终端 |
+| Shell 命令 | `!command` 执行命令，并把输出发送给模型 |
+| 隐藏 Shell 命令 | `!!command` 执行命令，但不把输出发送给模型 |
+| 外部编辑器 | `Ctrl+G` 打开 `externalEditor` 指定的编辑器，其次使用 `$VISUAL`、`$EDITOR`、Windows 上的 Notepad，或其他平台上的 `nano` |
 
-## Interactive Mode：交互模式
+全部快捷键和自定义方式见 [Keybindings](/pi-docs/coding-agent/keybindings)。
 
-直接运行 `pi` 默认进入 interactive mode。它适合需要持续观察工具输出、随时 steering、切换模型或浏览 Session tree 的工作。
+## 斜杠命令
 
-一次交互运行可以理解为四层：
+在编辑器中输入 `/`，打开命令补全。Extension 可以注册自定义命令，Skill 可通过 `/skill:name` 使用，提示词模板会展开为 `/templatename`。
 
-```text
-启动资源
-  -> system prompt、context files、skills、extensions、templates
-用户输入
-  -> editor、slash command、@file、shell shortcut
-Agent Runtime
-  -> LLM request、tool call、tool result、queue、session
-界面输出
-  -> assistant、tool、notification、error、footer
+| 命令 | 说明 |
+|---|---|
+| `/login`、`/logout` | 管理 OAuth 或 API key 凭据 |
+| [`/llama`](/pi-docs/coding-agent/llama-cpp) | 下载、加载和卸载 llama.cpp router 模型 |
+| `/model` | 切换模型；在选择器中按 Ctrl+S 保存启动默认模型 |
+| `/thinking` | 切换思考级别；在选择器中按 Ctrl+S 保存启动默认级别 |
+| `/scoped-models` | 启用或禁用 Ctrl+P 循环切换的模型 |
+| `/settings` | 管理主题、消息投递、传输层和其他偏好 |
+| `/resume` | 从历史会话中选择一个会话 |
+| `/new` | 开始新会话 |
+| `/name <name>` | 设置会话显示名称 |
+| `/session` | 显示会话文件、ID、消息数、token 和费用 |
+| `/tree` | 跳转到会话中的任意位置，并从那里继续 |
+| `/trust` | 保存项目的信任决定，供之后会话使用 |
+| `/fork` | 从之前的用户消息创建新会话 |
+| `/clone` | 将当前活动分支复制到新会话 |
+| `/compact [prompt]` | 手动压缩上下文，可以附带自定义指令 |
+| `/copy` | 将最后一条助手消息复制到剪贴板 |
+| `/export [file]` | 将会话导出为 HTML 或 JSONL |
+| `/import <file>` | 从 JSONL 文件导入会话并恢复 |
+| `/share` | 将会话作为私有 GitHub gist 上传，并取得可分享的 HTML 链接 |
+| `/reload` | 重新加载快捷键、Extension、Skill、提示词、主题和上下文文件 |
+| `/hotkeys` | 显示所有键盘快捷键 |
+| `/changelog` | 显示版本历史 |
+| `/quit` | 退出 pi |
+
+## 消息队列
+
+Agent 运行期间仍可以提交消息：
+
+- **Enter** 将消息排入 steering 队列；当前助手 turn 完成工具调用后投递。
+- **Alt+Enter** 将消息排入 follow-up 队列；Agent 完成全部工作后投递。
+- **Escape** 中止运行，并把已排队消息恢复到编辑器。
+- **Alt+Up** 将排队消息取回编辑器。
+
+可以在 [Settings](/pi-docs/coding-agent/settings) 中使用 `steeringMode` 和 `followUpMode` 配置投递方式。
+
+> 译者注：steering 是运行中的指令调整，follow-up 是当前工作完成后的跟进消息。它们都改变后续 turn，不会修改已经发送给模型的请求。
+
+## 会话
+
+会话会自动保存到 `~/.pi/agent/sessions/`，并按工作目录组织。
+
+```bash
+pi -c                  # 继续最近一次会话
+pi -r                  # 浏览并选择历史会话
+pi --no-session        # 临时模式，不保存会话
+pi --name "my task"    # 启动时设置会话显示名称
+pi --session <path|id> # 使用指定会话文件或会话 ID
+pi --fork <path|id>    # 将会话文件或部分会话 ID 分支为新会话
 ```
 
-### 界面的四个区域
+有用的会话命令：
 
-| 区域 | 显示什么 | 为什么重要 |
-| --- | --- | --- |
-| Startup header | shortcuts、已加载 context files、prompt templates、skills、extensions | 判断本次运行到底加载了哪些资源 |
-| Messages | user message、assistant response、tool call、tool result、notification、error、extension UI | 观察一次 Agent Loop 的事实和失败点 |
-| Editor | 输入 prompt 的位置；边框颜色表示当前 thinking level | 区分“正在输入”与“已经送入模型” |
-| Footer | 工作目录、Session 名、token/cache 使用量、cost、context 使用量、model | 判断预算和上下文是否接近上限 |
+- `/session` 显示当前会话文件和 ID。
+- `/tree` 在当前文件的会话树中导航，也可以总结被放弃的分支。
+- `/fork` 从较早的用户消息创建新会话。
+- `/clone` 将当前活动分支复制到新会话文件。
+- `/compact` 总结较早的消息，为后续请求释放上下文空间。
 
-Footer 的 totals 不只计算 assistant response。
+详细说明见 [Sessions](/pi-docs/coding-agent/sessions) 和 [Compaction](/pi-docs/coding-agent/compaction)。
 
-它还可能包括 Tool 报告的 usage 和 summary generation 的 usage。
+## 上下文文件
 
-因此，看到 token 或 cost 增加时，不要只寻找最后一条自然语言回复。
+Pi 启动时从以下位置加载 `AGENTS.md` 或 `CLAUDE.md`：
 
-Editor 可以暂时被内置 UI 替换。
+- 全局文件：`~/.pi/agent/AGENTS.md`
+- 从当前工作目录开始，逐层向上搜索的父目录
+- 当前目录
 
-例如 `/settings` 会打开设置界面，Extension 也可以显示自定义 UI。
+如果某个目录包含 `AGENTS.override.md`，Pi 会优先加载它，而不是该目录中的 `AGENTS.md` 或 `CLAUDE.md`。其他目录中的上下文文件仍会按层级正常叠加。
 
-返回 editor 后，正在编辑的文本和队列消息要按当前界面提示确认。
+上下文文件适合存放项目约定、命令、安全规则和偏好。使用 `--no-context-files` 或 `-nc` 可以关闭加载。
 
-> 译者注：这里的“界面”不是 Agent 的控制核心。TUI 可以显示 `tool_start`，但不能自行把一个 tool result 写回模型；真正决定下一次请求的是 Agent Runtime。Java 读者可以把 TUI 看作 Listener/Presenter，把 Runtime 看作拥有状态的 service。
+### System Prompt 文件
 
-### Editor Features：编辑器功能
+可以通过以下文件替换默认 system prompt：
 
-| 功能 | 操作 | 运行时含义 |
-| --- | --- | --- |
-| File reference | 输入 `@` 后模糊搜索项目文件 | 选中文件会把内容或引用加入本次 prompt，具体行为受文件类型和大小限制影响 |
-| Path completion | 按 Tab 补全路径 | 只帮助构造输入，不等于已经读取文件 |
-| Multi-line input | `Shift+Enter`；Windows Terminal 使用 `Ctrl+Enter` | 插入换行而不是提交 prompt |
-| Copy response | `/tree` 中 `Ctrl+X` 复制选中消息；否则复制最后一条 assistant；全屏模式还受 `fullscreenCopyOnSelect` 影响 | 复制是 UI 行为，不改变 Session 内容 |
-| Images | `Ctrl+V`；Windows 使用 `Alt+V`；也可以拖入终端 | 终端必须支持相应图像协议，图像最终要由 Provider adapter 编码 |
-| Shell command | `!command` | 执行命令并把输出发送给模型；必须把它当作一次真实外部副作用 |
-| Hidden shell command | `!!command` | 执行命令但不把输出发送给模型；仍可能改变文件或系统状态 |
-| External editor | `Ctrl+G` | 依次使用 `externalEditor`、`$VISUAL`、`$EDITOR`、Windows Notepad 或其他系统的 `nano` |
+- 项目级 `.pi/SYSTEM.md`
+- 全局 `~/.pi/agent/SYSTEM.md`
 
-`!command` 与模型生成的 `bash` Tool 不是同一入口。
+如果不想替换默认提示词，而是追加内容，可以在上述任一位置使用 `APPEND_SYSTEM.md`。
 
-前者是用户主动从编辑器发起的快捷操作。
+### 项目可信度
 
-后者是 assistant tool call 经过 Tool Registry、参数检查和权限边界后的运行时动作。
+交互启动时，如果项目目录含有项目级设置、资源或项目 `.agents/skills`，且 `~/.pi/agent/trust.json` 中没有该目录或其父目录的保存决定，pi 会询问是否信任项目目录。获得信任后，pi 才会加载 `.pi/settings.json` 和 `.pi` 资源、安装缺失的项目包，并执行项目 Extension。
 
-两者都不能绕过操作系统和项目安全策略。
+在作出信任决定前，pi 只加载上下文文件、用户/全局 Extension 以及 CLI 的 `-e` Extension，使它们可以处理 `project_trust` 事件。项目级 Extension、项目包管理的 Extension 和项目设置，只会在项目受信任后加载。切换到当前进程尚未解决信任状态的其他 cwd 会话时，也遵循这一区分。
 
-完整快捷键和自定义方法见 [Keybindings](/pi-docs/coding-agent/keybindings)。
+非交互模式（`-p`、`--mode json`、`--mode rpc`）不会显示信任提示。如果没有适用的保存决定，它们会使用全局设置中的 `defaultProjectTrust`：默认值 `ask` 和 `never` 会忽略这些项目资源，`always` 会信任它们。可以使用 `--approve`/`-a` 或 `--no-approve`/`-na` 为本次运行覆盖该决定。
 
-> 译者注：`!!command` 的“隐藏”只隐藏输出，不隐藏副作用。把它用于删除、网络请求或修改仓库仍然危险；如果你只想让模型看结果而不污染上下文，才考虑使用它。
+如果没有 Extension 或保存的决定适用，`defaultProjectTrust` 控制回退行为。在 `~/.pi/agent/settings.json` 中将它设为 `"ask"`、`"always"` 或 `"never"`，也可以通过 `/settings` 修改。
 
-## Slash Commands：斜杠命令
+`pi config` 和包命令使用相同的项目可信度流程，但 `pi update` 从不询问。可以为单个命令使用 `--approve` 信任项目本地设置，或使用 `--no-approve` 忽略它们。
 
-在 editor 输入 `/` 会打开命令补全。
+交互模式中使用 `/trust` 可以保存项目的信任决定，供后续会话使用，其中也包括对当前目录的直接父目录建立信任。它只写入 `~/.pi/agent/trust.json`；当前会话不会重新加载，因此需要重启 pi 才能生效。
 
-Extension 可以注册自定义 command。
+> 译者注：项目覆盖配置与项目可信度是两个不同问题。前者是“哪些值最终生效”，后者是“项目中的设置、资源和代码是否获准加载执行”；不能只因为文件位于项目目录就跳过信任边界。
 
-Skill 以 `/skill:name` 暴露。
+## 导出与分享会话
 
-Prompt template 以 `/templatename` 展开。
+使用 `/export [file]` 将会话写入 HTML。
 
-| 命令 | 作用 | 使用时要确认 |
-| --- | --- | --- |
-| `/login`、`/logout` | 管理 OAuth 或 API-key credential | credential 的保存位置和 provider |
-| `/llama` | 下载、加载、卸载 llama.cpp router model | 本地模型和磁盘空间 |
-| `/model` | 切换 model；选择器中 `Ctrl+S` 保存启动默认值 | 当前 provider、context window、thinking 支持 |
-| `/thinking` | 切换 thinking level；`Ctrl+S` 保存默认值 | thinking 是模型能力，不是额外的 Tool |
-| `/scoped-models` | 控制 `Ctrl+P` 循环可用的 models | scope 只影响循环列表，不删除 catalog |
-| `/settings` | theme、消息投递、transport 和其他偏好 | 设置可能影响后续 Session |
-| `/resume` | 选择旧 Session | 先确认工作目录和 Session 名 |
-| `/new` | 创建新 Session | 当前上下文不会自动复制 |
-| `/name <name>` | 设置 Session 展示名 | 只改变显示 metadata |
-| `/session` | 显示 Session 文件、ID、消息、tokens、cost | 不会输出完整秘密 credential |
-| `/tree` | 跳到 Session 中任意位置并从那里继续 | 这会改变当前 branch leaf |
-| `/trust` | 保存项目 trust decision | 会影响项目资源是否加载 |
-| `/fork` | 从旧 user message 创建新 Session | 新 Session 与原 Session 的持久化边界不同 |
-| `/clone` | 将当前 active branch 复制到新 Session | 不要把 clone 当作 branch navigation |
-| `/compact [prompt]` | 手工压缩 context，可加自定义指令 | 压缩会改变模型下次看到的消息集合 |
-| `/copy` | 复制最后一条 assistant message | 只复制呈现内容 |
-| `/export [file]` | 导出 HTML 或 JSONL | 导出的内容可能含代码和工具结果 |
-| `/import <file>` | 从 JSONL 导入并恢复 Session | 先确认来源可信 |
-| `/share` | 上传为 private GitHub gist 并得到 HTML link | private 不等于没有敏感信息风险 |
-| `/reload` | 重新加载 keybindings、extensions、skills、prompts、themes 和 context files | 运行中的状态不一定全部重置 |
-| `/hotkeys` | 显示快捷键 | 以当前配置而非默认表为准 |
-| `/changelog` | 显示版本历史 | 用于确认版本行为 |
-| `/quit` | 退出 Pi | Session 是否已自动保存要按退出结果确认 |
+使用 `/share` 将会话上传为私有 GitHub gist，并取得可分享的 HTML 链接。
 
-命令补全不代表命令执行成功。
+如果你用 pi 做开源工作，希望发布包含模型、提示词、工具和评估信息的会话来进行研究，请参见 [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf)。该工具会将会话发布到 Hugging Face 数据集。
 
-例如 `/compact` 可能因为 context 太短、压缩失败或 provider 错误而失败。
-
-把 command 当作 Runtime 请求，继续观察 notification、event 和 Session 状态。
-
-> 译者注：`/tree`、`/fork`、`/clone` 都涉及历史，但语义不同：`/tree` 在当前 Session 内移动，`/fork` 从历史点创建新的 Session，`/clone` 复制当前 active branch。学习 Harness 时，必须为这三种操作分别定义存储和恢复规则。
-
-## Message Queue：消息队列
-
-Agent 工作期间仍然可以提交消息。
-
-这些消息不会被粗暴地插入已经发出的 provider request。
-
-Pi 会在 Agent Loop 定义的边界处理它们。
-
-| 操作 | 投递时机 | 适合表达 |
-| --- | --- | --- |
-| `Enter` | 当前 assistant turn 完成 tool calls 后 | steering：修正当前工作 |
-| `Alt+Enter` | Agent 完成全部当前工作后 | follow-up：原任务结束后追加任务 |
-| `Escape` | abort 当前运行，并把排队内容恢复到 editor | 用户明确要求停止 |
-| `Alt+Up` | 把排队消息取回 editor | 修改或撤销尚未投递的指令 |
-
-Windows Terminal 默认把 `Alt+Enter` 用作 fullscreen。
-
-如果希望它进入 Pi 的 follow-up queue，需要按 [Terminal setup](/pi-docs/coding-agent/terminal-setup) 重新映射。
-
-`steeringMode` 和 `followUpMode` 在 Settings 中配置。
-
-重要的时序例子：
-
-```text
-Agent 正在执行 read -> grep -> edit
-用户按 Enter 输入“不要修改数据库代码”
-  -> 消息先进入 steering queue
-  -> 当前已经开始的 Tool 不会被消息倒放取消
-  -> 当前 turn 到边界
-  -> Runtime 注入 steering message
-  -> 下一次 model request 看到新要求
-```
-
-如果需求必须立即停止当前命令，仅仅 steering 不够，需要 `Escape` abort。
-
-如果需求是“做完现有工作再补一个检查”，使用 follow-up 更合适。
-
-> 译者注：steering、follow-up 和 abort 是三个不同的控制面。Go 中可以用 channel 加 context cancellation 表达，Java 中可以用 queue 加 `Future.cancel`；但 queue 只能改变未来输入，不能假装撤销已经发生的远程副作用。
-
-## Sessions：会话
-
-Pi 会自动把 Session 保存到 `~/.pi/agent/sessions/`。
-
-目录按工作目录组织。
-
-Session 不只是 `List<Message>`。
-
-除消息外，它还可能记录 parent、branch、model change、thinking level、tool 配置、usage、compaction、label 和 metadata。
-
-| 命令 | 含义 |
-| --- | --- |
-| `pi -c` | 继续最近的 Session |
-| `pi -r` | 浏览并选择 Session |
-| `pi --no-session` | 临时运行，不保存 |
-| `pi --name "my task"` | 启动时设置 Session display name |
-| `pi --session &lt;path|id&gt;` | 使用具体 Session 文件或 Session ID |
-| `pi --fork &lt;path|id&gt;` | 将 Session fork 到新文件 |
-
-常用 interactive command：
-
-- `/session` 显示当前文件和 ID。
-- `/tree` 导航文件内的 Session tree，并可以总结 abandoned branch。
-- `/fork` 从较早 user message 创建新 Session。
-- `/clone` 复制当前 active branch。
-- `/compact` 总结较旧消息，为 context 释放空间。
-
-> 译者注：Session 是“跨进程可恢复的事实”，Context 是“本次 request 要发送的投影”。Session 可以保留多条 branch，但一次请求通常只取其中一条路径；因此不要把 Session 文件原样当成模型上下文。
-
-## Context Files：上下文文件
-
-Pi 在启动时搜索 `AGENTS.md` 或 `CLAUDE.md`。
-
-搜索位置包括：
-
-1. `~/.pi/agent/AGENTS.md`：全局指令。
-2. 从当前工作目录向上遍历的父目录。
-3. 当前目录。
-
-如果某目录存在 `AGENTS.override.md`，Pi 会用它替代该目录的 `AGENTS.md` 或 `CLAUDE.md`。
-
-其他目录的 context file 仍然按正常层级叠加。
-
-适合放入 context file 的内容是项目约定、命令、代码风格、安全规则和偏好。
-
-它不是秘密存储，也不是给模型无限灌入仓库的机制。
-
-使用 `--no-context-files` 或 `-nc` 可关闭加载。
-
-### System Prompt Files
-
-`.pi/SYSTEM.md` 会替换项目默认 system prompt。
-
-`~/.pi/agent/SYSTEM.md` 会替换全局默认 system prompt。
-
-`APPEND_SYSTEM.md` 则追加到默认 prompt，不替换它。
-
-项目级和全局级都支持这个追加文件。
-
-“replace”和“append”必须区分：
-
-```text
-SYSTEM.md          -> 改变默认 system prompt
-APPEND_SYSTEM.md   -> 保留默认内容，再追加指令
-```
-
-### Project Trust：项目信任
-
-Interactive startup 遇到项目本地 settings、resources 或 `.agents/skills`，并且当前目录或父目录没有 `~/.pi/agent/trust.json` 决策时，会先询问是否 trust。
-
-被信任后，Pi 才允许加载 `.pi/settings.json` 和 `.pi` resources、安装缺失 project packages、执行 project extensions。
-
-在 trust decision 之前，Pi 只加载 context files、user/global extensions 和 CLI `-e` extensions，使它们可以处理 `project_trust` event。
-
-Project-local extensions、package-managed extensions 和 project settings 要在 trust 后才加载。
-
-切换到尚未解决 trust 的其他 cwd Session 时，也遵守这个分层。
-
-非交互模式 `-p`、`--mode json` 和 `--mode rpc` 不显示 trust prompt。
-
-如果没有适用的保存决策，则使用 global settings 的 `defaultProjectTrust`：`ask` 和 `never` 忽略这些 project resources，`always` trust 它们。
-
-`--approve`/`-a` 和 `--no-approve`/`-na` 可以只覆盖这一次运行。
-
-在 `~/.pi/agent/settings.json` 中可以把 `defaultProjectTrust` 设为 `ask`、`always` 或 `never`，也可以用 `/settings` 修改。
-
-`pi config` 和 package commands 使用同一套 project trust flow。
-
-例外是 `pi update` 永远不会询问 trust。
-
-可以对单次命令使用 `--approve` 信任项目资源，或用 `--no-approve` 忽略它们。
-
-Interactive mode 中使用 `/trust` 保存未来 Session 的 project trust decision。
-
-它也会把 immediate parent folder 的信任写入 `~/.pi/agent/trust.json`。
-
-当前 Session 不会因此自动 reload；要让变更完全生效，需要重启 Pi。
-
-> 译者注：Project trust 是“是否允许加载项目资源”的门，不是工具执行的完整 sandbox。信任项目后，Extension 和 settings 可能改变运行时行为；因此陌生仓库应先审阅资源，再选择 `--approve`，不能把 trust 等同于安全认证。
-
-## Exporting and Sharing Sessions：导出与分享
-
-`/export [file]` 会把 Session 写成 HTML。
-
-`/share` 会把 Session 上传为 private GitHub gist，并返回可分享的 HTML link。
-
-private 只表示访问范围较窄，不表示内容自动脱敏。
-
-Session 可能包含 prompt、代码、工具参数、工具输出、路径和错误信息。
-
-在导出或分享前，应检查凭据、个人数据和内部代码。
-
-如果你使用 Pi 做开源工作，并希望公开 model、prompt、tool 和 evaluation 研究，可参考 `badlogic/pi-share-hf`。
-
-它会把 Session 发布到 Hugging Face datasets。
-
-> 译者注：导出是数据边界，不只是 UI 功能。一个失败的 `bash` 输出也可能含环境变量或内部 URL；成熟 Harness 应在 export 前执行 secret redaction，并把“能否分享”当作权限策略的一部分。
-
-## CLI Reference：命令行参考
-
-Pi 的基本调用形状是：
+## CLI 参考
 
 ```bash
 pi [options] [--] [@files...] [messages...]
 ```
 
-解析规则可以按三步理解：
-
-1. `options` 先解析 flag 和对应值。
-2. `--` 停止 option parsing。
-3. 剩余参数作为 prompt 或 `@file` 输入。
-
-如果 prompt 以连字符开头，用 `--` 明确告诉 CLI 它不是 flag。
-
-### Package Commands：Package 命令
+### 包命令
 
 ```bash
-pi install <source> [-l]     # 安装 package；-l 表示 project-local
-pi remove <source> [-l]      # 删除 package
+pi install <source> [-l]     # 安装包；-l 表示安装到项目本地
+pi remove <source> [-l]      # 删除包
 pi uninstall <source> [-l]   # remove 的别名
-pi update [source|self|pi]   # 更新 Pi 或指定 source
-pi update --all              # 更新 Pi 和 packages，协调 pinned git refs
-pi update --extensions       # 只更新 packages，协调 pinned git refs
-pi update --models           # 只刷新 model catalogs
-pi update --self             # 只更新 Pi 本身
-pi update --extension <src>  # 更新一个 extension
-pi list                      # 列出已安装 packages
-pi config                    # 启用/禁用 package resources
+pi update [source|self|pi]   # 更新 pi 或某个包源
+pi update --all              # 更新 pi 和包；协调固定的 git 引用
+pi update --extensions       # 只更新包；协调固定的 git 引用
+pi update --models           # 只刷新模型目录
+pi update --self             # 只更新 pi 本身
+pi update --extension <src>  # 更新指定 Extension
+pi list                      # 列出已安装的包
+pi config                    # 启用或禁用包资源
 ```
 
-这些命令管理 Pi packages。
+这些命令用于管理 pi 包；`pi update` 也可以更新 pi CLI 的安装。卸载 pi 本身请参见 [Quickstart](/pi-docs/coding-agent/quickstart#uninstall)。`pi config` 和项目包命令接受 `--approve`/`--no-approve`，用来为单个命令信任或忽略项目本地设置。`pi update` 从不询问项目可信度。
 
-`pi update` 还可能更新 Pi CLI 的安装版本。
+详细说明见 [Pi Packages](/pi-docs/coding-agent/packages)，其中也包括包源和安全注意事项。
 
-卸载 Pi 自身请看 [Quickstart](/pi-docs/coding-agent/quickstart) 的 uninstall 小节。
+### 运行模式
 
-`pi config` 和 project package commands 接受 `--approve`/`--no-approve`，分别用于信任或忽略项目本地设置。
+| 参数 | 说明 |
+|---|---|
+| `default` | 交互模式 |
+| `-p`、`--print` | 输出响应后退出 |
+| `--mode json` | 将所有事件作为 JSON 行输出；见 [JSON mode](/pi-docs/coding-agent/json) |
+| `--mode rpc` | 通过 stdin/stdout 使用 RPC 模式；见 [RPC mode](/pi-docs/coding-agent/rpc) |
+| `--export <in> [out]` | 将会话导出为 HTML |
 
-`pi update` 不会询问 project trust。
-
-Package source、风险和权限边界见 [Pi Packages](/pi-docs/coding-agent/packages)。
-
-> 译者注：安装 package 会增加可执行代码和资源来源，因此它不等价于安装一份静态文档。应先读 package 的 manifest、Extension、Skill 和 settings，再决定是全局安装还是 `-l` 项目级安装；项目级安装尤其受 trust 控制。
-
-### Modes：运行模式
-
-| Flag | 含义 | 典型用途 |
-| --- | --- | --- |
-| 默认 | Interactive mode | 人工协作、观察工具和队列 |
-| `-p`、`--print` | 输出回答并退出 | shell pipeline、一次性任务 |
-| `--mode json` | 每行输出一个 event JSON | 机器采集、日志和测试 |
-| `--mode rpc` | 通过 stdin/stdout 使用 RPC | 宿主程序控制 Agent |
-| `--export <in> [out]` | 导出 Session 为 HTML | 离线保存和分享前审阅 |
-
-Print mode 也读取 piped stdin，并把它合并到 initial prompt：
+在 print 模式下，pi 也会读取管道 stdin，并把它合并到初始提示词中：
 
 ```bash
 cat README.md | pi -p "Summarize this text"
 ```
 
-这里的 `README.md` 内容来自 shell pipe，不是自动读取某个 Session 文件。
+### 模型选项
 
-`-p` 适合可复现的一次调用，但如果要观察完整生命周期，应使用 JSON mode 或测试中的 EventSink。
+| 选项 | 说明 |
+|---|---|
+| `--provider <name>` | Provider，例如 `anthropic`、`openai` 或 `google` |
+| `--model <pattern>` | 模型模式或 ID；支持 `provider/id` 和可选的 `:<thinking>` |
+| `--api-key <key>` | API key，会覆盖环境变量 |
+| `--thinking <level>` | `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
+| `--models <patterns>` | 以逗号分隔的模式，用于 Ctrl+P 循环切换 |
+| `--list-models [search]` | 列出可用模型 |
 
-> 译者注：四种 mode 的核心 Runtime 可以相同，输入输出边界不同。把 `--mode json` 看成事件流，把 `--mode rpc` 看成命令协议；不要把 JSON mode 当作 MCP，也不要把 print mode 的一行文本当作完整 trace。
+### 会话选项
 
-### Model Options：模型选项
+| 选项 | 说明 |
+|---|---|
+| `-c`、`--continue` | 继续最近一次会话 |
+| `-r`、`--resume` | 浏览并选择会话 |
+| `--session <path\|id>` | 使用指定会话文件或部分 UUID |
+| `--fork <path\|id>` | 将会话文件或部分 UUID 分支为新会话 |
+| `--session-dir <dir>` | 自定义会话存储目录 |
+| `--no-session` | 临时模式，不保存 |
+| `--name <name>`、`-n <name>` | 启动时设置会话显示名称 |
 
-| Option | 含义 | 注意 |
-| --- | --- | --- |
-| `--provider <name>` | 指定 Provider，如 `anthropic`、`openai`、`google` | Provider 决定认证与适配器 |
-| `--model <pattern>` | 指定 model pattern 或 ID，支持 `provider/id` 和可选 `:<thinking>` | pattern 可能匹配多个 model |
-| `--api-key <key>` | 指定 API key，覆盖环境变量 | 不要写入 shell history 或日志 |
-| `--thinking <level>` | `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | 只有模型支持时才有效 |
-| `--models <patterns>` | 用逗号分隔 `Ctrl+P` 循环 pattern | 只限制选择范围 |
-| `--list-models [search]` | 列出可用 models，可选搜索 | 只查询 catalog，不代表 credential 有效 |
+### 工具选项
 
-`--model sonnet:high` 是 thinking shorthand 的例子。
+| 选项 | 说明 |
+|---|---|
+| `--tools <list>`、`-t <list>` | 允许指定的内置、Extension 和自定义工具 |
+| `--exclude-tools <list>`、`-xt <list>` | 禁用指定的内置、Extension 和自定义工具 |
+| `--no-builtin-tools`、`-nbt` | 禁用内置工具，但保留 Extension/自定义工具 |
+| `--no-tools`、`-nt` | 禁用所有工具 |
 
-Provider prefix 适合多个 provider 有同名 model 时消歧。
+内置工具包括：`read`、`bash`、Windows 上的 `powershell`、`edit`、`write`、`grep`、`find` 和 `ls`。
 
-`--api-key` 是一次启动参数，使用后仍要注意进程列表和 shell history 泄露。
+### 资源选项
 
-### Session Options：Session 选项
+| 选项 | 说明 |
+|---|---|
+| `-e`、`--extension <source>` | 从路径、npm 或 git 加载 Extension；可以重复指定 |
+| `--no-extensions` | 禁用 Extension 发现 |
+| `--skill <path>` | 加载 Skill；可以重复指定 |
+| `--no-skills` | 禁用 Skill 发现 |
+| `--prompt-template <path>` | 加载提示词模板；可以重复指定 |
+| `--no-prompt-templates` | 禁用提示词模板发现 |
+| `--theme <path>` | 加载主题；可以重复指定 |
+| `--no-themes` | 禁用主题发现 |
+| `--no-context-files`、`-nc` | 禁用 `AGENTS.md` 和 `CLAUDE.md` 发现 |
 
-| Option | 含义 |
-| --- | --- |
-| `-c`、`--continue` | 继续最近 Session |
-| `-r`、`--resume` | 浏览并选择 Session |
-| `--session &lt;path|id&gt;` | 使用指定文件或 partial UUID |
-| `--fork &lt;path|id&gt;` | 从 Session fork 到新文件 |
-| `--session-dir <dir>` | 自定义 Session storage directory |
-| `--no-session` | 使用 ephemeral mode，不保存 |
-| `--name <name>`、`-n <name>` | 设置 Session display name |
-
-`--no-session` 只关闭持久化，不会关闭工具、网络或 shell 权限。
-
-`--session` 适合脚本明确绑定 Session，`-r` 适合人工选择。
-
-### Tool Options：工具选项
-
-| Option | 含义 |
-| --- | --- |
-| `--tools <list>`、`-t <list>` | allowlist 指定 built-in、Extension 和 custom tools |
-| `--exclude-tools <list>`、`-xt <list>` | 禁用指定工具 |
-| `--no-builtin-tools`、`-nbt` | 禁用内置工具，但保留 Extension/custom tools |
-| `--no-tools`、`-nt` | 禁用全部工具 |
-
-当前内置工具包括：`read`、`bash`、Windows 上的 `powershell`、`edit`、`write`、`grep`、`find` 和 `ls`。
-
-allowlist 和 exclude list 组合时，要在实际启动 header 或 JSON event 中确认 active tools。
-
-工具 definition 只告诉模型能力描述。
-
-它不等于权限授予；执行前仍应经过 schema、trust、permission 和 sandbox 边界。
-
-> 译者注：`--no-builtin-tools` 与 `--no-tools` 不是同义词。前者给 Extension/custom tools 留出空间，后者把全部 Tool Calling 能力关闭。调试工具缺失时，先看启动选项和 active registry，不要先怀疑模型。
-
-### Resource Options：资源选项
-
-| Option | 含义 |
-| --- | --- |
-| `-e`、`--extension <source>` | 从 path、npm 或 git 加载 Extension；可重复 |
-| `--no-extensions` | 关闭 Extension discovery |
-| `--skill <path>` | 显式加载一个 Skill；可重复 |
-| `--no-skills` | 关闭 Skill discovery |
-| `--prompt-template <path>` | 显式加载 prompt template；可重复 |
-| `--no-prompt-templates` | 关闭 template discovery |
-| `--theme <path>` | 显式加载 theme；可重复 |
-| `--no-themes` | 关闭 theme discovery |
-| `--no-context-files`、`-nc` | 关闭 `AGENTS.md` 和 `CLAUDE.md` discovery |
-
-可以把 `--no-*` 和显式 flag 组合起来只加载需要的资源：
+将 `--no-*` 与显式参数组合，可以只加载你指定的资源，而忽略设置。例如：
 
 ```bash
 pi --no-extensions -e ./my-extension.ts
 ```
 
-这条命令关闭自动 Extension discovery，但仍显式加载 `./my-extension.ts`。
+### 其他选项
 
-同样的思路适用于先关闭自动 Skill，再显式指定可信 Skill。
-
-### Other Options：其他选项
-
-| Option | 含义 |
-| --- | --- |
-| `--system-prompt <text>` | 替换默认 prompt；context files 和 skills 仍会追加 |
+| 选项 | 说明 |
+|---|---|
+| `--system-prompt <text>` | 替换默认提示词；上下文文件和 Skill 仍会追加 |
 | `--append-system-prompt <text>` | 追加到 system prompt |
-| `--tui-mode <mode>` | `regular`（默认）或实验性的 `fullscreen` |
-| `--use-theme <name[/name]>` | 本次 interactive run 设置初始 theme，不改 settings |
+| `--tui-mode <mode>` | TUI 模式：`regular`（默认）或实验性的 `fullscreen` |
+| `--use-theme <name[/name]>` | 设置本次运行的初始主题，不修改设置 |
 | `--verbose` | 强制显示详细启动信息 |
-| `-a`、`--approve` | 本次运行信任项目本地文件 |
-| `-na`、`--no-approve` | 本次运行忽略项目本地文件 |
-| `--` | 停止选项解析；余下参数是 prompt 或 `@file` |
+| `-a`、`--approve` | 为本次运行信任项目本地文件 |
+| `-na`、`--no-approve` | 为本次运行忽略项目本地文件 |
+| `--` | 停止解析选项；后面的参数作为提示词或 `@file` 输入 |
 | `-h`、`--help` | 显示帮助 |
 | `-v`、`--version` | 显示版本 |
 
-Fullscreen mode 的 transcript 在 terminal viewport 内滚动。
+在 `fullscreen` 模式中，transcript 在终端视口内滚动；排队消息、工作状态、Extension widget、编辑器和底栏固定在底部。鼠标/触控板输入滚动指针所在区域，键盘视口操作始终可用。支持 Kitty graphics protocol 的终端（包括 Kitty 和 Ghostty）可以显示行内图片。在 iTerm2 中，由于其行内图片协议无法在应用控制的滚动期间删除或裁剪图片，图片会以文本占位符显示。
 
-Queued messages、working status、extension widgets、editor 和 footer 固定在底部。
+在 `regular` 模式中，pi 使用主屏幕和终端负责的回滚区；iTerm2 的行内图片仍可正常显示。终端特定的设置和变通方案见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。
 
-鼠标或 trackpad 会滚动指针所在区域。
+可以在 `/settings` 中设置 **TUI mode**，立即在 `regular` 与 `fullscreen` 之间切换，并选择后续会话的默认模式。**Fullscreen exit output** 决定退出全屏时是打印最终 transcript，还是恢复之前的屏幕并只打印会话恢复提示。
 
-键盘 viewport action 始终可用。
+### 文件参数
 
-支持 Kitty graphics protocol 的终端（包括 Kitty、Ghostty）可以显示 inline images。
-
-iTerm2 因为其 inline-image protocol 无法在应用拥有的滚动区域中删除或裁剪 placement，所以会显示 text placeholder。
-
-Regular mode 使用主屏幕和 terminal-owned scrollback。
-
-在 regular mode 中，iTerm2 inline images 通常可以正常显示。
-
-终端差异和 workaround 见 [Terminal setup](/pi-docs/coding-agent/terminal-setup)。
-
-`/settings` 中的 TUI mode 可以立即切换 `regular`/`fullscreen`，也可以选择未来 Session 的默认值。
-
-Fullscreen exit output 控制退出时打印完整 transcript，还是恢复之前屏幕并只打印 Session resume hint。
-
-## File Arguments：文件参数
-
-在文件名前加 `@`，可以把文件作为 prompt 输入：
+在文件路径前加 `@`，即可把文件加入消息：
 
 ```bash
 pi @prompt.md "Answer this"
@@ -480,234 +275,54 @@ pi -p @screenshot.png "What's in this image?"
 pi @code.ts @test.ts "Review these files"
 ```
 
-`@` 不是模型工具调用。
-
-CLI 会先解析文件参数，再把文本、图像或引用交给输入构建流程。
-
-文件内容可能受到大小、类型和 provider 能力限制。
-
-使用 `@screenshot.png` 前，要确认当前 model 支持图像输入。
-
-> 译者注：`@file` 是用户输入阶段的 context composition；`read` 是模型决定后由 Runtime 执行的 Tool。前者在请求开始前注入，后者可能在多轮 loop 中产生结果，二者不能互换。
-
-## Examples：完整例子
+### 示例
 
 ```bash
-# Interactive with initial prompt
+# 带初始提示词进入交互模式
 pi "List all .ts files in src/"
 
-# Non-interactive
+# 非交互模式
 pi -p "Summarize this codebase"
 
-# Prompt beginning with a dash
+# 以短横线开头的提示词
 pi -p -- "- Summarize these points"
 
-# Non-interactive with piped stdin
+# 通过管道 stdin 在非交互模式中输入
 cat README.md | pi -p "Summarize this text"
 
-# Named one-shot session
+# 命名的一次性会话
 pi --name "release audit" -p "Audit this repository"
 
-# Different model
+# 使用其他模型
 pi --provider openai --model gpt-4o "Help me refactor"
 
-# Model with provider prefix
+# 使用 Provider 前缀指定模型
 pi --model openai/gpt-4o "Help me refactor"
 
-# Model with thinking level shorthand
+# 使用思考级别简写
 pi --model sonnet:high "Solve this complex problem"
 
-# Limit model cycling
+# 限制模型切换范围
 pi --models "claude-*,gpt-4o"
 
-# Read-only mode
-pi --tools read,grep,find,ls -p "Review the code"
+# 只读模式
+pi --tools read,grep,find,ls -p "Review this codebase"
 
-# Disable one extension or built-in tool while keeping the rest available
+# 禁用一个 Extension 或内置工具，但保留其他能力
 pi --exclude-tools ask_question
 ```
 
-这些例子依次覆盖 interactive、print、dash prompt、pipe、named session、model selection、thinking shorthand、model scope、read-only allowlist 和单工具禁用。
+## 设计原则
 
-运行 read-only 模式时，仍要检查 Extension 是否注册了额外 custom tool；`--tools` 的最终语义要以当前版本的 active registry 为准。
+Pi 保持核心足够小，把工作流相关行为放到 Extension、Skill、提示词模板和包中。
 
-执行真实命令前，可先加 `--no-session` 做无持久化试运行，但这不能代替权限审查。
+Pi 有意不内置 MCP、sub-agent、权限弹窗、plan mode、待办事项或后台 bash。可以通过 Extension 或包构建、安装这些工作流，也可以使用容器和 tmux 等外部工具。
 
-## Design Principles：设计原则
-
-Pi 保持 core 较小，把 workflow-specific behavior 推到 Extensions、Skills、prompt templates 和 packages。
-
-它有意不内置 MCP、sub-agents、permission popups、plan mode、to-dos 或 background bash。
-
-这些 workflow 可以通过 Extensions/packages 构建或安装，也可以配合 containers、tmux 等外部工具。
-
-这意味着 Pi core 的“没有某功能”也是架构边界，不是文档遗漏。
-
-| 能力 | Pi core 当前选择 | 自己构建 Harness 时的启示 |
-| --- | --- | --- |
-| MCP | 不内置 | 把协议客户端作为明确 adapter 或 Extension |
-| sub-agents | 不内置 | 需要另行定义 child Session 和预算 |
-| permission popups | 不内置 | 权限策略必须由宿主或 Extension 明确负责 |
-| plan/to-do | 不内置 | 用 Session/Extension 设计工作流状态 |
-| background bash | 不内置 | 外部 supervisor 负责生命周期、日志和取消 |
-
-完整设计理由见 [blog post](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/)。博客用于补充动机，当前行为仍以源码为准。
-
-> 译者注：小 core 并不表示能力少，而是把“通用控制流”和“具体工作流”分开。这样使用者可以替换工作流，但也必须自己承担权限、持久化、错误恢复和测试成本。不要因为某个 Extension 提供了 MCP 就声称 Pi core 原生支持 MCP。
-
-## Go 与 Java 对照
-
-| Pi/TypeScript 概念 | Go 学习实现 | Java 学习实现 |
-| --- | --- | --- |
-| editor callback | channel/callback | Listener 或 callback |
-| `AbortSignal` | `context.Context` | `CancellationToken` + interruption |
-| `AsyncIterable` stream | SSE scanner + callback | line stream + callback；生产实现可选 `Flow` |
-| Session tree | JSONL `Session` | Jackson JSONL `Session` |
-| Extension | explicit registry | `ServiceLoader` SPI |
-| CLI mode | `flag` + stdin | `Main` + `HttpClient`/stdin |
-
-Go 和 Java 示例都把 model、Tool 和 Session 分成接口/值对象。
-
-它们都用 `ScriptedModel` 测试多轮行为。
-
-Java 当前核心 loop 使用 `ExecutorService`/`Future`，如果需要非阻塞宿主 API，可以在外层使用 `CompletableFuture`。
-
-> 译者注：跨语言映射只解释相同的控制问题，不表示类型和线程模型完全相同。Java `Future.cancel(true)` 可能只是设置中断标志，Go `context.Cancel` 也不能撤销已发出的远程请求；副作用边界必须由 Tool 自己检查取消。
-
-## 故障排查手册
-
-### 1. 启动时找不到 command 或 Skill
-
-检查是否使用了 `--no-extensions`、`--no-skills`、`--no-prompt-templates` 或 `--no-context-files`。
-
-再看 startup header 中的 loaded resources。
-
-确认 project trust 是否阻止了项目本地资源。
-
-用 `--approve` 做一次受控验证，不要永久修改 global trust 前跳过审阅。
-
-### 2. 工具不在 definitions 中
-
-检查 `--tools`、`--exclude-tools`、`--no-builtin-tools` 和 `--no-tools`。
-
-如果是 Extension tool，检查 Extension 是否加载、是否抛错、是否通过 `tool_call` hook。
-
-注意 model 看到的 definition 与 Runtime 实际 registry 应保持一致。
-
-### 3. 按键没有反应
-
-先区分 editor、fullscreen transcript 和 selector 当前焦点。
-
-查看 `/hotkeys`，再检查 terminal 对 modifier 的编码。
-
-Windows/WSL 的 `Alt+Enter`、`Ctrl+V`、`Ctrl+F` 具有不同默认值。
-
-### 4. Session 没有恢复到预期位置
-
-执行 `/session` 查看文件和 ID。
-
-执行 `/tree` 确认当前 leaf，而不是只看最后一行消息。
-
-如果使用 `--no-session`，本次运行本来就不会保存。
-
-如果使用了 `/fork` 或 `/clone`，确认你打开的是新 Session 文件。
-
-### 5. `/compact` 后模型表现变差
-
-检查 compaction summary 是否保留了约束、文件路径、未完成任务和 Tool Result 的关键事实。
-
-必要时使用 `/compact [prompt]` 添加明确保留要求。
-
-压缩不是“增加模型能力”，而是牺牲部分历史细节换取 context window 空间。
-
-### 6. `-p` 管道输入为空或输出不适合脚本
-
-确认命令没有把文本同时作为 shell redirection 和 positional prompt。
-
-用 `--mode json` 检查完整 event，避免只看最后一行。
-
-检查 pipe 是否提前关闭，以及 model/provider 是否返回 error。
-
-### 7. 导出或分享泄露敏感信息
-
-停止上传，检查 HTML/JSONL 中的 prompt、tool args、环境路径和输出。
-
-撤销已经暴露的 token，并改用脱敏后的 Session。
-
-不要把 `private gist` 当作 secret store。
-
-## 可执行实验
-
-### 实验 A：比较四种 mode
-
-**目标：** 看清 interactive、print、JSON、RPC 的输入输出差异。
-
-**准备：** 使用受限测试目录和本地 fake provider；不要使用生产 API key。
-
-**步骤：**
-
-1. 运行 `pi -p "hello"`，记录最终文本。
-2. 运行 `pi --mode json -p "hello"`，逐行读取 event type。
-3. 运行 interactive mode，输入一个 `/session` 和一个 calculator Tool 请求。
-4. 用 RPC client 发送一条 prompt，再读取 response/event。
-5. 对比四种 mode 是否共享 Session 和 model 状态。
-
-**观察点：** print 适合最终输出；JSON 暴露事件；RPC 需要 framing 和 request/response 关联；interactive 还包含 UI 状态。
-
-**预期结果：** 能指出哪个输出是 final message、哪个是 tool event、哪个是 transport wrapper。
-
-**思考题：** 如果 RPC client 断开，Session 是否已保存？如果只消费 JSON 的 final event，如何发现工具失败？
-
-### 实验 B：观察消息队列边界
-
-**目标：** 区分 steering、follow-up 和 abort。
-
-**准备：** 使用一个会连续执行两个 Tool 的 `ScriptedModel`，打开事件日志。
-
-**步骤：**
-
-1. 在第一个 Tool 运行时按 Enter 输入“只读，不要写文件”。
-2. 观察当前 Tool 是否被倒放取消。
-3. 观察下一次 request 是否包含 steering message。
-4. 再用 Alt+Enter 输入“完成后总结”，观察 follow-up 的投递时机。
-5. 运行中按 Escape，确认 queued messages 回到 editor。
-
-**观察点：** queue 的入队、消费、取消和恢复是不同状态转换。
-
-**预期结果：** 新要求不会污染已经发出的 request；abort 只表达取消当前工作，不能撤销已发生的外部副作用。
-
-### 实验 C：做一次安全的 read-only 审查
-
-**目标：** 让模型只能观察文件，不能写入或执行 shell。
-
-**准备：** 准备临时仓库，使用 `--tools read,grep,find,ls` 和 `--no-session`。
-
-**步骤：**
-
-1. 运行 `pi --tools read,grep,find,ls --no-session -p "Review this repository"`。
-2. 检查 startup header 和 JSON event 中的 active tool list。
-3. 给模型一个需要修改文件的 prompt，观察它如何处理工具缺失。
-4. 检查目录是否没有变化。
-
-**观察点：** allowlist 限制的是 Runtime registry；模型可能仍然提出 write call，但 unknown/disabled tool 不应产生文件副作用。
-
-**思考题：** 为什么还需要 OS-level read-only filesystem？如果 Extension 自己注册 shell-like tool，`--tools` 是否仍达到你的安全目标？
-
-## 译者注：与源码和 Harness 的关系
-
-本页描述的是 coding-agent CLI/TUI 的用户入口。
-
-源码阅读时，可以从 `packages/coding-agent/src/core/agent-session.ts` 的 `AgentSession`、`packages/agent/src/agent.ts` 的 `Agent` 以及 `packages/agent/src/agent-loop.ts` 的 `runAgentLoop` 追踪一次输入。
-
-Session、Context、Tool registry 和 resource loader 位于不同边界。
-
-因此，命令行选项不是孤立开关，而是改变 Harness 输入、能力集合或输出 transport 的配置。
-
-完成本页后，建议运行 Go 的 `stage-11-steering` 与 Java 的 `stage-11-steering`，再阅读 [调用链](/08-pi-architecture/call-chain)。
+完整设计理由见[博客文章](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/)。
 
 ## 完整原文对照
 
-[在 GitHub 打开源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/usage.md)
+[在 GitHub 打开固定 commit 的英文源文件](https://github.com/coolerks/pi-lean/blob/853a80d26c90a14c1886f0ebb8ffaae133ca2185/packages/coding-agent/docs/usage.md)
 
 ````markdown
 # Using Pi
